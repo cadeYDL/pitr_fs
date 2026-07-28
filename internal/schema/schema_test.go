@@ -1,0 +1,465 @@
+package schema
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ============================================================================
+// Test 环境:一个 docker PG 全 test package 复用,每个测试用独立 database 隔离。
+//
+// 依赖:
+//   - 环境里有 docker 可用
+//   - 若设置 PITR_TEST_PG_DSN, 跳过 docker,直接用外部 PG(适合 CI/Sandbox 已有 PG)
+// ============================================================================
+
+var (
+	adminDSN     string
+	containerID  string
+	dbCounter    int
+)
+
+func TestMain(m *testing.M) {
+	if dsn := os.Getenv("PITR_TEST_PG_DSN"); dsn != "" {
+		adminDSN = dsn
+		os.Exit(m.Run())
+	}
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		fmt.Fprintln(os.Stderr, "跳过 SQL 单测:未找到 docker,也未设置 PITR_TEST_PG_DSN")
+		os.Exit(0)
+	}
+
+	code, err := runWithDocker(m)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "docker PG 环境启动失败:", err)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+func runWithDocker(m *testing.M) (int, error) {
+	name := fmt.Sprintf("pitr-schema-test-%d", time.Now().UnixNano())
+	// 不做端口映射:macOS 侧 OrbStack 不把 -p 转发到宿主 127.0.0.1,
+	// 改用 <container>.orb.local(macOS)或容器 IP(Linux/calw)
+	out, err := exec.Command("docker", "run", "-d", "--name", name,
+		"-e", "POSTGRES_PASSWORD=x", "-e", "POSTGRES_DB=postgres",
+		"postgres:16").CombinedOutput()
+	if err != nil {
+		return 1, fmt.Errorf("docker run: %w: %s", err, out)
+	}
+	containerID = strings.TrimSpace(string(out))
+	defer exec.Command("docker", "rm", "-f", containerID).Run()
+
+	dsn, err := waitReadyDSN(name)
+	if err != nil {
+		return 1, err
+	}
+	adminDSN = dsn
+	return m.Run(), nil
+}
+
+// waitReadyDSN — 尝试两种可达 host, 返回第一个 ping 通的 DSN
+func waitReadyDSN(name string) (string, error) {
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		hosts := []string{name + ".orb.local"}
+		if ip := containerIP(name); ip != "" {
+			hosts = append(hosts, ip)
+		}
+		for _, h := range hosts {
+			dsn := fmt.Sprintf("postgres://postgres:x@%s:5432/postgres?sslmode=disable", h)
+			if ping(dsn) == nil {
+				return dsn, nil
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return "", errors.New("PG 60 秒内未就绪(尝试了 orb.local 与容器 IP)")
+}
+
+func containerIP(name string) string {
+	out, err := exec.Command("docker", "inspect", "-f",
+		"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func ping(dsn string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer c.Close(ctx)
+	return c.Ping(ctx)
+}
+
+// freshDB — 建独立 database 并返回 (dsn, cleanup)。跑 InitSQL 之前调用。
+func freshDB(t *testing.T) (string, func()) {
+	t.Helper()
+	dbCounter++
+	name := fmt.Sprintf("pitr_test_%d_%d", time.Now().UnixNano(), dbCounter)
+
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		admin.Close(ctx)
+		t.Fatalf("create db: %v", err)
+	}
+	admin.Close(ctx)
+
+	dsn := strings.Replace(adminDSN, "/postgres?", "/"+name+"?", 1)
+	cleanup := func() {
+		a, err := pgx.Connect(ctx, adminDSN)
+		if err != nil {
+			return
+		}
+		defer a.Close(ctx)
+		_, _ = a.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
+	}
+	return dsn, cleanup
+}
+
+func mustExec(t *testing.T, conn *pgx.Conn, sql string, args ...any) {
+	t.Helper()
+	if _, err := conn.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("exec %q: %v", oneLine(sql), err)
+	}
+}
+
+func oneLine(s string) string {
+	f := strings.Fields(s)
+	if len(f) > 12 {
+		return strings.Join(f[:12], " ") + " ..."
+	}
+	return strings.Join(f, " ")
+}
+
+func mustScalarInt(t *testing.T, conn *pgx.Conn, sql string, args ...any) int64 {
+	t.Helper()
+	var n int64
+	if err := conn.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+		t.Fatalf("scalar %q: %v", oneLine(sql), err)
+	}
+	return n
+}
+
+// execUnderTxn — 在同一 pgx 事务里执行 SET LOCAL pitr.current_txn + 一段 SQL。
+// SET LOCAL 只在事务内生效, 触发器读 GUC 才拿得到 txn_id。
+func execUnderTxn(t *testing.T, conn *pgx.Conn, txnID int64, sql string, args ...any) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL pitr.current_txn = "+strconv.FormatInt(txnID, 10)); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("set local: %v", err)
+	}
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("exec %q: %v", oneLine(sql), err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+func applySchema(t *testing.T, dsn string) *pgx.Conn {
+	t.Helper()
+	ctx := context.Background()
+	c, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := c.Exec(ctx, InitSQL); err != nil {
+		t.Fatalf("apply InitSQL: %v", err)
+	}
+	return c
+}
+
+// ============================================================================
+// TestSQL_Idempotent — init_pitr.sql 连续跑两次都不报错(幂等)
+// ============================================================================
+func TestSQL_Idempotent(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+	// 再跑一次
+	if _, err := conn.Exec(context.Background(), InitSQL); err != nil {
+		t.Fatalf("第二次执行 InitSQL 应幂等,却报错: %v", err)
+	}
+	// 根版本只应有一条
+	n := mustScalarInt(t, conn, "SELECT count(*) FROM pitr_txn WHERE state='root'")
+	if n != 1 {
+		t.Errorf("跑两次后 root 版本应仍只有 1 条,实际 %d", n)
+	}
+}
+
+// ============================================================================
+// TestSQL_TablesExist — 所有 pitr_* 表 + 索引 + 存储过程都建了
+// ============================================================================
+func TestSQL_TablesExist(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	for _, tbl := range []string{
+		"pitr_txn", "pitr_node_history", "pitr_edge_history",
+		"pitr_chunk_history", "pitr_blob_retention",
+	} {
+		n := mustScalarInt(t, conn,
+			"SELECT count(*) FROM information_schema.tables WHERE table_name = $1", tbl)
+		if n != 1 {
+			t.Errorf("表 %s 未建", tbl)
+		}
+	}
+
+	// uniq_active_txn_per_path 部分索引
+	n := mustScalarInt(t, conn,
+		"SELECT count(*) FROM pg_indexes WHERE indexname = 'uniq_active_txn_per_path'")
+	if n != 1 {
+		t.Error("uniq_active_txn_per_path 部分索引未建")
+	}
+
+	// 存储过程
+	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert",
+		"pitr_capture_node_change", "pitr_capture_edge_change", "pitr_capture_chunk_change"} {
+		n := mustScalarInt(t, conn,
+			"SELECT count(*) FROM pg_proc WHERE proname = $1", proc)
+		if n < 1 {
+			t.Errorf("过程/函数 %s 未建", proc)
+		}
+	}
+}
+
+// ============================================================================
+// TestTrigger_CapturesUpdate — mock 一张 jfs_node,UPDATE 后 history 里有 op='U' 记录
+//
+// 注意:init_pitr.sql 装触发器时用 DO 块检查 jfs_node 存在。所以要先建
+// jfs_node,再 re-apply schema 触发 trigger 挂载。
+// ============================================================================
+func TestTrigger_CapturesUpdate(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	// 触发器现在还没挂上, re-apply init 才会挂
+	if _, err := conn.Exec(context.Background(), InitSQL); err != nil {
+		t.Fatalf("re-apply after mock jfs_node: %v", err)
+	}
+
+	// 建一个 auto 版本,给 GUC 用
+	txnID := mustScalarInt(t, conn, `
+        INSERT INTO pitr_txn (version_hash, scope_path, state, command)
+        VALUES ('t01_upd_xxxx', '/', 'auto', 'write:/a') RETURNING id`)
+
+	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (100, 33188, 1, 0)")
+	// SET LOCAL 只在事务内生效, 触发器读 GUC 才拿得到 txn_id
+	execUnderTxn(t, conn, txnID, "UPDATE jfs_node SET length = 42 WHERE inode = 100")
+
+	got := mustScalarInt(t, conn, `SELECT count(*) FROM pitr_node_history
+        WHERE txn_id = $1 AND inode = 100 AND op = 'U'`, txnID)
+	if got != 1 {
+		t.Errorf("期望 1 条 op='U' history,实际 %d", got)
+	}
+}
+
+// ============================================================================
+// TestTrigger_SessionVarFilter — 未设 pitr.current_txn 时不记录 history
+// ============================================================================
+func TestTrigger_SessionVarFilter(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	if _, err := conn.Exec(context.Background(), InitSQL); err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+
+	// 不设 GUC(默认空), UPDATE 不应产生 history
+	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (200, 33188, 1, 0)")
+	mustExec(t, conn, "UPDATE jfs_node SET length = 1 WHERE inode = 200")
+
+	got := mustScalarInt(t, conn, "SELECT count(*) FROM pitr_node_history WHERE inode = 200")
+	if got != 0 {
+		t.Errorf("未设 GUC 时不应打点,实际有 %d 条", got)
+	}
+}
+
+// ============================================================================
+// TestCollapse_KeepsEarliestSnapshot — 模拟 auto v1/v2/v3,坍缩后每个 inode 只留
+// 最早那次改动的 snapshot,commit 版本自身持有全部 history
+// ============================================================================
+func TestCollapse_KeepsEarliestSnapshot(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	if _, err := conn.Exec(context.Background(), InitSQL); err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+
+	// 建一个 committed 事务作为 parent
+	commitID := mustScalarInt(t, conn, `
+        INSERT INTO pitr_txn (version_hash, scope_path, state, command)
+        VALUES ('cmt_01_xxxxx', '/a', 'committed', 'commit') RETURNING id`)
+
+	// 建 3 个 auto 子事务 v1/v2/v3
+	var autoIDs [3]int64
+	for i, tag := range []string{"a01_v1_xxxxx", "a01_v2_xxxxx", "a01_v3_xxxxx"} {
+		autoIDs[i] = mustScalarInt(t, conn, `
+            INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command)
+            VALUES ($1, $2, '/a', 'auto', 'w') RETURNING id`, tag, commitID)
+	}
+
+	// 建一行 jfs_node, 让 auto v1/v2/v3 各改一次同一 inode
+	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (300, 33188, 1, 0)")
+	for i, tid := range autoIDs {
+		execUnderTxn(t, conn, tid,
+			"UPDATE jfs_node SET length = $1 WHERE inode = 300", int64(10*(i+1)))
+	}
+	// 3 条 auto history 应齐
+	before := mustScalarInt(t, conn, "SELECT count(*) FROM pitr_node_history WHERE inode = 300")
+	if before != 3 {
+		t.Fatalf("坍缩前应有 3 条 history,实际 %d", before)
+	}
+
+	// 坍缩
+	mustExec(t, conn, "CALL pitr_collapse_commit($1)", commitID)
+
+	// 只应剩 1 条,归属到 commit_id
+	after := mustScalarInt(t, conn, "SELECT count(*) FROM pitr_node_history WHERE inode = 300")
+	if after != 1 {
+		t.Errorf("坍缩后应剩 1 条,实际 %d", after)
+	}
+	owner := mustScalarInt(t, conn, "SELECT txn_id FROM pitr_node_history WHERE inode = 300")
+	if owner != commitID {
+		t.Errorf("剩下的 history 应归属 commit_id=%d,实际 %d", commitID, owner)
+	}
+
+	// 剩下这条应该是 v1 之前的 snapshot(length=0)
+	var length int64
+	if err := conn.QueryRow(context.Background(),
+		`SELECT (snapshot->>'length')::bigint FROM pitr_node_history WHERE inode = 300`).Scan(&length); err != nil {
+		t.Fatalf("读 snapshot: %v", err)
+	}
+	if length != 0 {
+		t.Errorf("坍缩后应保留最早的 snapshot(length=0),实际 length=%d", length)
+	}
+
+	// auto 事务已被删
+	autoLeft := mustScalarInt(t, conn,
+		"SELECT count(*) FROM pitr_txn WHERE parent_id = $1 AND state = 'auto'", commitID)
+	if autoLeft != 0 {
+		t.Errorf("坍缩后 auto 子事务应清空,实际剩 %d", autoLeft)
+	}
+}
+
+// ============================================================================
+// TestRevert_RestoresRow — 插入一行 → UPDATE → revert 到之前 → 行恢复原值
+// ============================================================================
+func TestRevert_RestoresRow(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	if _, err := conn.Exec(context.Background(), InitSQL); err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+
+	// v_before 版本 tag: 记录时点 (created_at) 作为 revert 目标
+	// 先插入一行,让 v_before 之前的世界是"没这行"
+	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (400, 33188, 1, 100)")
+	_ = mustScalarInt(t, conn, `
+        INSERT INTO pitr_txn (version_hash, scope_path, state, command)
+        VALUES ('rv_before_xx', '/a', 'committed', 'w') RETURNING id`)
+
+	// 再开一个 auto 事务,把 length 从 100 改成 999
+	autoID := mustScalarInt(t, conn, `
+        INSERT INTO pitr_txn (version_hash, scope_path, state, command)
+        VALUES ('rv_after_xxx', '/a', 'auto', 'w') RETURNING id`)
+	execUnderTxn(t, conn, autoID, "UPDATE jfs_node SET length = 999 WHERE inode = 400")
+
+	// 现在 length 应是 999,history 里有一条 op='U' snapshot length=100
+	cur := mustScalarInt(t, conn, "SELECT length FROM jfs_node WHERE inode = 400")
+	if cur != 999 {
+		t.Fatalf("revert 前 length 应是 999,实际 %d", cur)
+	}
+
+	// revert 到 rv_before
+	mustExec(t, conn, "CALL pitr_revert($1)", "rv_before_xx")
+
+	// length 应回到 100
+	got := mustScalarInt(t, conn, "SELECT length FROM jfs_node WHERE inode = 400")
+	if got != 100 {
+		t.Errorf("revert 后 length 应回到 100,实际 %d", got)
+	}
+}
+
+// ============================================================================
+// mock jfs_* 表(裁剪版, 仅包含被 pitr 依赖的字段)
+// 真实 JuiceFS 表结构:https://github.com/juicedata/juicefs/blob/main/pkg/meta/sql.go
+// ============================================================================
+const mockJFSNodeSQL = `
+CREATE TABLE IF NOT EXISTS jfs_node (
+    inode           bigint  PRIMARY KEY,
+    type            smallint,
+    flags           smallint,
+    mode            int,
+    uid             int,
+    gid             int,
+    atime           bigint,
+    mtime           bigint,
+    ctime           bigint,
+    atimensec       int,
+    mtimensec       int,
+    ctimensec       int,
+    nlink           int,
+    length          bigint,
+    rdev            int,
+    parent          bigint,
+    access_acl_id   int,
+    default_acl_id  int
+);
+CREATE TABLE IF NOT EXISTS jfs_edge (
+    parent  bigint,
+    name    bytea,
+    inode   bigint,
+    type    smallint,
+    PRIMARY KEY (parent, name)
+);
+CREATE TABLE IF NOT EXISTS jfs_chunk (
+    inode   bigint,
+    indx    int,
+    slices  bytea,
+    PRIMARY KEY (inode, indx)
+);
+`
