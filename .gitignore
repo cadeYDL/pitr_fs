@@ -1,0 +1,25 @@
+# Build artifacts
+/bin/
+/out/
+/dist/
+*.test
+*.out
+
+# Go
+vendor/
+coverage.txt
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE (keep .claude, not .idea)
+.idea/
+
+# Local bench data
+/tmp-pitr-bench/
+
+# Environment overrides
+.env
+.env.local
