@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "pitr_fs/api/pitrd/v1"
+	pitrmount "pitr_fs/internal/mount"
 	"pitr_fs/internal/pg"
 	pitrserver "pitr_fs/internal/server"
 	"pitr_fs/internal/txn"
@@ -78,12 +79,28 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	}
 	defer db.Close()
 
+	jfs := &pitrmount.JuiceFS{
+		MetaURL:    dsn,
+		MountPoint: flagJFSMount,
+	}
+	if err := jfs.Start(cmd.Context()); err != nil {
+		return fmt.Errorf("挂载 JuiceFS: %w", err)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := jfs.Stop(stopCtx); err != nil {
+			slog.Error("stop JuiceFS", "error", err)
+		}
+	}()
+
 	mgr := txn.NewManager(db)
 	handler := pitrserver.New(db, mgr, pitrserver.Config{
-		Volume:    flagVolume,
-		JFSMount:  flagJFSMount,
-		FUSEMount: flagFUSEMount,
-		Retention: flagRetention,
+		Volume:     flagVolume,
+		JFSMount:   flagJFSMount,
+		FUSEMount:  flagFUSEMount,
+		Retention:  flagRetention,
+		JFSMounted: true,
 	})
 	grpcServer := grpc.NewServer()
 	pb.RegisterPitrdServer(grpcServer, handler)

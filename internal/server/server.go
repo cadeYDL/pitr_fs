@@ -15,6 +15,8 @@ type Config struct {
 	JFSMount      string
 	FUSEMount     string
 	Retention     string
+	JFSMounted    bool
+	FUSEMounted   bool
 }
 
 type Server struct {

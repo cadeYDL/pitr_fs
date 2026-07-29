@@ -45,11 +45,43 @@ fi
 # 5. 建目录
 mkdir -p "$(dirname "$PITR_SOCKET")" "$PITR_MOUNT" /var/lib/pitr/jfs
 
-# 6. exec pitrd 成为主进程 (P1 骨架, 立刻返回; P2 之后阻塞持有 socket)
+# 6. 启动 pitrd。entrypoint 保持为编排进程,确保容器停止时先让 gRPC 优雅退出,
+# 再关闭 PostgreSQL,避免下次启动触发 WAL crash recovery。
 log "启动 pitrd..."
-exec pitrd \
+pitrd \
     --pg-dsn "$PG_DSN" \
     --volume "$PITR_VOLUME" \
     --jfs-mount /var/lib/pitr/jfs \
     --fuse-mount "$PITR_MOUNT" \
-    --socket   "$PITR_SOCKET"
+    --socket   "$PITR_SOCKET" &
+PITRD_PID=$!
+
+stop_postgres() {
+    if kill -0 "$PG_PID" >/dev/null 2>&1; then
+        log "关闭 PostgreSQL..."
+        if ! gosu postgres pg_ctl -D "$PGDATA" -m fast -w stop; then
+            kill -TERM "$PG_PID" >/dev/null 2>&1 || true
+        fi
+        wait "$PG_PID" 2>/dev/null || true
+    fi
+}
+
+shutdown() {
+    log "收到停止信号,关闭 pitrd..."
+    kill -TERM "$PITRD_PID" >/dev/null 2>&1 || true
+    wait "$PITRD_PID" 2>/dev/null || true
+    stop_postgres
+    exit 0
+}
+
+trap shutdown TERM INT
+
+set +e
+wait "$PITRD_PID"
+PITRD_RC=$?
+set -e
+trap - TERM INT
+
+# pitrd 非预期退出时也关闭 PG,并把 pitrd exit code 交给容器运行时。
+stop_postgres
+exit "$PITRD_RC"

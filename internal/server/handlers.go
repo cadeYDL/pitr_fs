@@ -73,8 +73,8 @@ func (s *Server) Status(
 			Name:        s.cfg.Volume,
 			JfsMount:    s.cfg.JFSMount,
 			FuseMount:   s.cfg.FUSEMount,
-			JfsMounted:  false,
-			FuseMounted: false,
+			JfsMounted:  s.cfg.JFSMounted,
+			FuseMounted: s.cfg.FUSEMounted,
 			Retention:   s.cfg.Retention,
 		}},
 	}, nil

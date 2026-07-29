@@ -87,3 +87,22 @@ func TestInstall_StatusOnMissingContainer(t *testing.T) {
 		t.Errorf("status 应输出'容器未运行', 实际:\n%s", out.String())
 	}
 }
+
+func TestEntrypoint_GracefullyStopsPostgres(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "deploy/entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	for _, required := range []string{
+		"trap shutdown TERM INT",
+		"kill -TERM \"$PITRD_PID\"",
+		"pg_ctl -D \"$PGDATA\" -m fast -w stop",
+		"exit \"$PITRD_RC\"",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("entrypoint 缺少优雅关闭片段 %q", required)
+		}
+	}
+}
