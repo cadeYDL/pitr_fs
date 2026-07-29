@@ -10,8 +10,8 @@
 #   C. 同连接但用 SET SESSION 而非 SET LOCAL,GUC 泄漏到下一个事务         [连接池陷阱]
 #   D. 加了 FK 后, Y 在 X 未 commit 时引用 X 的 pitr_txn.id → FK 违反      [MVCC 可见性]
 #
-# 全部 PASS  = 生产版本方案在 PG 层是自洽的,剩下只看 JuiceFS SDK 能否复用连接
-# B 里 GUC 是 NULL,而 A 是 42 = 定量证实"必须共享连接"的强需求
+# 全部 PASS = PG 层同连接方案自洽,同时定量证明跨连接时必须采用
+# docs/P0-report.md 已确定的“单 daemon 开放 auto 窗口”方案。
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ PORT="${PORT:-55444}"
 DB=verify03
 FAIL=0
 
-PSQL="docker exec -i $CONTAINER psql -U postgres -d $DB -qtAX"
+PSQL="docker exec -i $CONTAINER psql -h 127.0.0.1 -U postgres -d $DB -qtAX"
 
 cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -45,14 +45,16 @@ docker run -d --name "$CONTAINER" \
     -p 127.0.0.1:$PORT:5432 \
     postgres:16 >/dev/null
 
-until docker exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; do sleep 0.5; done
-docker exec "$CONTAINER" psql -U postgres -c "CREATE DATABASE $DB;" >/dev/null
+until docker exec "$CONTAINER" psql -h 127.0.0.1 -U postgres -d postgres \
+    -qtAX -c "SELECT 1" >/dev/null 2>&1; do sleep 0.5; done
+docker exec "$CONTAINER" psql -h 127.0.0.1 -U postgres \
+    -c "CREATE DATABASE $DB;" >/dev/null
 
 # ============================================================
 # 1. 装极简 schema + 生产版触发器(读 GUC)
 # ============================================================
 echo "==> 1/5 装 mock schema + 生产版触发器(读 pitr.current_txn)"
-docker exec -i "$CONTAINER" psql -U postgres -d "$DB" >/dev/null <<'SQL'
+docker exec -i "$CONTAINER" psql -h 127.0.0.1 -U postgres -d "$DB" >/dev/null <<'SQL'
 CREATE TABLE jfs_node (inode bigint PRIMARY KEY, length bigint);
 
 CREATE TABLE pitr_txn (
@@ -103,7 +105,7 @@ SQL
 # ============================================================
 echo
 echo "==> 2/5 场景 A: 同连接 + SET LOCAL + UPDATE"
-docker exec -i "$CONTAINER" psql -U postgres -d "$DB" >/dev/null <<'SQL'
+docker exec -i "$CONTAINER" psql -h 127.0.0.1 -U postgres -d "$DB" >/dev/null <<'SQL'
 BEGIN;
 SET LOCAL pitr.current_txn = '42';
 UPDATE jfs_node SET length = 999 WHERE inode = 1;
@@ -118,13 +120,13 @@ assert_eq "A) 同连接触发器读到 GUC" "42" "$got"
 echo
 echo "==> 3/5 场景 B: 跨连接 SET LOCAL 不可见"
 # 连接 X: 设 GUC 后 commit,session 结束 GUC 丢失
-docker exec -i "$CONTAINER" psql -U postgres -d "$DB" >/dev/null <<'SQL'
+docker exec -i "$CONTAINER" psql -h 127.0.0.1 -U postgres -d "$DB" >/dev/null <<'SQL'
 BEGIN;
 SET LOCAL pitr.current_txn = '77';
 COMMIT;
 SQL
 # 连接 Y: 全新 session,GUC 是空
-docker exec -i "$CONTAINER" psql -U postgres -d "$DB" >/dev/null <<'SQL'
+docker exec -i "$CONTAINER" psql -h 127.0.0.1 -U postgres -d "$DB" >/dev/null <<'SQL'
 UPDATE jfs_node SET length = 888 WHERE inode = 2;
 SQL
 got=$($PSQL -c "SELECT COALESCE(txn_id::text, 'NULL') FROM pitr_node_history WHERE inode = 2 ORDER BY id DESC LIMIT 1;")
@@ -167,7 +169,7 @@ $PSQL -c "ALTER TABLE pitr_node_history
 
 # 后台连接 X: 消费 id=2, 保持事务打开 4 秒
 (
-    docker exec -i "$CONTAINER" psql -U postgres -d "$DB" >/dev/null 2>&1 <<'SQL'
+    docker exec -i "$CONTAINER" psql -h 127.0.0.1 -U postgres -d "$DB" >/dev/null 2>&1 <<'SQL'
 BEGIN;
 INSERT INTO pitr_txn (version_hash) VALUES ('unfinished-2');
 SELECT pg_sleep(4);
@@ -179,7 +181,7 @@ sleep 1   # 给 X 时间进入 sleep 状态
 
 # 前台连接 Y: 引用 X 尚未 commit 的 id=2
 set +e
-err=$(docker exec -i "$CONTAINER" psql -U postgres -d "$DB" -v ON_ERROR_STOP=1 2>&1 <<'SQL'
+err=$(docker exec -i "$CONTAINER" psql -h 127.0.0.1 -U postgres -d "$DB" -v ON_ERROR_STOP=1 2>&1 <<'SQL'
 BEGIN;
 SET LOCAL pitr.current_txn = '2';
 UPDATE jfs_node SET length = 333 WHERE inode = 1;
@@ -212,8 +214,10 @@ if [[ $FAIL -eq 0 ]]; then
   C. 用 SET SESSION 而非 SET LOCAL 会污染连接池后续请求 → 归属方案必须 LOCAL
   D. 就算能"传 id 过去",FK 会撞 MVCC → 归属和主写必须在同一事务
 
-即:0.3 的头号风险是 **JuiceFS SDK 是否暴露复用外部 sql.DB 的 API**;
-    暴露 → 走生产方案;不暴露 → 走时间戳退化方案(见 docs/P0-report.md)。
+结合 JuiceFS 1.4.0 源码调研:
+  - mount 进程不暴露外部 transaction 注入接口;
+  - pitrd 与 mount 跨进程,不能传递 pgx transaction;
+  - 最终采用单 daemon 串行的开放 auto 窗口方案(见 docs/P0-report.md)。
 EOF
     exit 0
 else
