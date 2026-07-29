@@ -115,6 +115,9 @@ CREATE OR REPLACE FUNCTION pitr_current_txn() RETURNS bigint AS $$
 DECLARE
     v_txn text := current_setting('pitr.current_txn', true);
 BEGIN
+    IF current_setting('pitr.suppress_capture', true) = 'on' THEN
+        RETURN NULL;
+    END IF;
     IF v_txn IS NULL OR v_txn = '' THEN
         SELECT id INTO v_txn
           FROM pitr_txn
@@ -373,7 +376,7 @@ BEGIN
     END IF;
 
     -- 抑制 revert 自身写入触发的打点
-    PERFORM set_config('pitr.current_txn', '', true);
+    PERFORM set_config('pitr.suppress_capture', 'on', true);
 
     -- 反向 replay 全部 history。不能只取最新 snapshot:同一 inode 经历
     -- v1→v2→v3 时,必须依次恢复 v3 前、v2 前的状态才能回到 v1。
@@ -469,5 +472,136 @@ BEGIN
             END IF;
         END IF;
     END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- active transaction rollback
+--
+-- 只反向 replay 指定 active txn 的 auto 子版本,不影响其他 scope/txn。
+-- replay 完成后删除 auto 子版本并把 active 标为 rolled_back。
+-- ============================================================================
+
+CREATE OR REPLACE PROCEDURE pitr_rollback(p_txn_id bigint) AS $$
+DECLARE
+    v_state text;
+    r_node RECORD;
+    r_edge RECORD;
+    r_chunk RECORD;
+    r_chunk_ref RECORD;
+BEGIN
+    SELECT state INTO v_state FROM pitr_txn WHERE id = p_txn_id FOR UPDATE;
+    IF v_state IS NULL THEN
+        RAISE EXCEPTION 'pitr_rollback: txn % 不存在', p_txn_id;
+    END IF;
+    IF v_state <> 'active' THEN
+        RAISE EXCEPTION 'pitr_rollback: txn % state=% 不能 rollback', p_txn_id, v_state;
+    END IF;
+
+    PERFORM set_config('pitr.suppress_capture', 'on', true);
+
+    FOR r_node IN
+        SELECT nh.inode, nh.op, nh.snapshot
+          FROM pitr_node_history nh
+          JOIN pitr_txn t ON t.id = nh.txn_id
+         WHERE t.parent_id = p_txn_id AND t.state = 'auto'
+         ORDER BY nh.recorded_at DESC, nh.txn_id DESC
+    LOOP
+        IF r_node.op = 'I' THEN
+            DELETE FROM jfs_node WHERE inode = r_node.inode;
+        ELSIF r_node.snapshot IS NOT NULL THEN
+            IF EXISTS (SELECT 1 FROM jfs_node WHERE inode = r_node.inode) THEN
+                UPDATE jfs_node
+                   SET (inode, type, flags, mode, uid, gid, atime, mtime, ctime,
+                        atimensec, mtimensec, ctimensec, nlink, length, rdev,
+                        parent, access_acl_id, default_acl_id) =
+                       (SELECT jn.inode, jn.type, jn.flags, jn.mode, jn.uid, jn.gid,
+                               jn.atime, jn.mtime, jn.ctime, jn.atimensec,
+                               jn.mtimensec, jn.ctimensec, jn.nlink, jn.length,
+                               jn.rdev, jn.parent, jn.access_acl_id, jn.default_acl_id
+                          FROM jsonb_populate_record(NULL::jfs_node, r_node.snapshot) AS jn)
+                 WHERE inode = r_node.inode;
+            ELSE
+                INSERT INTO jfs_node
+                SELECT * FROM jsonb_populate_record(NULL::jfs_node, r_node.snapshot);
+            END IF;
+        END IF;
+    END LOOP;
+
+    FOR r_edge IN
+        SELECT eh.parent, eh.name, eh.op, eh.snapshot
+          FROM pitr_edge_history eh
+          JOIN pitr_txn t ON t.id = eh.txn_id
+         WHERE t.parent_id = p_txn_id AND t.state = 'auto'
+         ORDER BY eh.recorded_at DESC, eh.txn_id DESC
+    LOOP
+        IF r_edge.op = 'I' THEN
+            DELETE FROM jfs_edge WHERE parent = r_edge.parent AND name = r_edge.name;
+        ELSIF r_edge.snapshot IS NOT NULL THEN
+            IF EXISTS (SELECT 1 FROM jfs_edge
+                        WHERE parent = r_edge.parent AND name = r_edge.name) THEN
+                UPDATE jfs_edge SET (parent, name, inode, type) =
+                    (SELECT je.parent, je.name, je.inode, je.type
+                       FROM jsonb_populate_record(NULL::jfs_edge, r_edge.snapshot) AS je)
+                 WHERE parent = r_edge.parent AND name = r_edge.name;
+            ELSE
+                INSERT INTO jfs_edge
+                SELECT * FROM jsonb_populate_record(NULL::jfs_edge, r_edge.snapshot);
+            END IF;
+        END IF;
+    END LOOP;
+
+    FOR r_chunk IN
+        SELECT ch.inode, ch.indx, ch.op, ch.snapshot
+          FROM pitr_chunk_history ch
+          JOIN pitr_txn t ON t.id = ch.txn_id
+         WHERE t.parent_id = p_txn_id AND t.state = 'auto'
+         ORDER BY ch.recorded_at DESC, ch.txn_id DESC
+    LOOP
+        IF r_chunk.op = 'I' THEN
+            DELETE FROM jfs_chunk WHERE inode = r_chunk.inode AND indx = r_chunk.indx;
+        ELSIF r_chunk.snapshot IS NOT NULL THEN
+            IF EXISTS (SELECT 1 FROM jfs_chunk
+                        WHERE inode = r_chunk.inode AND indx = r_chunk.indx) THEN
+                UPDATE jfs_chunk SET (inode, indx, slices) =
+                    (SELECT jc.inode, jc.indx, jc.slices
+                       FROM jsonb_populate_record(NULL::jfs_chunk, r_chunk.snapshot) AS jc)
+                 WHERE inode = r_chunk.inode AND indx = r_chunk.indx;
+            ELSE
+                INSERT INTO jfs_chunk
+                SELECT * FROM jsonb_populate_record(NULL::jfs_chunk, r_chunk.snapshot);
+            END IF;
+        END IF;
+    END LOOP;
+
+    FOR r_chunk_ref IN
+        SELECT crh.chunkid, crh.op, crh.snapshot
+          FROM pitr_chunk_ref_history crh
+          JOIN pitr_txn t ON t.id = crh.txn_id
+         WHERE t.parent_id = p_txn_id AND t.state = 'auto'
+         ORDER BY crh.recorded_at DESC, crh.txn_id DESC
+    LOOP
+        IF r_chunk_ref.op = 'I' THEN
+            DELETE FROM jfs_chunk_ref WHERE chunkid = r_chunk_ref.chunkid;
+        ELSIF r_chunk_ref.snapshot IS NOT NULL THEN
+            IF EXISTS (SELECT 1 FROM jfs_chunk_ref
+                        WHERE chunkid = r_chunk_ref.chunkid) THEN
+                UPDATE jfs_chunk_ref SET (chunkid, size, refs) =
+                    (SELECT jcr.chunkid, jcr.size, jcr.refs
+                       FROM jsonb_populate_record(NULL::jfs_chunk_ref,
+                                                  r_chunk_ref.snapshot) AS jcr)
+                 WHERE chunkid = r_chunk_ref.chunkid;
+            ELSE
+                INSERT INTO jfs_chunk_ref
+                SELECT * FROM jsonb_populate_record(NULL::jfs_chunk_ref,
+                                                    r_chunk_ref.snapshot);
+            END IF;
+        END IF;
+    END LOOP;
+
+    DELETE FROM pitr_txn WHERE parent_id = p_txn_id AND state = 'auto';
+    UPDATE pitr_txn
+       SET state = 'rolled_back', command = 'rollback', closed_at = now()
+     WHERE id = p_txn_id;
 END;
 $$ LANGUAGE plpgsql;

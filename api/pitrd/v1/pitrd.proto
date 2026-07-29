@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package pitrd.v1;
+
+option go_package = "pitr_fs/api/pitrd/v1;v1";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+service Pitrd {
+  rpc Init(InitRequest) returns (InitResponse);
+  rpc Mount(MountRequest) returns (MountResponse);
+  rpc Umount(UmountRequest) returns (google.protobuf.Empty);
+  rpc Status(StatusRequest) returns (StatusResponse);
+
+  rpc Begin(BeginRequest) returns (BeginResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  rpc Logs(LogsRequest) returns (LogsResponse);
+  rpc Revert(RevertRequest) returns (RevertResponse);
+  rpc Diff(DiffRequest) returns (DiffResponse);
+  rpc Recover(RecoverRequest) returns (RecoverResponse);
+  rpc ConfigSet(ConfigSetRequest) returns (ConfigSetResponse);
+}
+
+message InitRequest {
+  string path = 1;
+  string volume = 2;
+  string retention = 3;
+  repeated string storage_args = 4;
+}
+
+message InitResponse {
+  VolumeStatus volume = 1;
+}
+
+message MountRequest {
+  string path = 1;
+  string volume = 2;
+}
+
+message MountResponse {
+  VolumeStatus volume = 1;
+}
+
+message UmountRequest {
+  string path = 1;
+}
+
+message StatusRequest {}
+
+message VolumeStatus {
+  string name = 1;
+  string jfs_mount = 2;
+  string fuse_mount = 3;
+  bool jfs_mounted = 4;
+  bool fuse_mounted = 5;
+  string retention = 6;
+}
+
+message StatusResponse {
+  string daemon_version = 1;
+  bool postgres_healthy = 2;
+  repeated VolumeStatus volumes = 3;
+  int64 active_transactions = 4;
+}
+
+message Transaction {
+  int64 txn_id = 1;
+  string version_hash = 2;
+  optional int64 parent_id = 3;
+  string scope_path = 4;
+  string state = 5;
+  string command = 6;
+  string message = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp closed_at = 9;
+}
+
+message BeginRequest {
+  string path = 1;
+  string message = 2;
+}
+
+message BeginResponse {
+  string version_hash = 1;
+  int64 txn_id = 2;
+  Transaction transaction = 3;
+}
+
+message CommitRequest {
+  string path = 1;
+  int64 txn_id = 2;
+  string message = 3;
+}
+
+message CommitResponse {
+  string version_hash = 1;
+  int64 txn_id = 2;
+  Transaction transaction = 3;
+}
+
+message RollbackRequest {
+  string path = 1;
+  int64 txn_id = 2;
+}
+
+message RollbackResponse {
+  string version_hash = 1;
+  int64 txn_id = 2;
+  Transaction transaction = 3;
+}
+
+message LogsRequest {
+  string path = 1;
+  int32 limit = 2;
+}
+
+message LogEntry {
+  string version_hash = 1;
+  string command = 2;
+  string message = 3;
+  string state = 4;
+  string created_at = 5;
+  Transaction transaction = 6;
+}
+
+message LogsResponse {
+  repeated LogEntry entries = 1;
+}
+
+message RevertRequest {
+  string version_hash = 1;
+  string path = 2;
+  bool dry_run = 3;
+}
+
+message RevertResponse {
+  int64 applied = 1;
+  string new_version_hash = 2;
+}
+
+message DiffRequest {
+  string version_a = 1;
+  string version_b = 2;
+  string path = 3;
+}
+
+message DiffResponse {
+  int64 node_changes = 1;
+  int64 edge_changes = 2;
+  int64 chunk_changes = 3;
+}
+
+message RecoverRequest {
+  string path = 1;
+}
+
+message RecoverResponse {
+  repeated VolumeStatus volumes = 1;
+}
+
+message ConfigSetRequest {
+  string key = 1;
+  string value = 2;
+  string window = 3;
+}
+
+message ConfigSetResponse {
+  string key = 1;
+  string value = 2;
+  string window = 3;
+}

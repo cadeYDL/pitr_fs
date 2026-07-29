@@ -5,14 +5,55 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "pitr_fs/api/pitrd/v1"
 )
 
 var errNotImpl = errors.New("尚未实现;将在 Phase 2/4 落地")
+
+const rpcTimeout = 5 * time.Second
+
+type daemonClient struct {
+	conn *grpc.ClientConn
+	rpc  pb.PitrdClient
+}
+
+func dialDaemon(cmd *cobra.Command) (*daemonClient, error) {
+	socket, err := cmd.Root().PersistentFlags().GetString("socket")
+	if err != nil {
+		return nil, err
+	}
+	conn, err := grpc.NewClient(
+		"unix://"+socket,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("连接 pitrd(%s): %w", socket, err)
+	}
+	return &daemonClient{conn: conn, rpc: pb.NewPitrdClient(conn)}, nil
+}
+
+func (c *daemonClient) close() {
+	_ = c.conn.Close()
+}
+
+func rpcContext(cmd *cobra.Command) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(cmd.Context(), rpcTimeout)
+}
+
+func friendlyRPCError(cmd *cobra.Command, err error) error {
+	socket, _ := cmd.Root().PersistentFlags().GetString("socket")
+	return fmt.Errorf("pitrd 请求失败(%s): %w", socket, err)
+}
 
 func main() {
 	if err := newRoot().Execute(); err != nil {
@@ -111,7 +152,30 @@ func newStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "列出所有已知卷 + 挂载 + 事务状态",
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Status(ctx, &pb.StatusRequest{})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"connected to pitrd %s, %d volumes, %d active transactions\n",
+				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetActiveTransactions())
+			for _, volume := range resp.GetVolumes() {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"%s\tjfs=%s\tfuse=%s\tretention=%s\n",
+					volume.GetName(), volume.GetJfsMount(),
+					volume.GetFuseMount(), volume.GetRetention())
+			}
+			return nil
+		},
 	}
 }
 
@@ -134,24 +198,62 @@ func newConfigCmd() *cobra.Command {
 // ---------- 事务 / 时间旅行 ----------
 
 func newBeginCmd() *cobra.Command {
+	var message string
 	c := &cobra.Command{
 		Use:   "begin <path>",
 		Short: "在 <path> 上开一个 active 事务",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Begin(ctx, &pb.BeginRequest{
+				Path: args[0], Message: message,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			transaction := resp.GetTransaction()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "started txn %s @ %s\n",
+				transaction.GetVersionHash(), transaction.GetScopePath())
+			return nil
+		},
 	}
-	c.Flags().StringP("message", "m", "", "事务说明")
+	c.Flags().StringVarP(&message, "message", "m", "", "事务说明")
 	return c
 }
 
 func newCommitCmd() *cobra.Command {
+	var message string
 	c := &cobra.Command{
 		Use:   "commit <path>",
 		Short: "提交 <path> 上的 active 事务(触发坍缩)",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Commit(ctx, &pb.CommitRequest{
+				Path: args[0], Message: message,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			transaction := resp.GetTransaction()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "committed txn %s @ %s\n",
+				transaction.GetVersionHash(), transaction.GetScopePath())
+			return nil
+		},
 	}
-	c.Flags().StringP("message", "m", "", "commit 说明")
+	c.Flags().StringVarP(&message, "message", "m", "", "commit 说明")
 	return c
 }
 
@@ -160,18 +262,62 @@ func newRollbackCmd() *cobra.Command {
 		Use:   "rollback <path>",
 		Short: "回滚 <path> 上的 active 事务",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Rollback(ctx,
+				&pb.RollbackRequest{Path: args[0]})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			transaction := resp.GetTransaction()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "rolled back txn %s @ %s\n",
+				transaction.GetVersionHash(), transaction.GetScopePath())
+			return nil
+		},
 	}
 }
 
 func newLogsCmd() *cobra.Command {
+	var limit int
 	c := &cobra.Command{
 		Use:   "logs <path>",
 		Short: "查看 <path> 的版本历史",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Logs(ctx, &pb.LogsRequest{
+				Path: args[0], Limit: int32(limit),
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			for _, entry := range resp.GetEntries() {
+				transaction := entry.GetTransaction()
+				if transaction.GetMessage() == "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s   %s\n",
+						transaction.GetVersionHash(), transaction.GetCommand())
+				} else {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s   %s   # %s\n",
+						transaction.GetVersionHash(), transaction.GetCommand(),
+						transaction.GetMessage())
+				}
+			}
+			return nil
+		},
 	}
-	c.Flags().IntP("number", "n", 20, "最多返回多少条")
+	c.Flags().IntVarP(&limit, "number", "n", 20, "最多返回多少条")
 	return c
 }
 

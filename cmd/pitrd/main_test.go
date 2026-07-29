@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 // shortSock — 短路径 sock, 避开 macOS 103-byte sun_path 限制
@@ -25,7 +27,7 @@ func TestServe_CreatesSocketAndBlocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serve(ctx, sock) }()
+	go func() { errCh <- serveSocket(ctx, sock, grpc.NewServer()) }()
 
 	waitCtx, wCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer wCancel()
@@ -61,7 +63,7 @@ func TestServe_CreatesSocketAndBlocks(t *testing.T) {
 
 // TestServe_EmptySocketRejected — 空 socket 应报错
 func TestServe_EmptySocketRejected(t *testing.T) {
-	if err := serve(context.Background(), ""); err == nil {
+	if err := serveSocket(context.Background(), "", grpc.NewServer()); err == nil {
 		t.Fatal("空 socket 应报错")
 	}
 }
@@ -76,7 +78,7 @@ func TestServe_StaleSocketReplaced(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serve(ctx, sock) }()
+	go func() { errCh <- serveSocket(ctx, sock, grpc.NewServer()) }()
 
 	// 等到能 dial(即残留被替换、监听已就绪)
 	deadline := time.Now().Add(2 * time.Second)
@@ -98,5 +100,8 @@ func TestServe_StaleSocketReplaced(t *testing.T) {
 	<-errCh
 	if !dialed {
 		t.Fatal("残留 socket 场景下 dial 未成功")
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Fatalf("退出后 socket 应清理,stat err=%v", err)
 	}
 }

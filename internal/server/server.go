@@ -1,0 +1,39 @@
+package server
+
+import (
+	"pitr_fs/internal/pg"
+	"pitr_fs/internal/txn"
+
+	pb "pitr_fs/api/pitrd/v1"
+)
+
+const DefaultDaemonVersion = "dev"
+
+type Config struct {
+	DaemonVersion string
+	Volume        string
+	JFSMount      string
+	FUSEMount     string
+	Retention     string
+}
+
+type Server struct {
+	pb.UnimplementedPitrdServer
+
+	db  *pg.DB
+	mgr *txn.Manager
+	cfg Config
+}
+
+func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
+	if cfg.DaemonVersion == "" {
+		cfg.DaemonVersion = DefaultDaemonVersion
+	}
+	if cfg.Volume == "" {
+		cfg.Volume = "default"
+	}
+	if cfg.Retention == "" {
+		cfg.Retention = "compact"
+	}
+	return &Server{db: db, mgr: mgr, cfg: cfg}
+}

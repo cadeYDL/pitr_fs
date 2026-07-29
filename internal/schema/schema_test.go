@@ -242,7 +242,7 @@ func TestSQL_TablesExist(t *testing.T) {
 	}
 
 	// 存储过程
-	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert",
+	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert", "pitr_rollback",
 		"pitr_capture_node_change", "pitr_capture_edge_change",
 		"pitr_capture_chunk_change", "pitr_capture_chunk_ref_change",
 		"pitr_scopes_overlap"} {
