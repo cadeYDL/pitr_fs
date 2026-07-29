@@ -1,6 +1,7 @@
 # P0 可行性验证报告 —— Task 0.3: PG 连接共享
 
-**状态**: PG 层机制已验证(4/4 PASS);JuiceFS SDK 复用连接调研待做
+**状态**: DONE — PG 层机制 4/4 PASS;JuiceFS 1.4.0 无法跨进程复用
+pitrd 的 PG 事务,最终选择“单 daemon 开放 auto 窗口”退化方案
 **关联文档**: 设计文档 §5.3、执行计划 Task 0.3
 
 ---
@@ -47,7 +48,7 @@ cd bench
 
 结论:**生产版方案在 PG 层是自洽的**,剩下只看 JuiceFS SDK 能否复用连接(见 §2.2)。
 
-### 2.2 JuiceFS SDK 复用连接调研 (人工)
+### 2.2 JuiceFS SDK 复用连接调研
 
 JuiceFS 元数据 SQL 后端的核心入口在 `pkg/meta/sql.go`,底层是 `xorm.Engine`。需要回答:
 
@@ -67,11 +68,26 @@ grep -rn "type Meta interface" pkg/meta/interface.go
 grep -rn "meta.RegisterMeta\|EngineArgs" pkg/meta/
 ```
 
-**调研结论**(填入):
+**调研环境**:
 
-- 是否有官方 API 传入 `*sql.DB`: ______
-- 是否有 hook 让 xorm.Engine 使用固定连接: ______
-- 若都没有,fork 改造点估算(哪几个文件、多少行): ______
+- 运行环境:OrbStack `calw`
+- JuiceFS:`1.4.0+2026-07-06.62bedf3`
+- 对应源码提交:`62bedf3c`
+
+**调研结论**:
+
+- 官方 `meta.NewClient(uri, conf)` 只接受 DSN,不接受外部 `*sql.DB`、
+  `*sql.Conn` 或 `pgx.Conn`。
+- SQL meta 在 `newSQLMeta` 内部调用 `xorm.NewEngine`,连接池由 JuiceFS
+  自己创建。虽然包内有未导出的 `engineCreator`,它也只能替换 engine 创建,
+  不能把 pitrd 已开启的 PG transaction 传给一次元数据操作。
+- `dbMeta.txn` 每次调用 `xorm.Engine.Transaction`,自行从 JuiceFS 连接池获取连接
+  并开启事务。
+- 当前部署拓扑中 `juicefs mount` 是独立进程,pitrd 的 FUSE loopback 通过
+  POSIX syscall 进入该进程。即使给 JuiceFS 增加 engine 注入 API,也无法把
+  pitrd 进程中的 pgx transaction 跨进程传递给某一次 syscall。
+- 因此严格方案不是“少于 100 行的 fork”;它需要给 JuiceFS 增加跨进程事务/
+  请求上下文协议并贯穿 FUSE 与 meta 层,超出一期范围。
 
 ### 2.3 综合判定
 
@@ -81,7 +97,7 @@ grep -rn "meta.RegisterMeta\|EngineArgs" pkg/meta/
 | SDK 无 API 但 fork ≤ 100 行 | ✅ fork + 生产方案 |
 | SDK 无 API 且 fork 成本高 | ❌ 走时间戳退化 |
 
-**最终判定**: ______
+**最终判定**:❌ 不可共享,采用退化方案。
 
 ---
 
@@ -104,19 +120,24 @@ grep -rn "meta.RegisterMeta\|EngineArgs" pkg/meta/
 
 **具体退化**:
 
-- 触发器不读 GUC,直接 `INSERT ... (txn_id = NULL, recorded_at = clock_timestamp())`(demo/init.sql 已经是这个版本)
-- pitrd 在打点事务里 `INSERT pitr_txn (started_at, ended_at)` 圈时间窗
-- revert 时按 `pitr_node_history.recorded_at ∈ [txn.started_at, txn.ended_at]` 关联
+- Phase 3 的 proxy 在一次 JuiceFS 写操作前,先提交一条
+  `state='auto', closed_at IS NULL` 的开放版本。
+- JuiceFS 独立连接上的 trigger 在 GUC 为空时,选择唯一开放的 auto,
+  直接把其 id 写入 history 的 `txn_id`。
+- 写操作结束后 proxy 设置 `closed_at`;失败时反向补偿并删除 auto。
+- daemon 用互斥锁保证同一时刻至多一个开放窗口。相比事后用时间戳关联,
+  该方案仍保留 FK 和明确 txn_id,但本质上仍是独立事务窗口。
 
 **精度损失**:
 
 - **并发写重叠**: version_A `[t1, t3]`、version_B `[t2, t4]`,重叠区 `[t2, t3]` 里的 history 行按启发式(fd/path 前缀)归属 → 存在归错的可能
-- **补偿而非 rollback**: pitrd 事务失败要主动 DELETE 时间窗里的 history 行,不能靠 PG 自动 rollback
+- **补偿而非 rollback**:pitrd 事务失败要主动 replay/删除开放窗口里的
+  history,不能靠 PG 自动 rollback。
 - **性能持平**: 触发器少一次 `current_setting` 调用,反而略快
 
 **这个损失可接受吗?**
 
-- 单 daemon 场景(≥95% 使用场景): 时间窗天然不重叠(daemon 串行提交事务),退化方案 == 生产方案
+- 单 daemon 场景:开放窗口不重叠,history 归属是确定的。
 - 多 daemon / 高并发: 归错的概率见 §4 补测(暂未做,等 SDK 结论后视情况)
 
 ---

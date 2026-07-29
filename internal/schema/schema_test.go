@@ -23,9 +23,9 @@ import (
 // ============================================================================
 
 var (
-	adminDSN     string
-	containerID  string
-	dbCounter    int
+	adminDSN    string
+	containerID string
+	dbCounter   int
 )
 
 func TestMain(m *testing.M) {
@@ -225,7 +225,7 @@ func TestSQL_TablesExist(t *testing.T) {
 
 	for _, tbl := range []string{
 		"pitr_txn", "pitr_node_history", "pitr_edge_history",
-		"pitr_chunk_history", "pitr_blob_retention",
+		"pitr_chunk_history", "pitr_chunk_ref_history", "pitr_blob_retention",
 	} {
 		n := mustScalarInt(t, conn,
 			"SELECT count(*) FROM information_schema.tables WHERE table_name = $1", tbl)
@@ -243,7 +243,9 @@ func TestSQL_TablesExist(t *testing.T) {
 
 	// 存储过程
 	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert",
-		"pitr_capture_node_change", "pitr_capture_edge_change", "pitr_capture_chunk_change"} {
+		"pitr_capture_node_change", "pitr_capture_edge_change",
+		"pitr_capture_chunk_change", "pitr_capture_chunk_ref_change",
+		"pitr_scopes_overlap"} {
 		n := mustScalarInt(t, conn,
 			"SELECT count(*) FROM pg_proc WHERE proname = $1", proc)
 		if n < 1 {
@@ -272,8 +274,8 @@ func TestTrigger_CapturesUpdate(t *testing.T) {
 
 	// 建一个 auto 版本,给 GUC 用
 	txnID := mustScalarInt(t, conn, `
-        INSERT INTO pitr_txn (version_hash, scope_path, state, command)
-        VALUES ('t01_upd_xxxx', '/', 'auto', 'write:/a') RETURNING id`)
+        INSERT INTO pitr_txn (version_hash, scope_path, state, command, closed_at)
+        VALUES ('t01_upd_xxxx', '/', 'auto', 'write:/a', now()) RETURNING id`)
 
 	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (100, 33188, 1, 0)")
 	// SET LOCAL 只在事务内生效, 触发器读 GUC 才拿得到 txn_id
@@ -311,6 +313,69 @@ func TestTrigger_SessionVarFilter(t *testing.T) {
 }
 
 // ============================================================================
+// TestTrigger_OpenAutoFallback — JuiceFS 使用独立连接时没有 GUC,触发器应把写入
+// 归到唯一开放的 auto 窗口;窗口关闭后不再记录。
+// ============================================================================
+func TestTrigger_OpenAutoFallback(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, `
+		INSERT INTO jfs_node (inode, mode, nlink, length)
+		VALUES (210, 33188, 1, 0), (211, 33188, 1, 0)`)
+
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command)
+		VALUES ('fallback0001', 1, '/a', 'auto', 'write:/a/f') RETURNING id`)
+
+	// 不设置 pitr.current_txn,模拟 JuiceFS 的独立 PG 连接。
+	mustExec(t, conn, "UPDATE jfs_node SET length = 10 WHERE inode = 210")
+	got := mustScalarInt(t, conn,
+		"SELECT count(*) FROM pitr_node_history WHERE txn_id=$1 AND inode=210", autoID)
+	if got != 1 {
+		t.Fatalf("开放 auto 窗口应捕获 1 条 history,实际 %d", got)
+	}
+
+	mustExec(t, conn, "UPDATE pitr_txn SET closed_at=now() WHERE id=$1", autoID)
+	mustExec(t, conn, "UPDATE jfs_node SET length = 10 WHERE inode = 211")
+	got = mustScalarInt(t, conn,
+		"SELECT count(*) FROM pitr_node_history WHERE txn_id=$1 AND inode=211", autoID)
+	if got != 0 {
+		t.Fatalf("auto 窗口关闭后不应继续捕获,实际 %d", got)
+	}
+}
+
+// ============================================================================
+// TestTrigger_CapturesChunkRef — chunk 指针回退所需的引用计数也必须进入 history。
+// ============================================================================
+func TestTrigger_CapturesChunkRef(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, "INSERT INTO jfs_chunk_ref (chunkid, size, refs) VALUES (900, 4, 1)")
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command, closed_at)
+		VALUES ('chunkref0001', 1, '/a', 'auto', 'write:/a/f', now()) RETURNING id`)
+
+	execUnderTxn(t, conn, autoID, "UPDATE jfs_chunk_ref SET refs=0 WHERE chunkid=900")
+	got := mustScalarInt(t, conn, `
+		SELECT count(*) FROM pitr_chunk_ref_history
+		WHERE txn_id=$1 AND chunkid=900 AND op='U'
+		  AND (snapshot->>'refs')::int=1`, autoID)
+	if got != 1 {
+		t.Fatalf("chunk_ref UPDATE 应捕获旧引用计数,实际 %d", got)
+	}
+}
+
+// ============================================================================
 // TestCollapse_KeepsEarliestSnapshot — 模拟 auto v1/v2/v3,坍缩后每个 inode 只留
 // 最早那次改动的 snapshot,commit 版本自身持有全部 history
 // ============================================================================
@@ -334,8 +399,8 @@ func TestCollapse_KeepsEarliestSnapshot(t *testing.T) {
 	var autoIDs [3]int64
 	for i, tag := range []string{"a01_v1_xxxxx", "a01_v2_xxxxx", "a01_v3_xxxxx"} {
 		autoIDs[i] = mustScalarInt(t, conn, `
-            INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command)
-            VALUES ($1, $2, '/a', 'auto', 'w') RETURNING id`, tag, commitID)
+            INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command, closed_at)
+            VALUES ($1, $2, '/a', 'auto', 'w', now()) RETURNING id`, tag, commitID)
 	}
 
 	// 建一行 jfs_node, 让 auto v1/v2/v3 各改一次同一 inode
@@ -425,6 +490,70 @@ func TestRevert_RestoresRow(t *testing.T) {
 }
 
 // ============================================================================
+// TestRevert_ReplaysAllVersions — 同一 inode 多次修改时必须反向应用全部快照。
+// ============================================================================
+func TestRevert_ReplaysAllVersions(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (410, 33188, 1, 100)")
+	_ = mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn (version_hash, scope_path, state, command)
+		VALUES ('rv_multi_v1x', '/a', 'committed', 'commit') RETURNING id`)
+
+	for _, tc := range []struct {
+		hash   string
+		length int64
+	}{
+		{hash: "rv_multi_v2x", length: 200},
+		{hash: "rv_multi_v3x", length: 300},
+	} {
+		autoID := mustScalarInt(t, conn, `
+			INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command, closed_at)
+			VALUES ($1, 1, '/a', 'auto', 'write:/a/f', now()) RETURNING id`, tc.hash)
+		execUnderTxn(t, conn, autoID,
+			"UPDATE jfs_node SET length=$1 WHERE inode=410", tc.length)
+	}
+
+	mustExec(t, conn, "CALL pitr_revert($1)", "rv_multi_v1x")
+	got := mustScalarInt(t, conn, "SELECT length FROM jfs_node WHERE inode=410")
+	if got != 100 {
+		t.Fatalf("多版本 revert 应恢复到 length=100,实际 %d", got)
+	}
+}
+
+// ============================================================================
+// TestRevert_ScopeUsesPathBoundary — /a 不能错误匹配 /abc。
+// ============================================================================
+func TestRevert_ScopeUsesPathBoundary(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, "INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (420, 33188, 1, 1)")
+	_ = mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn (version_hash, scope_path, state, command)
+		VALUES ('scopebefore1', '/', 'committed', 'commit') RETURNING id`)
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn (version_hash, parent_id, scope_path, state, command, closed_at)
+		VALUES ('scopeafter01', 1, '/abc', 'auto', 'write:/abc/f', now()) RETURNING id`)
+	execUnderTxn(t, conn, autoID, "UPDATE jfs_node SET length=2 WHERE inode=420")
+
+	mustExec(t, conn, "CALL pitr_revert($1, $2)", "scopebefore1", "/a")
+	got := mustScalarInt(t, conn, "SELECT length FROM jfs_node WHERE inode=420")
+	if got != 2 {
+		t.Fatalf("revert /a 不应影响 /abc,实际 length=%d", got)
+	}
+}
+
+// ============================================================================
 // mock jfs_* 表(裁剪版, 仅包含被 pitr 依赖的字段)
 // 真实 JuiceFS 表结构:https://github.com/juicedata/juicefs/blob/main/pkg/meta/sql.go
 // ============================================================================
@@ -461,5 +590,10 @@ CREATE TABLE IF NOT EXISTS jfs_chunk (
     indx    int,
     slices  bytea,
     PRIMARY KEY (inode, indx)
+);
+CREATE TABLE IF NOT EXISTS jfs_chunk_ref (
+    chunkid  bigint PRIMARY KEY,
+    size     int,
+    refs     int
 );
 `
