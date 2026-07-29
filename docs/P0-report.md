@@ -1,6 +1,6 @@
 # P0 可行性验证报告 —— Task 0.3: PG 连接共享
 
-**状态**: 待执行
+**状态**: PG 层机制已验证(4/4 PASS);JuiceFS SDK 复用连接调研待做
 **关联文档**: 设计文档 §5.3、执行计划 Task 0.3
 
 ---
@@ -38,12 +38,14 @@ cd bench
 ./verify-conn-share.sh
 ```
 
-**结论**(跑完填入):
+**结论**(2026-07-29 跑通,4/4 PASS):
 
-- [ ] 场景 A: PASS / FAIL — ______
-- [ ] 场景 B: PASS / FAIL — ______
-- [ ] 场景 C: PASS / FAIL — ______
-- [ ] 场景 D: PASS / FAIL — ______
+- [x] 场景 A: **PASS** — 同连接 + SET LOCAL + UPDATE,触发器读到 `txn_id=42`
+- [x] 场景 B: **PASS** — 跨连接,触发器读到 `txn_id=NULL`(GUC 定量丢失,证实必须共享连接)
+- [x] 场景 C: **PASS** — SET SESSION 泄漏,inode=4 被错误归属为 99(证实归属必须用 LOCAL 不能 SESSION)
+- [x] 场景 D: **PASS** — 跨连接 FK 引用未 commit 的 pitr_txn 被拒(证实归属和主写必须在同一事务)
+
+结论:**生产版方案在 PG 层是自洽的**,剩下只看 JuiceFS SDK 能否复用连接(见 §2.2)。
 
 ### 2.2 JuiceFS SDK 复用连接调研 (人工)
 
