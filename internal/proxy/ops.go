@@ -21,7 +21,7 @@ func (n *Node) Create(
 ) (inode *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	path := n.root.visiblePath(n, name)
 	var file *trackedFile
-	window, errno := n.versionedHookWindow(ctx, path, command("create", path), 0,
+	errno = n.versionedHook(ctx, path, command("create", path), 0,
 		func() syscall.Errno {
 			var base fs.FileHandle
 			inode, base, fuseFlags, errno = n.LoopbackNode.Create(
@@ -32,12 +32,12 @@ func (n *Node) Create(
 					return syscall.EIO
 				}
 				fh = file
+				// 可写句柄必须绕过上层内核页缓存,否则小写入可能在 auto
+				// 窗口关闭后才下发到 JuiceFS,无法确定 history 归属。
+				fuseFlags |= fuse.FOPEN_DIRECT_IO
 			}
 			return errno
 		})
-	if errno == 0 && file != nil {
-		n.root.storeFD(file.id, window)
-	}
 	return inode, fh, fuseFlags, errno
 }
 
@@ -134,6 +134,9 @@ func (n *Node) Open(
 				return syscall.EIO
 			}
 			fh = file
+			if file.writable {
+				fuseFlags |= fuse.FOPEN_DIRECT_IO
+			}
 		}
 		return errno
 	}
@@ -142,13 +145,7 @@ func (n *Node) Open(
 		return fh, fuseFlags, errno
 	}
 
-	var window fdVersion
-	window, errno = n.versionedHookWindow(ctx, path, command("open", path), 0, open)
-	if errno == 0 {
-		if file, ok := tracked(fh); ok {
-			n.root.storeFD(file.id, window)
-		}
-	}
+	errno = n.versionedHook(ctx, path, command("open", path), 0, open)
 	return fh, fuseFlags, errno
 }
 

@@ -210,7 +210,7 @@ func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 		seen[op] = true
 	}
 	for _, op := range []string{
-		"mkdir", "create", "setxattr", "removexattr", "truncate", "link", "symlink",
+		"mkdir", "create", "write", "setxattr", "removexattr", "truncate", "link", "symlink",
 		"rename", "unlink", "rmdir",
 	} {
 		if !seen[op] {

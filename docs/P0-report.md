@@ -128,9 +128,12 @@ grep -rn "meta.RegisterMeta\|EngineArgs" pkg/meta/
 - daemon 用互斥锁保证同一时刻至多一个开放窗口。相比事后用时间戳关联,
   该方案仍保留 FK 和明确 txn_id,但本质上仍是独立事务窗口。
 
-**精度损失**:
+**精度损失 / 限制**:
 
-- **并发写重叠**: version_A `[t1, t3]`、version_B `[t2, t4]`,重叠区 `[t2, t3]` 里的 history 行按启发式(fd/path 前缀)归属 → 存在归错的可能
+- **单 daemon 并发**:Phase 3 已用全局窗口互斥串行化所有变更 syscall,
+  开放窗口不会重叠,history 归属确定;代价是不同文件的变更也会短暂串行。
+- **多 daemon**:数据库 `uniq_open_auto_window` 阻止第二个开放窗口,因此会
+  失败并返回 EIO,不会静默归错;一期不支持多 daemon 并行写同一元数据卷。
 - **补偿而非 rollback**:pitrd 事务失败要主动 replay/删除开放窗口里的
   history,不能靠 PG 自动 rollback。
 - **性能持平**: 触发器少一次 `current_setting` 调用,反而略快
@@ -138,7 +141,8 @@ grep -rn "meta.RegisterMeta\|EngineArgs" pkg/meta/
 **这个损失可接受吗?**
 
 - 单 daemon 场景:开放窗口不重叠,history 归属是确定的。
-- 多 daemon / 高并发: 归错的概率见 §4 补测(暂未做,等 SDK 结论后视情况)
+- 多 daemon:明确拒绝第二个开放窗口;后续若要扩展,需引入可跨进程传递的
+  请求归属协议,不能只放开唯一索引。
 
 ---
 

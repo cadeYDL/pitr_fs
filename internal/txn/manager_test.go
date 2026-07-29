@@ -34,7 +34,6 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "启动 PostgreSQL: %v: %s\n", err, out)
 		os.Exit(1)
 	}
-	defer exec.Command("docker", "rm", "-f", name).Run()
 	ipOut, err := exec.Command("docker", "inspect", "-f",
 		"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name).Output()
 	if err != nil {
@@ -58,7 +57,14 @@ func TestMain(m *testing.M) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	if err := exec.Command("docker", "rm", "-f", name).Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "清理 PostgreSQL 测试容器:", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
 }
 
 func setupManager(t *testing.T) (*Manager, *pg.DB) {
