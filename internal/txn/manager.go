@@ -266,6 +266,65 @@ func (m *Manager) CloseAutoVersion(ctx context.Context, autoID int64) error {
 	return nil
 }
 
+// OpenAutoVersion 在独立事务里创建开放的 auto 窗口。JuiceFS 使用自己的
+// PostgreSQL 连接,桥接触发器会把窗口期间的元数据变化归属到该 auto。
+func (m *Manager) OpenAutoVersion(
+	ctx context.Context,
+	parentID int64,
+	command string,
+) (int64, error) {
+	var autoID int64
+	err := m.db.InTx(ctx, func(tx pg.Tx) error {
+		id, _, err := m.CreateAutoVersion(ctx, tx, parentID, command)
+		autoID = id
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("打开 auto(parent=%d): %w", parentID, err)
+	}
+	return autoID, nil
+}
+
+// ReopenAutoVersion 让同一 fd 的后续写复用首次写创建的 auto。parentID 校验
+// 防止 fd 跨 active 事务生命周期后误用旧版本。
+func (m *Manager) ReopenAutoVersion(ctx context.Context, autoID, parentID int64) error {
+	affected, err := m.db.Exec(ctx, `
+		UPDATE pitr_txn SET closed_at=NULL
+		 WHERE id=$1 AND parent_id=$2 AND state='auto' AND closed_at IS NOT NULL`,
+		autoID, parentID)
+	if err != nil {
+		return fmt.Errorf("重开 auto %d: %w", autoID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w:auto %d 不存在、未关闭或 parent 不匹配",
+			ErrIllegalTransit, autoID)
+	}
+	return nil
+}
+
+// AbortAutoVersion 反向补偿一个失败的 FUSE 操作并删除对应 auto。SQL 过程只
+// replay 该 auto,不会回滚同一 active 事务下已经成功的其他 auto。
+func (m *Manager) AbortAutoVersion(ctx context.Context, autoID int64) error {
+	if _, err := m.db.Exec(ctx, "CALL pitr_abort_auto($1)", autoID); err != nil {
+		return fmt.Errorf("补偿 auto %d: %w", autoID, err)
+	}
+	return nil
+}
+
+// CloseDanglingAutoVersions 收口 daemon 异常退出时遗留的窗口。对应 JuiceFS
+// 操作可能已经成功,因此保留 auto/history 并把它关闭,避免启动后出现两个开放
+// 窗口。正常运行时返回 0。
+func (m *Manager) CloseDanglingAutoVersions(ctx context.Context) (int64, error) {
+	affected, err := m.db.Exec(ctx, `
+		UPDATE pitr_txn
+		   SET closed_at=now()
+		 WHERE state='auto' AND closed_at IS NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("关闭遗留 auto 窗口: %w", err)
+	}
+	return affected, nil
+}
+
 func (m *Manager) List(ctx context.Context, scope string, limit int) ([]*Txn, error) {
 	normalized, err := NormalizeScope(scope)
 	if err != nil {

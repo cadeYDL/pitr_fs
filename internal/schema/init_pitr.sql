@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS pitr_txn (
 
 CREATE INDEX IF NOT EXISTS idx_pitr_txn_scope_state ON pitr_txn (scope_path, state);
 CREATE INDEX IF NOT EXISTS idx_pitr_txn_created     ON pitr_txn (created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_auto_window
+    ON pitr_txn ((1))
+    WHERE state = 'auto' AND closed_at IS NULL;
 
 -- 一个 scope 同时只能有一个 active 事务(一期约束)
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_txn_per_path
@@ -603,5 +606,70 @@ BEGIN
     UPDATE pitr_txn
        SET state = 'rolled_back', command = 'rollback', closed_at = now()
      WHERE id = p_txn_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- failed auto compensation
+--
+-- FUSE action 失败时只补偿对应 auto。复用 pitr_rollback 的成熟 replay 路径:
+-- 临时摘下同 parent 的其他 auto,rollback 目标 auto,然后恢复 active parent 与
+-- 其他 auto 的父子关系。整个过程运行在 CALL 所在事务中,任一步失败都会原子
+-- 回滚,不会暴露临时拓扑。
+-- ============================================================================
+
+CREATE OR REPLACE PROCEDURE pitr_abort_auto(p_auto_id bigint) AS $$
+DECLARE
+    v_parent_id      bigint;
+    v_auto_state     text;
+    v_parent_state   text;
+    v_parent_command text;
+    v_sibling_ids    bigint[];
+BEGIN
+    SELECT parent_id, state
+      INTO v_parent_id, v_auto_state
+      FROM pitr_txn
+     WHERE id = p_auto_id
+     FOR UPDATE;
+    IF v_auto_state IS NULL THEN
+        RAISE EXCEPTION 'pitr_abort_auto: auto % 不存在', p_auto_id;
+    END IF;
+    IF v_auto_state <> 'auto' OR v_parent_id IS NULL THEN
+        RAISE EXCEPTION 'pitr_abort_auto: txn % state=% parent=% 不是 auto',
+            p_auto_id, v_auto_state, v_parent_id;
+    END IF;
+
+    SELECT state, command
+      INTO v_parent_state, v_parent_command
+      FROM pitr_txn
+     WHERE id = v_parent_id
+     FOR UPDATE;
+    IF v_parent_state <> 'active' THEN
+        RAISE EXCEPTION 'pitr_abort_auto: parent % state=% 不是 active',
+            v_parent_id, v_parent_state;
+    END IF;
+
+    SELECT array_agg(id ORDER BY id)
+      INTO v_sibling_ids
+      FROM pitr_txn
+     WHERE parent_id = v_parent_id
+       AND state = 'auto'
+       AND id <> p_auto_id;
+
+    UPDATE pitr_txn
+       SET parent_id = NULL
+     WHERE id = ANY(COALESCE(v_sibling_ids, ARRAY[]::bigint[]));
+
+    CALL pitr_rollback(v_parent_id);
+
+    UPDATE pitr_txn
+       SET state = 'active',
+           command = v_parent_command,
+           closed_at = NULL
+     WHERE id = v_parent_id;
+
+    UPDATE pitr_txn
+       SET parent_id = v_parent_id
+     WHERE id = ANY(COALESCE(v_sibling_ids, ARRAY[]::bigint[]));
 END;
 $$ LANGUAGE plpgsql;

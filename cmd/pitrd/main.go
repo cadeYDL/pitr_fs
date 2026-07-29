@@ -21,6 +21,7 @@ import (
 	pb "pitr_fs/api/pitrd/v1"
 	pitrmount "pitr_fs/internal/mount"
 	"pitr_fs/internal/pg"
+	"pitr_fs/internal/proxy"
 	pitrserver "pitr_fs/internal/server"
 	"pitr_fs/internal/txn"
 )
@@ -95,12 +96,35 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	}()
 
 	mgr := txn.NewManager(db)
+	if closed, err := mgr.CloseDanglingAutoVersions(cmd.Context()); err != nil {
+		return err
+	} else if closed != 0 {
+		slog.Warn("closed dangling auto windows", "count", closed)
+	}
+	fuseProxy, err := proxy.NewLoopback(
+		flagJFSMount,
+		flagFUSEMount,
+		proxy.WithManager(mgr),
+	)
+	if err != nil {
+		return fmt.Errorf("初始化 FUSE 代理: %w", err)
+	}
+	if err := fuseProxy.Start(); err != nil {
+		return fmt.Errorf("挂载 FUSE 代理: %w", err)
+	}
+	defer func() {
+		if err := fuseProxy.Unmount(); err != nil {
+			slog.Error("stop FUSE proxy", "error", err)
+		}
+	}()
+
 	handler := pitrserver.New(db, mgr, pitrserver.Config{
-		Volume:     flagVolume,
-		JFSMount:   flagJFSMount,
-		FUSEMount:  flagFUSEMount,
-		Retention:  flagRetention,
-		JFSMounted: true,
+		Volume:      flagVolume,
+		JFSMount:    flagJFSMount,
+		FUSEMount:   flagFUSEMount,
+		Retention:   flagRetention,
+		JFSMounted:  true,
+		FUSEMounted: true,
 	})
 	grpcServer := grpc.NewServer()
 	pb.RegisterPitrdServer(grpcServer, handler)

@@ -260,6 +260,119 @@ func TestRollback_ReplaysHistory(t *testing.T) {
 	}
 }
 
+func TestAutoVersion_OpenReopenClose(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	active, err := mgr.Begin(ctx, "/a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	autoID, err := mgr.OpenAutoVersion(ctx, active.ID, "write:/a/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CloseAutoVersion(ctx, autoID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ReopenAutoVersion(ctx, autoID, active.ID); err != nil {
+		t.Fatal(err)
+	}
+	var closed bool
+	if err := db.QueryRow(ctx,
+		"SELECT closed_at IS NOT NULL FROM pitr_txn WHERE id=$1", autoID).
+		Scan(&closed); err != nil {
+		t.Fatal(err)
+	}
+	if closed {
+		t.Fatal("reopen 后 closed_at 应为 NULL")
+	}
+	if err := mgr.CloseAutoVersion(ctx, autoID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseDanglingAutoVersions(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	active, err := mgr.Begin(ctx, "/a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	autoID, err := mgr.OpenAutoVersion(ctx, active.ID, "write:/a/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed, err := mgr.CloseDanglingAutoVersions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed != 1 {
+		t.Fatalf("closed=%d", closed)
+	}
+	var isClosed bool
+	if err := db.QueryRow(ctx,
+		"SELECT closed_at IS NOT NULL FROM pitr_txn WHERE id=$1", autoID).
+		Scan(&isClosed); err != nil {
+		t.Fatal(err)
+	}
+	if !isClosed {
+		t.Fatal("遗留 auto 应被关闭")
+	}
+}
+
+func TestAbortAutoVersion_OnlyReplaysTarget(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx,
+		"INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (100, 33188, 1, 10)"); err != nil {
+		t.Fatal(err)
+	}
+	active, err := mgr.Begin(ctx, "/a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingID := createClosedAuto(t, mgr, db, active.ID, "chmod:/a/f")
+	targetID := createClosedAuto(t, mgr, db, active.ID, "write:/a/f")
+	if err := db.InTx(ctx, func(tx pg.Tx) error {
+		if err := tx.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(targetID)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, "UPDATE jfs_node SET length=99 WHERE inode=100")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.AbortAutoVersion(ctx, targetID); err != nil {
+		t.Fatal(err)
+	}
+	var length int
+	if err := db.QueryRow(ctx, "SELECT length FROM jfs_node WHERE inode=100").
+		Scan(&length); err != nil {
+		t.Fatal(err)
+	}
+	var parentState string
+	if err := db.QueryRow(ctx, "SELECT state FROM pitr_txn WHERE id=$1", active.ID).
+		Scan(&parentState); err != nil {
+		t.Fatal(err)
+	}
+	var siblingParent int64
+	if err := db.QueryRow(ctx, "SELECT parent_id FROM pitr_txn WHERE id=$1", siblingID).
+		Scan(&siblingParent); err != nil {
+		t.Fatal(err)
+	}
+	var targetCount int
+	if err := db.QueryRow(ctx, "SELECT count(*) FROM pitr_txn WHERE id=$1", targetID).
+		Scan(&targetCount); err != nil {
+		t.Fatal(err)
+	}
+	if length != 10 || parentState != StateActive ||
+		siblingParent != active.ID || targetCount != 0 {
+		t.Fatalf("length=%d state=%s sibling.parent=%d target.count=%d",
+			length, parentState, siblingParent, targetCount)
+	}
+}
+
 func TestVersionHash_NoCollision(t *testing.T) {
 	const count = 1000
 	hashes := make(chan string, count)

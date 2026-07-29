@@ -1,7 +1,7 @@
 # ============================================================================
 # pitr-fs: all-in-one 镜像
 #   阶段 1 golang 构建 pitrd + pitr 静态二进制
-#   阶段 2 基于 postgres:16, 装 juicefs + fuse3 + tini, 铺 SQL 与 entrypoint
+#   阶段 2 基于 postgres:16, 装 juicefs + fuse3 + tini,铺 SQL 与 entrypoint
 # 见设计文档 §13.2
 # ============================================================================
 
@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/pitrd ./cmd/pitrd 
 # ---- 阶段 2: 运行镜像 ----
 FROM postgres:16
 
-# JuiceFS + FUSE + tini
+# JuiceFS + FUSE3(fusermount3,供 JuiceFS 与 pitr proxy 双层挂载)+ tini
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl fuse3 tini \
     && curl -sSL https://d.juicefs.com/install | sh - \
