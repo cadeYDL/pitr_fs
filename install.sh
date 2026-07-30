@@ -41,6 +41,30 @@ need_docker() {
     docker info >/dev/null 2>&1        || { echo "错误: Docker daemon 未运行" >&2; exit 1; }
 }
 
+detach_stale_fuse() {
+    case "$WORKSPACE" in
+        /*) ;;
+        *) echo "错误: PITR_WORKSPACE 必须是绝对路径: $WORKSPACE" >&2; return 1 ;;
+    esac
+    [ "$WORKSPACE" != "/" ] ||
+        { echo "错误: PITR_WORKSPACE 不能是根目录" >&2; return 1; }
+
+    local fs_type
+    fs_type=$(findmnt -n -o FSTYPE --target "$WORKSPACE" 2>/dev/null || true)
+    [ "$fs_type" = "fuse.pitrfs" ] || return 0
+
+    echo "==> 卸载失联的 pitr FUSE: $WORKSPACE"
+    if fusermount3 -uz "$WORKSPACE" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+        sudo fusermount3 -uz "$WORKSPACE" >/dev/null 2>&1 ||
+            sudo umount -l "$WORKSPACE"
+        return
+    fi
+    umount -l "$WORKSPACE"
+}
+
 # 端到端 ready 信号:socket 建立且一次真实 gRPC Status 成功。只检查 socket
 # 文件会在 SIGKILL 后误认容器可用，因为 writable layer 可能短暂保留
 # 上一进程留下的 unix socket。
@@ -86,6 +110,7 @@ EOF2
 
 run_container() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    detach_stale_fuse
     docker run -d --name "$CONTAINER" \
         --restart unless-stopped \
         --privileged \
@@ -136,6 +161,7 @@ EOF
 
 do_uninstall() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    detach_stale_fuse
     if [ "${1:-}" = "--purge" ]; then
         docker volume rm "$PG_VOLUME" "$DATA_VOLUME" >/dev/null 2>&1 || true
         echo "  数据卷已清理"
@@ -162,6 +188,7 @@ do_recover() {
         state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER")
         if [ "$state" != "running" ]; then
             echo "==> 容器状态 $state, 启动..."
+            detach_stale_fuse
             docker start "$CONTAINER" >/dev/null
         else
             echo "==> 容器已在运行"

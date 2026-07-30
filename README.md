@@ -102,6 +102,13 @@ PITR_WORKSPACE=/pitr_fs/data ./install.sh install
 pitr status
 ```
 
+`recover` 会复用现有数据卷，并在容器异常停止后自动卸载传播到 calw 的失联
+`pitrfs` FUSE，再恢复双层挂载：
+
+```bash
+PITR_WORKSPACE=/pitr_fs/data ./install.sh recover
+```
+
 写入两个版本并查看审计日志：
 
 ```bash

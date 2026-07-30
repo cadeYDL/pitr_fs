@@ -198,6 +198,25 @@ func TestInstall_AuditCanResolveHostProcessAndUser(t *testing.T) {
 	}
 }
 
+func TestInstall_DetachesOnlyPitrFuseBeforeRecover(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	for _, required := range []string{
+		`fs_type=$(findmnt -n -o FSTYPE --target "$WORKSPACE"`,
+		`[ "$fs_type" = "fuse.pitrfs" ] || return 0`,
+		`fusermount3 -uz "$WORKSPACE"`,
+		"detach_stale_fuse\n            docker start",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("install.sh 缺少安全的失联 FUSE 恢复片段 %q", required)
+		}
+	}
+}
+
 // TestInstall_StatusOnMissingContainer — status 在容器不存在时输出"容器未运行"
 // 需要 docker 才能跑; 无 docker 直接跳过
 func TestInstall_StatusOnMissingContainer(t *testing.T) {
