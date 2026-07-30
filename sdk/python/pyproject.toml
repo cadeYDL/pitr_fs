@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pitr-fs"
+version = "0.1.0"
+description = "Python SDK for PITR-FS"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "grpcio>=1.76,<2",
+  "protobuf>=6.31,<7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pitr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

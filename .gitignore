@@ -9,6 +9,13 @@
 vendor/
 coverage.txt
 
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.venv/
+
 # Editor / OS
 .DS_Store
 *.swp
