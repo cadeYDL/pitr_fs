@@ -155,7 +155,7 @@ func TestLoopback_Unmount(t *testing.T) {
 
 func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 	manager := &mockManager{active: &txn.Txn{ID: 42}}
-	_, mount, _ := mountedLoopback(t, WithManager(manager))
+	backend, mount, _ := mountedLoopback(t, WithManager(manager))
 	dir := filepath.Join(mount, "dir")
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -180,10 +180,19 @@ func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Setxattr(filePath, "user.pitr", []byte("yes"), 0); err != nil {
+	// Linux 可在 close(2) 返回后异步发送 FUSE Release；若立刻对同一路径
+	// 设置 xattr，它会正确归入尚未关闭的 fd auto，但 command 不会另起一条。
+	// 用一个从 backend 预置、从未打开写 fd 的文件独立验证 xattr handlers。
+	xattrPath := filepath.Join(dir, "xattr")
+	if err := os.WriteFile(
+		filepath.Join(backend, "dir", "xattr"), []byte("x"), 0o600,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Removexattr(filePath, "user.pitr"); err != nil {
+	if err := unix.Setxattr(xattrPath, "user.pitr", []byte("yes"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Removexattr(xattrPath, "user.pitr"); err != nil {
 		t.Fatal(err)
 	}
 	truncated, err := os.OpenFile(filePath, os.O_WRONLY|os.O_TRUNC, 0)
@@ -205,7 +214,7 @@ func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 	if err := os.Rename(hardlink, renamed); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{renamed, symlink, filePath} {
+	for _, path := range []string{renamed, symlink, xattrPath, filePath} {
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)
 		}
