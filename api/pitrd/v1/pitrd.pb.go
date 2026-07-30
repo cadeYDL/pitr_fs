@@ -319,6 +319,7 @@ type VolumeStatus struct {
 	JfsMounted    bool                   `protobuf:"varint,4,opt,name=jfs_mounted,json=jfsMounted,proto3" json:"jfs_mounted,omitempty"`
 	FuseMounted   bool                   `protobuf:"varint,5,opt,name=fuse_mounted,json=fuseMounted,proto3" json:"fuse_mounted,omitempty"`
 	Retention     string                 `protobuf:"bytes,6,opt,name=retention,proto3" json:"retention,omitempty"`
+	Error         string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -391,6 +392,13 @@ func (x *VolumeStatus) GetFuseMounted() bool {
 func (x *VolumeStatus) GetRetention() string {
 	if x != nil {
 		return x.Retention
+	}
+	return ""
+}
+
+func (x *VolumeStatus) GetError() string {
+	if x != nil {
+		return x.Error
 	}
 	return ""
 }
@@ -1554,7 +1562,7 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x06volume\x18\x01 \x01(\v2\x16.pitrd.v1.VolumeStatusR\x06volume\"#\n" +
 	"\rUmountRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\"\x0f\n" +
-	"\rStatusRequest\"\xc0\x01\n" +
+	"\rStatusRequest\"\xd6\x01\n" +
 	"\fVolumeStatus\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tjfs_mount\x18\x02 \x01(\tR\bjfsMount\x12\x1d\n" +
@@ -1563,7 +1571,8 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\vjfs_mounted\x18\x04 \x01(\bR\n" +
 	"jfsMounted\x12!\n" +
 	"\ffuse_mounted\x18\x05 \x01(\bR\vfuseMounted\x12\x1c\n" +
-	"\tretention\x18\x06 \x01(\tR\tretention\"\xc5\x01\n" +
+	"\tretention\x18\x06 \x01(\tR\tretention\x12\x14\n" +
+	"\x05error\x18\a \x01(\tR\x05error\"\xc5\x01\n" +
 	"\x0eStatusResponse\x12%\n" +
 	"\x0edaemon_version\x18\x01 \x01(\tR\rdaemonVersion\x12)\n" +
 	"\x10postgres_healthy\x18\x02 \x01(\bR\x0fpostgresHealthy\x120\n" +

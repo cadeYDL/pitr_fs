@@ -364,11 +364,13 @@ $$ LANGUAGE sql IMMUTABLE;
 -- Phase 1/3 的旧签名只有两个参数。PostgreSQL 的 OR REPLACE 不会在签名变化
 -- 时删除旧 overload,升级前先显式移除,避免两参数 CALL 解析歧义。
 DROP PROCEDURE IF EXISTS pitr_revert(character, text);
+DROP PROCEDURE IF EXISTS pitr_revert(character, text, bigint);
 
 CREATE OR REPLACE PROCEDURE pitr_revert(
     p_target_hash char(12),
     p_scope_path  text DEFAULT NULL,
-    p_capture_txn_id bigint DEFAULT NULL
+    p_capture_txn_id bigint DEFAULT NULL,
+    p_scope_inodes bigint[] DEFAULT NULL
 ) AS $$
 DECLARE
     v_target_txn_id  bigint;
@@ -404,6 +406,7 @@ BEGIN
         JOIN   pitr_txn t ON t.id = nh.txn_id
         WHERE  t.id > v_target_txn_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
+          AND  (p_scope_inodes IS NULL OR nh.inode = ANY(p_scope_inodes))
         ORDER  BY nh.recorded_at DESC, nh.txn_id DESC
     LOOP
         IF r_node.op = 'I' THEN
@@ -428,6 +431,9 @@ BEGIN
         JOIN   pitr_txn t ON t.id = eh.txn_id
         WHERE  t.id > v_target_txn_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
+          AND  (p_scope_inodes IS NULL
+                OR eh.parent = ANY(p_scope_inodes)
+                OR (eh.snapshot->>'inode')::bigint = ANY(p_scope_inodes))
         ORDER  BY eh.recorded_at DESC, eh.txn_id DESC
     LOOP
         IF r_edge.op = 'I' THEN
@@ -451,6 +457,7 @@ BEGIN
         JOIN   pitr_txn t ON t.id = ch.txn_id
         WHERE  t.id > v_target_txn_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
+          AND  (p_scope_inodes IS NULL OR ch.inode = ANY(p_scope_inodes))
         ORDER  BY ch.recorded_at DESC, ch.txn_id DESC
     LOOP
         IF r_chunk.op = 'I' THEN
@@ -474,6 +481,14 @@ BEGIN
         JOIN   pitr_txn t ON t.id = crh.txn_id
         WHERE  t.id > v_target_txn_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
+          -- chunk_ref 没有 inode。只有当该 txn 的全部 chunk history 都在
+          -- scope closure 内时才安全 replay;跨 scope 的 broad txn 宁可保留
+          -- 额外引用(垃圾稍晚回收),也不能覆盖 scope 外文件的当前 refcount。
+          AND  (p_scope_inodes IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM pitr_chunk_history scoped_chunk
+                    WHERE scoped_chunk.txn_id = crh.txn_id
+                      AND NOT (scoped_chunk.inode = ANY(p_scope_inodes))
+               ))
         ORDER  BY crh.recorded_at DESC, crh.txn_id DESC
     LOOP
         IF r_chunk_ref.op = 'I' THEN

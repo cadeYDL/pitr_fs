@@ -240,8 +240,13 @@ func TestServer_Rollback_E2E(t *testing.T) {
 func TestServer_RevertDiffRecover_E2E(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
-	if _, err := f.db.Exec(ctx,
-		"INSERT INTO jfs_node (inode,mode,nlink,length) VALUES (700,33188,1,10)"); err != nil {
+	if _, err := f.db.Exec(ctx, `
+		INSERT INTO jfs_node (inode,mode,nlink,length,parent)
+		VALUES (10,16877,2,0,1),(700,33188,1,10,10);
+		INSERT INTO jfs_edge(parent,name,inode,type)
+		VALUES
+		  (1,convert_to('proj','UTF8'),10,2),
+		  (10,convert_to('file','UTF8'),700,1)`); err != nil {
 		t.Fatal(err)
 	}
 	var v1, v2 int64
@@ -325,5 +330,33 @@ func TestServer_RecoverVolumeMissingDoesNotFormat(t *testing.T) {
 	}
 	if exists {
 		t.Fatal("recover 禁止重新创建/format JuiceFS 元数据")
+	}
+}
+
+func TestServer_RecoverMultiVolume_OneFailureDoesNotHideSuccess(t *testing.T) {
+	f := setupServer(t)
+	handler := New(f.db, f.mgr, Config{
+		Volumes: []VolumeConfig{
+			{
+				Name: "healthy", JFSMount: "/jfs-a", FUSEMount: "/workspace-a",
+				Retention: "compact", JFSMounted: true, FUSEMounted: true, DB: f.db,
+			},
+			{
+				Name: "missing", JFSMount: "/jfs-b", FUSEMount: "/workspace-b",
+				Retention: "compact", JFSMounted: false, FUSEMounted: false,
+			},
+		},
+	})
+	response, err := handler.Recover(context.Background(), &pb.RecoverRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.GetVolumes()) != 2 {
+		t.Fatalf("volumes=%+v", response.GetVolumes())
+	}
+	if response.GetVolumes()[0].GetError() != "" ||
+		response.GetVolumes()[1].GetError() == "" {
+		t.Fatalf("healthy=%+v missing=%+v",
+			response.GetVolumes()[0], response.GetVolumes()[1])
 	}
 }

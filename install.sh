@@ -7,6 +7,8 @@ IMAGE="${PITR_IMAGE:-pitr-fs:latest}"
 CONTAINER="${PITR_CONTAINER:-pitrfs}"
 WORKSPACE="${PITR_WORKSPACE:-$HOME/pitr-workspace}"
 BIN_LINK="${PITR_BIN:-/usr/local/bin/pitr}"
+PG_VOLUME="${PITR_PG_VOLUME:-pitr_pgdata}"
+DATA_VOLUME="${PITR_DATA_VOLUME:-pitr_data}"
 READY_TIMEOUT="${PITR_READY_TIMEOUT:-120}"   # 秒
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -22,6 +24,8 @@ usage() {
   PITR_WORKSPACE   宿主机工作目录 (默认 \$HOME/pitr-workspace)
   PITR_CONTAINER   容器名 (默认 pitrfs)
   PITR_IMAGE       镜像名 (默认 pitr-fs:latest)
+  PITR_PG_VOLUME   PostgreSQL Docker volume (默认 pitr_pgdata)
+  PITR_DATA_VOLUME 对象数据 Docker volume (默认 pitr_data)
   PITR_STORAGE     juicefs 存储后端 (默认 file); s3/minio/oss/cos/...
   PITR_BUCKET      存储 bucket URL / 本地路径 (默认容器内 /data)
   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   云对象存储凭证 (透传)
@@ -74,8 +78,8 @@ run_container() {
         ${PITR_BUCKET:+-e "PITR_BUCKET=$PITR_BUCKET"} \
         ${AWS_ACCESS_KEY_ID:+-e "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"} \
         ${AWS_SECRET_ACCESS_KEY:+-e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"} \
-        -v pitr_pgdata:/var/lib/postgresql/data \
-        -v pitr_data:/data \
+        -v "$PG_VOLUME:/var/lib/postgresql/data" \
+        -v "$DATA_VOLUME:/data" \
         --mount "type=bind,source=$WORKSPACE,target=/workspace,bind-propagation=rshared" \
         "$IMAGE" >/dev/null
 }
@@ -113,7 +117,7 @@ EOF
 do_uninstall() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     if [ "${1:-}" = "--purge" ]; then
-        docker volume rm pitr_pgdata pitr_data >/dev/null 2>&1 || true
+        docker volume rm "$PG_VOLUME" "$DATA_VOLUME" >/dev/null 2>&1 || true
         echo "  数据卷已清理"
     fi
     local sudo; sudo=$(sudo_if_needed "$BIN_LINK")
@@ -143,8 +147,8 @@ do_recover() {
             echo "==> 容器已在运行"
         fi
     else
-        docker volume inspect pitr_pgdata >/dev/null 2>&1 \
-            || { echo "错误: pitr_pgdata volume 不存在, 无法 recover; 请用 $0 install" >&2; exit 1; }
+        docker volume inspect "$PG_VOLUME" >/dev/null 2>&1 \
+            || { echo "错误: $PG_VOLUME volume 不存在, 无法 recover; 请用 $0 install" >&2; exit 1; }
         mkdir -p "$WORKSPACE"
         echo "==> 容器不存在, 复用 volume 重建..."
         run_container
@@ -156,8 +160,8 @@ do_recover() {
         install_wrapper
     fi
 
-    # P1 阶段 pitr recover 未实现, 有 socket + 容器 running 即视为 recover 成功
-    # P2 起 daemon 层 recover 逻辑接进来
+    # daemon 层只校验既有 JuiceFS 元数据和双层 mount,绝不 format。
+    docker exec "$CONTAINER" pitr recover
     echo "  ✓ recover 完成"
 }
 

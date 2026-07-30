@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 
@@ -17,7 +18,8 @@ import (
 var versionHashRE = regexp.MustCompile(`^[0-9a-f]{12}$`)
 
 type Engine struct {
-	db *pg.DB
+	db        *pg.DB
+	mountPath string
 }
 
 type Options struct {
@@ -26,8 +28,22 @@ type Options struct {
 	DryRun     bool
 }
 
-func NewEngine(db *pg.DB) *Engine {
-	return &Engine{db: db}
+type EngineOption func(*Engine)
+
+func WithMountPath(value string) EngineOption {
+	return func(engine *Engine) {
+		if value != "" {
+			engine.mountPath = path.Clean(value)
+		}
+	}
+}
+
+func NewEngine(db *pg.DB, options ...EngineOption) *Engine {
+	engine := &Engine{db: db}
+	for _, option := range options {
+		option(engine)
+	}
+	return engine
 }
 
 func (e *Engine) Revert(
@@ -87,25 +103,42 @@ func (e *Engine) Revert(
 			return fmt.Errorf("%w: %d", ErrActiveScope, activeCount)
 		}
 
+		var scopeInodes []int64
+		if scope != nil {
+			scopeInodes, err = e.resolveScopeInodes(
+				ctx, tx, targetID, *scope)
+			if err != nil {
+				return err
+			}
+		}
 		if scanErr := tx.QueryRow(ctx, `
 			SELECT
 			  (SELECT count(*) FROM pitr_node_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
-			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))) +
+			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
+			     AND ($3::bigint[] IS NULL OR h.inode=ANY($3))) +
 			  (SELECT count(*) FROM pitr_edge_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
-			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))) +
+			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
+			     AND ($3::bigint[] IS NULL OR h.parent=ANY($3)
+			          OR (h.snapshot->>'inode')::bigint=ANY($3))) +
 			  (SELECT count(*) FROM pitr_chunk_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
-			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))) +
+			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
+			     AND ($3::bigint[] IS NULL OR h.inode=ANY($3))) +
 			  (SELECT count(*) FROM pitr_chunk_ref_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
-			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2)))`,
-			targetID, scope).Scan(&applied); scanErr != nil {
+			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
+			     AND ($3::bigint[] IS NULL OR NOT EXISTS (
+			          SELECT 1 FROM pitr_chunk_history scoped_chunk
+			           WHERE scoped_chunk.txn_id=h.txn_id
+			             AND NOT (scoped_chunk.inode=ANY($3))
+			     )))`,
+			targetID, scope, scopeInodes).Scan(&applied); scanErr != nil {
 			return scanErr
 		}
 		if options.DryRun {
@@ -142,7 +175,8 @@ func (e *Engine) Revert(
 			return errors.New("生成唯一 revert version hash 失败:连续冲突 3 次")
 		}
 		if _, callErr := tx.Exec(ctx,
-			"CALL pitr_revert($1,$2,$3)", targetHash, scope, revertID); callErr != nil {
+			"CALL pitr_revert($1,$2,$3,$4)",
+			targetHash, scope, revertID, scopeInodes); callErr != nil {
 			return callErr
 		}
 		return nil
@@ -151,4 +185,77 @@ func (e *Engine) Revert(
 		return 0, "", fmt.Errorf("revert %s: %w", targetHash, err)
 	}
 	return applied, newVersionHash, nil
+}
+
+// resolveScopeInodes 用当前 edge 与目标之后的 edge history 合成目录图。这样
+// 即使 scope 或其子项当前已被 rename/delete,仍能通过历史 edge 找回闭包。
+// mountPath 未配置时返回 nil,保留按 transaction scope 过滤的兼容语义。
+func (e *Engine) resolveScopeInodes(
+	ctx context.Context,
+	tx pg.Tx,
+	targetID int64,
+	scope string,
+) ([]int64, error) {
+	if e.mountPath == "" {
+		return nil, nil
+	}
+	relative, ok := strings.CutPrefix(path.Clean(scope), e.mountPath)
+	if !ok || (relative != "" && !strings.HasPrefix(relative, "/")) {
+		return []int64{}, nil
+	}
+	relative = strings.Trim(relative, "/")
+	parts := make([]string, 0)
+	if relative != "" {
+		parts = strings.Split(relative, "/")
+	}
+	rows, err := tx.Query(ctx, `
+		WITH RECURSIVE
+		history_edges AS (
+		  SELECT edge.parent,convert_from(edge.name,'UTF8') AS name,edge.inode
+		    FROM pitr_edge_history h
+		    JOIN pitr_txn t ON t.id=h.txn_id
+		    CROSS JOIN LATERAL
+		      jsonb_populate_record(NULL::jfs_edge,h.snapshot) AS edge
+		   WHERE t.id>$1 AND h.snapshot IS NOT NULL
+		     AND pitr_scopes_overlap(t.scope_path,$2)
+		),
+		all_edges AS (
+		  SELECT parent,convert_from(name,'UTF8') AS name,inode FROM jfs_edge
+		  UNION
+		  SELECT parent,name,inode FROM history_edges
+		),
+		walk(depth,inode) AS (
+		  SELECT 0,1::bigint
+		  UNION ALL
+		  SELECT walk.depth+1,edge.inode
+		    FROM walk JOIN all_edges edge ON edge.parent=walk.inode
+		   WHERE walk.depth<cardinality($3::text[])
+		     AND edge.name=($3::text[])[walk.depth+1]
+		),
+		roots(inode) AS (
+		  SELECT inode FROM walk WHERE depth=cardinality($3::text[])
+		),
+		tree(inode) AS (
+		  SELECT inode FROM roots
+		  UNION
+		  SELECT edge.inode FROM tree JOIN all_edges edge ON edge.parent=tree.inode
+		)
+		SELECT DISTINCT inode FROM tree ORDER BY inode`,
+		targetID, scope, parts)
+	if err != nil {
+		return nil, fmt.Errorf("解析 revert scope inode: %w", err)
+	}
+	defer rows.Close()
+	inodes := make([]int64, 0)
+	for rows.Next() {
+		var inode int64
+		if err := rows.Scan(&inode); err != nil {
+			return nil, fmt.Errorf("读取 revert scope inode: %w", err)
+		}
+		inodes = append(inodes, inode)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历 revert scope inode: %w", err)
+	}
+	return inodes, nil
 }

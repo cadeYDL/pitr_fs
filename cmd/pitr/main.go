@@ -144,9 +144,15 @@ func newRecoverCmd() *cobra.Command {
 				return friendlyRPCError(cmd, err)
 			}
 			for _, volume := range resp.GetVolumes() {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"recovered %s @ %s (jfs=%s)\n",
-					volume.GetName(), volume.GetFuseMount(), volume.GetJfsMount())
+				if volume.GetError() != "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+						"failed %s @ %s: %s\n",
+						volume.GetName(), volume.GetFuseMount(), volume.GetError())
+				} else {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+						"recovered %s @ %s (jfs=%s)\n",
+						volume.GetName(), volume.GetFuseMount(), volume.GetJfsMount())
+				}
 			}
 			return nil
 		},

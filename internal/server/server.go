@@ -18,15 +18,29 @@ type Config struct {
 	Retention     string
 	JFSMounted    bool
 	FUSEMounted   bool
+	Volumes       []VolumeConfig
+}
+
+// VolumeConfig 描述 recover/status 可管理的一个卷。每卷可以使用独立的
+// PostgreSQL 元数据数据库;事务 RPC 仍由 Server 的主 db/mgr 处理。
+type VolumeConfig struct {
+	Name        string
+	JFSMount    string
+	FUSEMount   string
+	Retention   string
+	JFSMounted  bool
+	FUSEMounted bool
+	DB          *pg.DB
 }
 
 type Server struct {
 	pb.UnimplementedPitrdServer
 
-	db  *pg.DB
-	mgr *txn.Manager
-	rev *revert.Engine
-	cfg Config
+	db      *pg.DB
+	mgr     *txn.Manager
+	rev     *revert.Engine
+	cfg     Config
+	volumes []VolumeConfig
 }
 
 func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
@@ -39,5 +53,27 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 	if cfg.Retention == "" {
 		cfg.Retention = "compact"
 	}
-	return &Server{db: db, mgr: mgr, rev: revert.NewEngine(db), cfg: cfg}
+	volumes := cfg.Volumes
+	if len(volumes) == 0 {
+		volumes = []VolumeConfig{{
+			Name:        cfg.Volume,
+			JFSMount:    cfg.JFSMount,
+			FUSEMount:   cfg.FUSEMount,
+			Retention:   cfg.Retention,
+			JFSMounted:  cfg.JFSMounted,
+			FUSEMounted: cfg.FUSEMounted,
+			DB:          db,
+		}}
+	}
+	for index := range volumes {
+		if volumes[index].Retention == "" {
+			volumes[index].Retention = "compact"
+		}
+	}
+	return &Server{
+		db: db, mgr: mgr,
+		rev:     revert.NewEngine(db, revert.WithMountPath(cfg.FUSEMount)),
+		cfg:     cfg,
+		volumes: volumes,
+	}
 }

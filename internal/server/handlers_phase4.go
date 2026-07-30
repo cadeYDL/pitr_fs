@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -73,36 +74,70 @@ func (s *Server) Recover(
 	req *pb.RecoverRequest,
 ) (*pb.RecoverResponse, error) {
 	requested := path.Clean(req.GetPath())
-	if req.GetPath() != "" &&
-		requested != path.Clean(s.cfg.FUSEMount) &&
-		requested != "/" {
+	var results []*pb.VolumeStatus
+	successes := 0
+	for _, volume := range s.volumes {
+		if req.GetPath() != "" && requested != "/" &&
+			requested != path.Clean(volume.FUSEMount) {
+			continue
+		}
+		item := volumeStatusPB(volume)
+		if err := recoverVolume(ctx, volume); err != nil {
+			item.Error = err.Error()
+		} else {
+			successes++
+		}
+		results = append(results, item)
+	}
+	if len(results) == 0 {
 		return nil, status.Errorf(codes.NotFound,
 			"未找到挂载点 %s", req.GetPath())
 	}
+	if successes == 0 {
+		return nil, status.Error(codes.FailedPrecondition,
+			results[0].GetError())
+	}
+	return &pb.RecoverResponse{Volumes: results}, nil
+}
+
+func recoverVolume(ctx context.Context, volume VolumeConfig) error {
+	if volume.DB == nil {
+		return errors.New("卷数据库未配置")
+	}
 	var exists bool
-	if err := s.db.QueryRow(ctx, `
+	if err := volume.DB.QueryRow(ctx, `
 		SELECT to_regclass('public.jfs_setting') IS NOT NULL
 		   AND EXISTS (SELECT 1 FROM jfs_setting)`).Scan(&exists); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
-			return nil, status.Error(codes.FailedPrecondition,
-				"JuiceFS 卷元数据不存在;recover 禁止 format,请显式 init")
+			return errors.New("JuiceFS 卷元数据不存在;recover 禁止 format,请显式 init")
 		}
-		return nil, status.Error(codes.Internal, err.Error())
+		return fmt.Errorf("校验 JuiceFS 卷元数据: %w", err)
 	}
 	if !exists {
-		return nil, status.Error(codes.FailedPrecondition,
-			"JuiceFS 卷元数据不存在;recover 禁止 format,请显式 init")
+		return errors.New("JuiceFS 卷元数据不存在;recover 禁止 format,请显式 init")
 	}
-	if !s.cfg.JFSMounted || !s.cfg.FUSEMounted {
-		return nil, status.Error(codes.Unavailable, "卷存在但挂载未就绪")
+	if !volume.JFSMounted || !volume.FUSEMounted {
+		return errors.New("卷存在但挂载未就绪")
 	}
-	return &pb.RecoverResponse{Volumes: []*pb.VolumeStatus{{
-		Name:        s.cfg.Volume,
-		JfsMount:    s.cfg.JFSMount,
-		FuseMount:   s.cfg.FUSEMount,
-		JfsMounted:  true,
-		FuseMounted: true,
-		Retention:   s.cfg.Retention,
-	}}}, nil
+	return nil
+}
+
+func volumeStatusPB(volume VolumeConfig) *pb.VolumeStatus {
+	return &pb.VolumeStatus{
+		Name:        volume.Name,
+		JfsMount:    volume.JFSMount,
+		FuseMount:   volume.FUSEMount,
+		JfsMounted:  volume.JFSMounted,
+		FuseMounted: volume.FUSEMounted,
+		Retention:   volume.Retention,
+	}
+}
+
+func (s *Server) volumeStatuses() []*pb.VolumeStatus {
+	out := make([]*pb.VolumeStatus, 0, len(s.volumes))
+	for _, volume := range s.volumes {
+		out = append(out, volumeStatusPB(volume))
+	}
+	return out
 }

@@ -263,6 +263,56 @@ func TestRevert_SubtreeScope(t *testing.T) {
 	}
 }
 
+func TestRevert_SubtreeInodeClosureWithinBroadTxn(t *testing.T) {
+	_, db := setupEngine(t)
+	engine := NewEngine(db, WithMountPath("/workspace"))
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jfs_node(inode,mode,nlink,length,parent)
+		VALUES
+		  (10,16877,2,0,1),(20,16877,2,0,1),
+		  (100,33188,1,10,10),(200,33188,1,100,20);
+		INSERT INTO jfs_edge(parent,name,inode,type)
+		VALUES
+		  (1,convert_to('proj','UTF8'),10,2),
+		  (1,convert_to('other','UTF8'),20,2),
+		  (10,convert_to('file','UTF8'),100,1),
+		  (20,convert_to('file','UTF8'),200,1)`); err != nil {
+		t.Fatal(err)
+	}
+	insertCommitted(t, db, "111111111111", "/workspace")
+	broad := insertCommitted(t, db, "222222222222", "/workspace")
+	if err := db.InTx(ctx, func(txDB pg.Tx) error {
+		if err := txDB.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(broad)); err != nil {
+			return err
+		}
+		_, err := txDB.Exec(ctx,
+			"UPDATE jfs_node SET length=length+1 WHERE inode IN (100,200)")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, _, err := engine.Revert(ctx, Options{
+		TargetHash: "111111111111",
+		ScopePath:  "/workspace/proj",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projLength, otherLength int64
+	if err := db.QueryRow(ctx, `
+		SELECT max(length) FILTER (WHERE inode=100),
+		       max(length) FILTER (WHERE inode=200)
+		  FROM jfs_node`).Scan(&projLength, &otherLength); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 || projLength != 10 || otherLength != 101 {
+		t.Fatalf("applied=%d proj=%d other=%d",
+			applied, projLength, otherLength)
+	}
+}
+
 func TestRevert_RejectsActiveScope(t *testing.T) {
 	engine, db := setupEngine(t)
 	if _, err := db.Exec(context.Background(), `
@@ -276,5 +326,104 @@ func TestRevert_RejectsActiveScope(t *testing.T) {
 	})
 	if !errors.Is(err, ErrActiveScope) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRevert_10kFilesDir(t *testing.T) {
+	engine, db := setupEngine(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jfs_node(inode,mode,nlink,length)
+		SELECT value,33188,1,10 FROM generate_series(1000,10999) AS value`); err != nil {
+		t.Fatal(err)
+	}
+	insertCommitted(t, db, "111111111111", "/workspace/tenk")
+	v2 := insertCommitted(t, db, "222222222222", "/workspace/tenk")
+	if err := db.InTx(ctx, func(txDB pg.Tx) error {
+		if err := txDB.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(v2)); err != nil {
+			return err
+		}
+		_, err := txDB.Exec(ctx, `
+			UPDATE jfs_node SET length=20 WHERE inode BETWEEN 1000 AND 10999`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	applied, _, err := engine.Revert(ctx, Options{
+		TargetHash: "111111111111",
+		ScopePath:  "/workspace/tenk",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored int
+	if err := db.QueryRow(ctx, `
+		SELECT count(*) FROM jfs_node
+		 WHERE inode BETWEEN 1000 AND 10999 AND length=10`).Scan(&restored); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 10_000 || restored != 10_000 {
+		t.Fatalf("applied=%d restored=%d", applied, restored)
+	}
+	t.Logf("10k files metadata revert: %s", time.Since(started))
+}
+
+func TestRevert_ConcurrentWriteBlocksUntilCommit(t *testing.T) {
+	engine, db := setupEngine(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx,
+		"INSERT INTO jfs_node(inode,mode,nlink,length) VALUES (100,33188,1,10)"); err != nil {
+		t.Fatal(err)
+	}
+	insertCommitted(t, db, "111111111111", "/workspace/concurrent")
+	v2 := insertCommitted(t, db, "222222222222", "/workspace/concurrent")
+	updateLength(t, db, v2, 100, 20)
+	// 只让 revert replay 的 UPDATE 放慢 250ms。此时 pitr_revert 已持有四张
+	// JuiceFS 表的 EXCLUSIVE lock,并发写必须等它提交。
+	if _, err := db.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION pitr_test_slow_revert() RETURNS trigger AS $$
+		DECLARE command_value text;
+		BEGIN
+		  SELECT command INTO command_value
+		    FROM pitr_txn
+		   WHERE id=NULLIF(current_setting('pitr.current_txn',true),'')::bigint;
+		  IF command_value LIKE 'revert:%' THEN
+		    PERFORM pg_sleep(0.25);
+		  END IF;
+		  RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER tg_test_slow_revert
+		  BEFORE UPDATE ON jfs_node
+		  FOR EACH ROW EXECUTE FUNCTION pitr_test_slow_revert()`); err != nil {
+		t.Fatal(err)
+	}
+
+	revertDone := make(chan error, 1)
+	go func() {
+		_, _, err := engine.Revert(ctx, Options{
+			TargetHash: "111111111111",
+			ScopePath:  "/workspace/concurrent",
+		})
+		revertDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	started := time.Now()
+	if _, err := db.Exec(ctx, "UPDATE jfs_node SET length=99 WHERE inode=100"); err != nil {
+		t.Fatal(err)
+	}
+	blockedFor := time.Since(started)
+	if err := <-revertDone; err != nil {
+		t.Fatal(err)
+	}
+	var length int64
+	if err := db.QueryRow(ctx, "SELECT length FROM jfs_node WHERE inode=100").
+		Scan(&length); err != nil {
+		t.Fatal(err)
+	}
+	if blockedFor < 150*time.Millisecond || length != 99 {
+		t.Fatalf("blocked=%s length=%d", blockedFor, length)
 	}
 }

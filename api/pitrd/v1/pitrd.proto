@@ -57,6 +57,7 @@ message VolumeStatus {
   bool jfs_mounted = 4;
   bool fuse_mounted = 5;
   string retention = 6;
+  string error = 7;
 }
 
 message StatusResponse {

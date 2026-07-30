@@ -69,14 +69,7 @@ func (s *Server) Status(
 		DaemonVersion:      s.cfg.DaemonVersion,
 		PostgresHealthy:    true,
 		ActiveTransactions: active,
-		Volumes: []*pb.VolumeStatus{{
-			Name:        s.cfg.Volume,
-			JfsMount:    s.cfg.JFSMount,
-			FuseMount:   s.cfg.FUSEMount,
-			JfsMounted:  s.cfg.JFSMounted,
-			FuseMounted: s.cfg.FUSEMounted,
-			Retention:   s.cfg.Retention,
-		}},
+		Volumes:            s.volumeStatuses(),
 	}, nil
 }
 
