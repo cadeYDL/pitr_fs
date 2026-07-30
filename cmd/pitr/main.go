@@ -103,7 +103,114 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newRevertCmd())
 	root.AddCommand(newClearCmd())
 
+	root.InitDefaultCompletionCmd()
+	localizeCompletionCommand(root)
 	return root
+}
+
+func localizeCompletionCommand(root *cobra.Command) {
+	var completion *cobra.Command
+	for _, command := range root.Commands() {
+		if command.Name() == "completion" {
+			completion = command
+			break
+		}
+	}
+	if completion == nil {
+		return
+	}
+	completion.Short = "生成指定 shell 的自动补全脚本"
+	completion.Long = `为 pitr 生成指定 shell 的自动补全脚本。
+具体加载和安装方法请查看各 shell 子命令的帮助。`
+
+	longDescriptions := map[string]string{
+		"bash": `生成 bash 自动补全脚本。
+
+该脚本依赖 bash-completion 软件包。当前会话可执行：
+
+	source <(pitr completion bash)
+
+永久启用可执行：
+
+	pitr completion bash > /etc/bash_completion.d/pitr
+
+macOS 使用 Homebrew 时可执行：
+
+	pitr completion bash > $(brew --prefix)/etc/bash_completion.d/pitr
+
+重新启动 shell 后生效。`,
+		"zsh": `生成 zsh 自动补全脚本。
+
+若尚未启用补全，请先执行：
+
+	echo "autoload -U compinit; compinit" >> ~/.zshrc
+
+当前会话可执行：
+
+	source <(pitr completion zsh)
+
+永久启用可将脚本写入 ${fpath[1]}/_pitr；macOS 使用 Homebrew 时写入
+$(brew --prefix)/share/zsh/site-functions/_pitr。
+
+重新启动 shell 后生效。`,
+		"fish": `生成 fish 自动补全脚本。
+
+当前会话可执行：
+
+	pitr completion fish | source
+
+永久启用可执行：
+
+	pitr completion fish > ~/.config/fish/completions/pitr.fish
+
+重新启动 shell 后生效。`,
+		"powershell": `生成 PowerShell 自动补全脚本。
+
+当前会话可执行：
+
+	pitr completion powershell | Out-String | Invoke-Expression
+
+永久启用时，请将上述命令加入 PowerShell 配置文件。`,
+	}
+	for _, command := range completion.Commands() {
+		shell := command.Name()
+		command.Short = fmt.Sprintf("生成 %s 自动补全脚本", shell)
+		command.Long = longDescriptions[shell]
+		if flag := command.Flags().Lookup("no-descriptions"); flag != nil {
+			flag.Usage = "生成不含命令说明的补全脚本"
+		}
+		switch shell {
+		case "bash":
+			command.RunE = func(cmd *cobra.Command, _ []string) error {
+				noDescriptions, _ := cmd.Flags().GetBool("no-descriptions")
+				return cmd.Root().GenBashCompletionV2(
+					cmd.OutOrStdout(), !noDescriptions)
+			}
+		case "zsh":
+			command.RunE = func(cmd *cobra.Command, _ []string) error {
+				noDescriptions, _ := cmd.Flags().GetBool("no-descriptions")
+				if noDescriptions {
+					return cmd.Root().GenZshCompletionNoDesc(cmd.OutOrStdout())
+				}
+				return cmd.Root().GenZshCompletion(cmd.OutOrStdout())
+			}
+		case "fish":
+			command.RunE = func(cmd *cobra.Command, _ []string) error {
+				noDescriptions, _ := cmd.Flags().GetBool("no-descriptions")
+				return cmd.Root().GenFishCompletion(
+					cmd.OutOrStdout(), !noDescriptions)
+			}
+		case "powershell":
+			command.RunE = func(cmd *cobra.Command, _ []string) error {
+				noDescriptions, _ := cmd.Flags().GetBool("no-descriptions")
+				if noDescriptions {
+					return cmd.Root().GenPowerShellCompletion(cmd.OutOrStdout())
+				}
+				return cmd.Root().GenPowerShellCompletionWithDesc(
+					cmd.OutOrStdout())
+			}
+		}
+	}
 }
 
 // ---------- 生命周期 ----------
