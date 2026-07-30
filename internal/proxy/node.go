@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"sync"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -16,6 +17,12 @@ type trackedFile struct {
 	*fs.LoopbackFile
 	id       uint64
 	writable bool
+
+	auditMu sync.Mutex
+	path    string
+	posixOp string
+	before  contentPreview
+	samples []writeSample
 }
 
 func tracked(f fs.FileHandle) (*trackedFile, bool) {

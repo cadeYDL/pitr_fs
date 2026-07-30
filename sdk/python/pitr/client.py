@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterator
 
 import grpc
@@ -27,12 +28,23 @@ class LogEntry:
     state: str
     command: str
     message: str
+    created_at: datetime | None
+    closed_at: datetime | None
+    posix_operation: str
+    process_command: str
+    actor_uid: int
+    actor_gid: int
+    actor_pid: int
+    actor_name: str
+    change_summary: str
 
 
 @dataclass(frozen=True)
 class RevertResult:
     applied: int
     new_version_hash: str
+    resolved_version_hash: str
+    resolved_version_time: str
 
 
 @dataclass(frozen=True)
@@ -149,6 +161,23 @@ class Client:
                 state=value.state,
                 command=value.command,
                 message=value.message,
+                created_at=(
+                    value.created_at.ToDatetime()
+                    if value.HasField("created_at")
+                    else None
+                ),
+                closed_at=(
+                    value.closed_at.ToDatetime()
+                    if value.HasField("closed_at")
+                    else None
+                ),
+                posix_operation=value.posix_operation,
+                process_command=value.process_command,
+                actor_uid=value.actor_uid,
+                actor_gid=value.actor_gid,
+                actor_pid=value.actor_pid,
+                actor_name=value.actor_name,
+                change_summary=value.change_summary,
             )
 
     def revert(
@@ -160,18 +189,65 @@ class Client:
         dry_run: bool = False,
         timeout: float | None = None,
     ) -> RevertResult:
+        if not version_hash.strip():
+            raise ValueError("version hash 不能为空")
+        return self._revert(
+            version_hash=version_hash,
+            target_time="",
+            path=path,
+            global_scope=global_scope,
+            dry_run=dry_run,
+            timeout=timeout,
+        )
+
+    def revert_at(
+        self,
+        target_time: datetime,
+        *,
+        path: str = ".",
+        global_scope: bool = False,
+        dry_run: bool = False,
+        timeout: float | None = None,
+    ) -> RevertResult:
+        if target_time.tzinfo is None or target_time.utcoffset() is None:
+            raise ValueError("target_time 必须包含时区")
+        return self._revert(
+            version_hash="",
+            target_time=target_time.isoformat(),
+            path=path,
+            global_scope=global_scope,
+            dry_run=dry_run,
+            timeout=timeout,
+        )
+
+    def _revert(
+        self,
+        *,
+        version_hash: str,
+        target_time: str,
+        path: str,
+        global_scope: bool,
+        dry_run: bool,
+        timeout: float | None,
+    ) -> RevertResult:
         if global_scope and path != ".":
             raise ValueError("global_scope 与 path 不能同时使用")
         resolved = "" if global_scope else _resolve_path(path)
         response = self._stub.Revert(
             pb.RevertRequest(
                 version_hash=version_hash,
+                target_time=target_time,
                 path=resolved,
                 dry_run=dry_run,
             ),
             timeout=timeout,
         )
-        return RevertResult(response.applied, response.new_version_hash)
+        return RevertResult(
+            response.applied,
+            response.new_version_hash,
+            response.resolved_version_hash,
+            response.resolved_version_time,
+        )
 
     def diff(
         self,

@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "pitr_fs/api/pitrd/v1"
 )
@@ -110,13 +111,23 @@ type fakePitrd struct {
 }
 
 func fakeTxn(state, command, message string) *pb.Transaction {
+	changedAt := time.Date(2026, 7, 31, 6, 23, 17, 842000000, time.UTC)
 	return &pb.Transaction{
-		TxnId:       9,
-		VersionHash: "012345abcdef",
-		ScopePath:   "/workspace/proj",
-		State:       state,
-		Command:     command,
-		Message:     message,
+		TxnId:          9,
+		VersionHash:    "012345abcdef",
+		ScopePath:      "/workspace/proj",
+		State:          state,
+		Command:        command,
+		Message:        message,
+		PosixOperation: `write("/workspace/proj/a", offset=0, total=2, calls=1)`,
+		ProcessCommand: "echo 123456789",
+		ActorUid:       501,
+		ActorGid:       20,
+		ActorPid:       1234,
+		ActorName:      "ydl",
+		ChangeSummary:  `"v1" -> "v2"`,
+		CreatedAt:      timestamppb.New(changedAt.Add(-time.Millisecond)),
+		ClosedAt:       timestamppb.New(changedAt),
 	}
 }
 
@@ -161,7 +172,12 @@ func (fakePitrd) Diff(context.Context, *pb.DiffRequest) (*pb.DiffResponse, error
 }
 
 func (fakePitrd) Revert(context.Context, *pb.RevertRequest) (*pb.RevertResponse, error) {
-	return &pb.RevertResponse{Applied: 9, NewVersionHash: "fedcba654321"}, nil
+	return &pb.RevertResponse{
+		Applied:             9,
+		NewVersionHash:      "fedcba654321",
+		ResolvedVersionHash: "111111111111",
+		ResolvedVersionTime: "2026-07-31T06:23:17.842Z",
+	}, nil
 }
 
 func (fakePitrd) Clear(context.Context, *pb.ClearRequest) (*pb.ClearResponse, error) {
@@ -242,9 +258,12 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "status"}, "connected to pitrd test, 1 volumes"},
 		{[]string{"--socket", socket, "status"}, "history-limit=100"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef   commit   # done"},
+		{[]string{"--socket", socket, "logs", "/workspace/proj", "-l", "-n", "1"},
+			"012345abcdef\twrite(\"/workspace/proj/a\", offset=0, total=2, calls=1)\techo 12345..."},
 		{[]string{"--socket", socket, "diff", "111111111111", "222222222222", "--path", "/workspace/proj"}, "nodes=2 edges=3 chunks=4"},
-		{[]string{"--socket", socket, "revert", "111111111111", "--path", "/workspace/proj"}, "reverted 9 history rows; new version fedcba654321"},
-		{[]string{"--socket", socket, "revert", "111111111111", "--dry-run"}, "dry-run: would apply 9 history rows"},
+		{[]string{"--socket", socket, "revert", "111111111111", "--path", "/workspace/proj"}, "reverted to 111111111111 at 2026-07-31T06:23:17.842Z; applied 9 history rows; new version fedcba654321"},
+		{[]string{"--socket", socket, "revert", "111111111111", "--dry-run"}, "dry-run: target 111111111111 at 2026-07-31T06:23:17.842Z; would apply 9 history rows"},
+		{[]string{"--socket", socket, "revert", "--at", "2026-07-31T14:23:17+08:00"}, "reverted to 111111111111"},
 		{[]string{"--socket", socket, "recover", "/workspace"}, "recovered default @ /workspace"},
 		{[]string{"--socket", socket, "init", "/workspace"}, "initialized default @ /workspace"},
 		{[]string{"--socket", socket, "umount", "/workspace"}, "unmounted /workspace"},

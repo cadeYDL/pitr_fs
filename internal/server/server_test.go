@@ -191,7 +191,13 @@ func TestServer_AutomaticVersion_E2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	autoID, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/proj/a", "write:/workspace/proj/a")
+		ctx, "/workspace/proj/a", "write:/workspace/proj/a",
+		txn.VersionMetadata{
+			PosixOp:        `write("/workspace/proj/a", offset=0, len=2)`,
+			ProcessCommand: "echo hi > ...",
+			ActorUID:       1000, ActorGID: 1001, ActorPID: 42,
+			ActorName: "tester",
+		})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +210,8 @@ func TestServer_AutomaticVersion_E2E(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.mgr.CloseStandaloneVersion(ctx, autoID); err != nil {
+	if err := f.mgr.CloseStandaloneVersion(
+		ctx, autoID, "", `"v1" -> "v2"`); err != nil {
 		t.Fatal(err)
 	}
 	logs, err := f.client.Logs(ctx,
@@ -220,6 +227,66 @@ func TestServer_AutomaticVersion_E2E(t *testing.T) {
 	}
 	if logs.GetEntries()[0].GetTransaction().GetClosedAt() == nil {
 		t.Fatal("自动版本必须已关闭")
+	}
+	audit := logs.GetEntries()[0].GetTransaction()
+	if audit.GetPosixOperation() == "" ||
+		audit.GetProcessCommand() != "echo hi > ..." ||
+		audit.GetActorUid() != 1000 || audit.GetActorGid() != 1001 ||
+		audit.GetActorPid() != 42 || audit.GetActorName() != "tester" ||
+		audit.GetChangeSummary() != `"v1" -> "v2"` {
+		t.Fatalf("audit=%+v", audit)
+	}
+}
+
+func TestServer_RevertAtValidationAndResolution(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	var firstID int64
+	if err := f.db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('111111111111',1,'/workspace/proj','committed','commit',
+		        '2020-01-01T01:00:00Z')
+		RETURNING id`).Scan(&firstID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('222222222222',$1,'/workspace/proj','committed','commit',
+		        '2020-01-01T02:00:00Z')`, firstID); err != nil {
+		t.Fatal(err)
+	}
+	response, err := f.client.Revert(ctx, &pb.RevertRequest{
+		TargetTime: "2020-01-01T01:30:00+00:00",
+		Path:       "/workspace/proj", DryRun: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedTime, parseErr := time.Parse(
+		time.RFC3339Nano, response.GetResolvedVersionTime())
+	if response.GetResolvedVersionHash() != "111111111111" ||
+		parseErr != nil ||
+		!resolvedTime.Equal(time.Date(2020, 1, 1, 1, 0, 0, 0, time.UTC)) {
+		t.Fatalf("resolved=%+v", response)
+	}
+	for _, request := range []*pb.RevertRequest{
+		{},
+		{VersionHash: "111111111111", TargetTime: "2020-01-01T01:00:00Z"},
+		{TargetTime: "not-a-time"},
+		{TargetTime: time.Now().Add(time.Hour).Format(time.RFC3339Nano)},
+	} {
+		if _, err := f.client.Revert(ctx, request); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("request=%+v code=%s err=%v",
+				request, status.Code(err), err)
+		}
+	}
+	if _, err := f.client.Revert(ctx, &pb.RevertRequest{
+		TargetTime: "2019-12-31T23:59:59Z",
+		DryRun:     true,
+	}); status.Code(err) != codes.OutOfRange {
+		t.Fatalf("too early code=%s err=%v", status.Code(err), err)
 	}
 }
 
@@ -412,7 +479,8 @@ func TestServer_UmountRejectsOpenWrite(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	versionID, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/proj", "write:/workspace/proj/a")
+		ctx, "/workspace/proj", "write:/workspace/proj/a",
+		txn.VersionMetadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +488,7 @@ func TestServer_UmountRejectsOpenWrite(t *testing.T) {
 		&pb.UmountRequest{Path: "/workspace"}); err == nil {
 		t.Fatal("存在开放写窗口时 umount 应失败")
 	}
-	if err := f.mgr.CloseStandaloneVersion(ctx, versionID); err != nil {
+	if err := f.mgr.CloseStandaloneVersion(ctx, versionID, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.client.Umount(ctx,
@@ -437,7 +505,8 @@ func TestServer_ClearRequiresConfirmationAndKeepsCurrentData(t *testing.T) {
 		t.Fatal(err)
 	}
 	versionID, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/proj/file", "write:/workspace/proj/file")
+		ctx, "/workspace/proj/file", "write:/workspace/proj/file",
+		txn.VersionMetadata{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +519,7 @@ func TestServer_ClearRequiresConfirmationAndKeepsCurrentData(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.mgr.CloseStandaloneVersion(ctx, versionID); err != nil {
+	if err := f.mgr.CloseStandaloneVersion(ctx, versionID, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.client.Clear(ctx, &pb.ClearRequest{

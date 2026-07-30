@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent import futures
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import grpc
@@ -16,6 +17,7 @@ class FakePitrd(rpc.PitrdServicer):
         self.commits = 0
         self.rollbacks = 0
         self.last_revert_path = None
+        self.last_revert_time = None
 
     @staticmethod
     def _transaction(state: str, command: str) -> pb.Transaction:
@@ -25,6 +27,13 @@ class FakePitrd(rpc.PitrdServicer):
             scope_path="/workspace/proj",
             state=state,
             command=command,
+            posix_operation="write(file, 2)",
+            process_command="echo hi > file",
+            actor_uid=1000,
+            actor_gid=1000,
+            actor_pid=22,
+            actor_name="tester",
+            change_summary='"v1" -> "v2"',
         )
 
     def Begin(self, request, context):  # noqa: N802
@@ -53,7 +62,13 @@ class FakePitrd(rpc.PitrdServicer):
 
     def Revert(self, request, context):  # noqa: N802
         self.last_revert_path = request.path
-        return pb.RevertResponse(applied=3, new_version_hash="fedcba654321")
+        self.last_revert_time = request.target_time
+        return pb.RevertResponse(
+            applied=3,
+            new_version_hash="fedcba654321",
+            resolved_version_hash="111111111111",
+            resolved_version_time="2026-07-31T10:00:00Z",
+        )
 
     def Diff(self, request, context):  # noqa: N802
         return pb.DiffResponse(node_changes=1, edge_changes=2, chunk_changes=3)
@@ -109,6 +124,10 @@ def test_logs_iteration(pitrd):
     with Client(socket) as client:
         values = list(client.logs("/workspace/proj", 2))
     assert [value.command for value in values] == ["write:a", "commit"]
+    assert values[0].posix_operation == "write(file, 2)"
+    assert values[0].process_command == "echo hi > file"
+    assert values[0].actor_name == "tester"
+    assert values[0].change_summary == '"v1" -> "v2"'
 
 
 def test_revert_with_path_and_diff(pitrd):
@@ -120,9 +139,25 @@ def test_revert_with_path_and_diff(pitrd):
         )
     assert reverted.applied == 3
     assert reverted.new_version_hash == "fedcba654321"
+    assert reverted.resolved_version_hash == "111111111111"
     assert diff.node_changes == 1
     assert diff.edge_changes == 2
     assert diff.chunk_changes == 3
+
+
+def test_revert_at_requires_timezone_and_sends_timestamp(pitrd):
+    socket, implementation = pitrd
+    target = datetime(
+        2026, 7, 31, 18, 0, 0, 123, tzinfo=timezone(timedelta(hours=8))
+    )
+    with Client(socket) as client:
+        result = client.revert_at(target, path="/workspace/proj")
+        with pytest.raises(ValueError, match="包含时区"):
+            client.revert_at(datetime(2026, 7, 31, 18, 0, 0))
+        with pytest.raises(ValueError, match="不能为空"):
+            client.revert("")
+    assert implementation.last_revert_time == target.isoformat()
+    assert result.resolved_version_hash == "111111111111"
 
 
 def test_config_and_clear(pitrd):

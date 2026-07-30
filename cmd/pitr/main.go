@@ -586,6 +586,7 @@ func newRollbackCmd() *cobra.Command {
 
 func newLogsCmd() *cobra.Command {
 	var limit int
+	var long bool
 	c := &cobra.Command{
 		Use:   "logs <path>",
 		Short: "查看 <path> 的版本历史",
@@ -610,6 +611,35 @@ func newLogsCmd() *cobra.Command {
 			}
 			for _, entry := range resp.GetEntries() {
 				transaction := entry.GetTransaction()
+				if long {
+					posixOp := transaction.GetPosixOperation()
+					if posixOp == "" {
+						posixOp = transaction.GetCommand()
+					}
+					processCommand := shortenForLog(
+						transaction.GetProcessCommand(), 10)
+					if processCommand == "" {
+						processCommand = "<unknown>"
+					}
+					operationTime := transaction.GetCreatedAt()
+					if transaction.GetClosedAt() != nil {
+						operationTime = transaction.GetClosedAt()
+					}
+					timestamp := ""
+					if operationTime != nil {
+						timestamp = operationTime.AsTime().Format(time.RFC3339Nano)
+					}
+					actor := formatLogActor(transaction)
+					change := transaction.GetChangeSummary()
+					if change == "" {
+						change = "-"
+					}
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+						"%s\t%s\t%s\t%s\t%s\t%s\n",
+						transaction.GetVersionHash(), posixOp, processCommand,
+						timestamp, actor, change)
+					continue
+				}
 				if transaction.GetMessage() == "" {
 					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s   %s\n",
 						transaction.GetVersionHash(), transaction.GetCommand())
@@ -623,7 +653,32 @@ func newLogsCmd() *cobra.Command {
 		},
 	}
 	c.Flags().IntVarP(&limit, "number", "n", 20, "最多返回多少条")
+	c.Flags().BoolVarP(&long, "long", "l", false,
+		"显示 POSIX 操作、原始命令、操作时间、操作人和内容摘要")
 	return c
+}
+
+func shortenForLog(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "..."
+}
+
+func formatLogActor(transaction *pb.Transaction) string {
+	if transaction.GetActorName() != "" {
+		return fmt.Sprintf("%s(uid=%d,gid=%d,pid=%d)",
+			transaction.GetActorName(), transaction.GetActorUid(),
+			transaction.GetActorGid(), transaction.GetActorPid())
+	}
+	if transaction.GetActorUid() == 0 && transaction.GetActorGid() == 0 &&
+		transaction.GetActorPid() == 0 {
+		return "<unknown>"
+	}
+	return fmt.Sprintf("uid=%d,gid=%d,pid=%d",
+		transaction.GetActorUid(), transaction.GetActorGid(),
+		transaction.GetActorPid())
 }
 
 func newDiffCmd() *cobra.Command {
@@ -666,11 +721,15 @@ func newRevertCmd() *cobra.Command {
 	var scope string
 	var dryRun bool
 	var global bool
+	var targetTime string
 	c := &cobra.Command{
-		Use:   "revert <version-hash>",
-		Short: "回退到指定版本",
-		Args:  cobra.ExactArgs(1),
+		Use:   "revert [version-hash]",
+		Short: "按版本号或时间回退",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if (len(args) == 0) == (targetTime == "") {
+				return errors.New("version-hash 与 --at 必须且只能指定一个")
+			}
 			if global && scope != "" {
 				return errors.New("--global 与 --path/--scope 不能同时使用")
 			}
@@ -689,20 +748,28 @@ func newRevertCmd() *cobra.Command {
 			defer client.close()
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
+			versionHash := ""
+			if len(args) == 1 {
+				versionHash = args[0]
+			}
 			resp, err := client.rpc.Revert(ctx, &pb.RevertRequest{
-				VersionHash: args[0],
+				VersionHash: versionHash,
 				Path:        resolved,
 				DryRun:      dryRun,
+				TargetTime:  targetTime,
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
 			if dryRun {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"dry-run: would apply %d history rows\n", resp.GetApplied())
+					"dry-run: target %s at %s; would apply %d history rows\n",
+					resp.GetResolvedVersionHash(), resp.GetResolvedVersionTime(),
+					resp.GetApplied())
 			} else {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"reverted %d history rows; new version %s\n",
+					"reverted to %s at %s; applied %d history rows; new version %s\n",
+					resp.GetResolvedVersionHash(), resp.GetResolvedVersionTime(),
 					resp.GetApplied(), resp.GetNewVersionHash())
 			}
 			return nil
@@ -712,6 +779,8 @@ func newRevertCmd() *cobra.Command {
 	c.Flags().StringVar(&scope, "scope", "", "已弃用:请使用 --path")
 	c.Flags().BoolVar(&global, "global", false, "回退整个卷(默认只回退当前目录)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "只统计将回放的 history")
+	c.Flags().StringVar(&targetTime, "at", "",
+		"回退到该 RFC3339 时间之前最近的完整版本")
 	return c
 }
 

@@ -490,18 +490,25 @@ func (x *StatusResponse) GetOpenWrites() int64 {
 }
 
 type Transaction struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TxnId         int64                  `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
-	VersionHash   string                 `protobuf:"bytes,2,opt,name=version_hash,json=versionHash,proto3" json:"version_hash,omitempty"`
-	ParentId      *int64                 `protobuf:"varint,3,opt,name=parent_id,json=parentId,proto3,oneof" json:"parent_id,omitempty"`
-	ScopePath     string                 `protobuf:"bytes,4,opt,name=scope_path,json=scopePath,proto3" json:"scope_path,omitempty"`
-	State         string                 `protobuf:"bytes,5,opt,name=state,proto3" json:"state,omitempty"`
-	Command       string                 `protobuf:"bytes,6,opt,name=command,proto3" json:"command,omitempty"`
-	Message       string                 `protobuf:"bytes,7,opt,name=message,proto3" json:"message,omitempty"`
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	ClosedAt      *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=closed_at,json=closedAt,proto3" json:"closed_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	TxnId          int64                  `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	VersionHash    string                 `protobuf:"bytes,2,opt,name=version_hash,json=versionHash,proto3" json:"version_hash,omitempty"`
+	ParentId       *int64                 `protobuf:"varint,3,opt,name=parent_id,json=parentId,proto3,oneof" json:"parent_id,omitempty"`
+	ScopePath      string                 `protobuf:"bytes,4,opt,name=scope_path,json=scopePath,proto3" json:"scope_path,omitempty"`
+	State          string                 `protobuf:"bytes,5,opt,name=state,proto3" json:"state,omitempty"`
+	Command        string                 `protobuf:"bytes,6,opt,name=command,proto3" json:"command,omitempty"`
+	Message        string                 `protobuf:"bytes,7,opt,name=message,proto3" json:"message,omitempty"`
+	CreatedAt      *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	ClosedAt       *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=closed_at,json=closedAt,proto3" json:"closed_at,omitempty"`
+	PosixOperation string                 `protobuf:"bytes,10,opt,name=posix_operation,json=posixOperation,proto3" json:"posix_operation,omitempty"`
+	ProcessCommand string                 `protobuf:"bytes,11,opt,name=process_command,json=processCommand,proto3" json:"process_command,omitempty"`
+	ActorUid       int64                  `protobuf:"varint,12,opt,name=actor_uid,json=actorUid,proto3" json:"actor_uid,omitempty"`
+	ActorGid       int64                  `protobuf:"varint,13,opt,name=actor_gid,json=actorGid,proto3" json:"actor_gid,omitempty"`
+	ActorPid       int64                  `protobuf:"varint,14,opt,name=actor_pid,json=actorPid,proto3" json:"actor_pid,omitempty"`
+	ActorName      string                 `protobuf:"bytes,15,opt,name=actor_name,json=actorName,proto3" json:"actor_name,omitempty"`
+	ChangeSummary  string                 `protobuf:"bytes,16,opt,name=change_summary,json=changeSummary,proto3" json:"change_summary,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Transaction) Reset() {
@@ -595,6 +602,55 @@ func (x *Transaction) GetClosedAt() *timestamppb.Timestamp {
 		return x.ClosedAt
 	}
 	return nil
+}
+
+func (x *Transaction) GetPosixOperation() string {
+	if x != nil {
+		return x.PosixOperation
+	}
+	return ""
+}
+
+func (x *Transaction) GetProcessCommand() string {
+	if x != nil {
+		return x.ProcessCommand
+	}
+	return ""
+}
+
+func (x *Transaction) GetActorUid() int64 {
+	if x != nil {
+		return x.ActorUid
+	}
+	return 0
+}
+
+func (x *Transaction) GetActorGid() int64 {
+	if x != nil {
+		return x.ActorGid
+	}
+	return 0
+}
+
+func (x *Transaction) GetActorPid() int64 {
+	if x != nil {
+		return x.ActorPid
+	}
+	return 0
+}
+
+func (x *Transaction) GetActorName() string {
+	if x != nil {
+		return x.ActorName
+	}
+	return ""
+}
+
+func (x *Transaction) GetChangeSummary() string {
+	if x != nil {
+		return x.ChangeSummary
+	}
+	return ""
 }
 
 type BeginRequest struct {
@@ -1126,6 +1182,7 @@ type RevertRequest struct {
 	VersionHash   string                 `protobuf:"bytes,1,opt,name=version_hash,json=versionHash,proto3" json:"version_hash,omitempty"`
 	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	DryRun        bool                   `protobuf:"varint,3,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	TargetTime    string                 `protobuf:"bytes,4,opt,name=target_time,json=targetTime,proto3" json:"target_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1181,12 +1238,21 @@ func (x *RevertRequest) GetDryRun() bool {
 	return false
 }
 
+func (x *RevertRequest) GetTargetTime() string {
+	if x != nil {
+		return x.TargetTime
+	}
+	return ""
+}
+
 type RevertResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Applied        int64                  `protobuf:"varint,1,opt,name=applied,proto3" json:"applied,omitempty"`
-	NewVersionHash string                 `protobuf:"bytes,2,opt,name=new_version_hash,json=newVersionHash,proto3" json:"new_version_hash,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	Applied             int64                  `protobuf:"varint,1,opt,name=applied,proto3" json:"applied,omitempty"`
+	NewVersionHash      string                 `protobuf:"bytes,2,opt,name=new_version_hash,json=newVersionHash,proto3" json:"new_version_hash,omitempty"`
+	ResolvedVersionHash string                 `protobuf:"bytes,3,opt,name=resolved_version_hash,json=resolvedVersionHash,proto3" json:"resolved_version_hash,omitempty"`
+	ResolvedVersionTime string                 `protobuf:"bytes,4,opt,name=resolved_version_time,json=resolvedVersionTime,proto3" json:"resolved_version_time,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *RevertResponse) Reset() {
@@ -1229,6 +1295,20 @@ func (x *RevertResponse) GetApplied() int64 {
 func (x *RevertResponse) GetNewVersionHash() string {
 	if x != nil {
 		return x.NewVersionHash
+	}
+	return ""
+}
+
+func (x *RevertResponse) GetResolvedVersionHash() string {
+	if x != nil {
+		return x.ResolvedVersionHash
+	}
+	return ""
+}
+
+func (x *RevertResponse) GetResolvedVersionTime() string {
+	if x != nil {
+		return x.ResolvedVersionTime
 	}
 	return ""
 }
@@ -1710,7 +1790,7 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\avolumes\x18\x03 \x03(\v2\x16.pitrd.v1.VolumeStatusR\avolumes\x123\n" +
 	"\x13active_transactions\x18\x04 \x01(\x03B\x02\x18\x01R\x12activeTransactions\x12\x1f\n" +
 	"\vopen_writes\x18\x05 \x01(\x03R\n" +
-	"openWrites\"\xd4\x02\n" +
+	"openWrites\"\xc3\x04\n" +
 	"\vTransaction\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x03R\x05txnId\x12!\n" +
 	"\fversion_hash\x18\x02 \x01(\tR\vversionHash\x12 \n" +
@@ -1722,7 +1802,16 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\amessage\x18\a \x01(\tR\amessage\x129\n" +
 	"\n" +
 	"created_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x127\n" +
-	"\tclosed_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\bclosedAtB\f\n" +
+	"\tclosed_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\bclosedAt\x12'\n" +
+	"\x0fposix_operation\x18\n" +
+	" \x01(\tR\x0eposixOperation\x12'\n" +
+	"\x0fprocess_command\x18\v \x01(\tR\x0eprocessCommand\x12\x1b\n" +
+	"\tactor_uid\x18\f \x01(\x03R\bactorUid\x12\x1b\n" +
+	"\tactor_gid\x18\r \x01(\x03R\bactorGid\x12\x1b\n" +
+	"\tactor_pid\x18\x0e \x01(\x03R\bactorPid\x12\x1d\n" +
+	"\n" +
+	"actor_name\x18\x0f \x01(\tR\tactorName\x12%\n" +
+	"\x0echange_summary\x18\x10 \x01(\tR\rchangeSummaryB\f\n" +
 	"\n" +
 	"_parent_id\"<\n" +
 	"\fBeginRequest\x12\x12\n" +
@@ -1759,14 +1848,18 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"created_at\x18\x05 \x01(\tR\tcreatedAt\x127\n" +
 	"\vtransaction\x18\x06 \x01(\v2\x15.pitrd.v1.TransactionR\vtransaction\"<\n" +
 	"\fLogsResponse\x12,\n" +
-	"\aentries\x18\x01 \x03(\v2\x12.pitrd.v1.LogEntryR\aentries\"_\n" +
+	"\aentries\x18\x01 \x03(\v2\x12.pitrd.v1.LogEntryR\aentries\"\x80\x01\n" +
 	"\rRevertRequest\x12!\n" +
 	"\fversion_hash\x18\x01 \x01(\tR\vversionHash\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x17\n" +
-	"\adry_run\x18\x03 \x01(\bR\x06dryRun\"T\n" +
+	"\adry_run\x18\x03 \x01(\bR\x06dryRun\x12\x1f\n" +
+	"\vtarget_time\x18\x04 \x01(\tR\n" +
+	"targetTime\"\xbc\x01\n" +
 	"\x0eRevertResponse\x12\x18\n" +
 	"\aapplied\x18\x01 \x01(\x03R\aapplied\x12(\n" +
-	"\x10new_version_hash\x18\x02 \x01(\tR\x0enewVersionHash\"[\n" +
+	"\x10new_version_hash\x18\x02 \x01(\tR\x0enewVersionHash\x122\n" +
+	"\x15resolved_version_hash\x18\x03 \x01(\tR\x13resolvedVersionHash\x122\n" +
+	"\x15resolved_version_time\x18\x04 \x01(\tR\x13resolvedVersionTime\"[\n" +
 	"\vDiffRequest\x12\x1b\n" +
 	"\tversion_a\x18\x01 \x01(\tR\bversionA\x12\x1b\n" +
 	"\tversion_b\x18\x02 \x01(\tR\bversionB\x12\x12\n" +

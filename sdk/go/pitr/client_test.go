@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -57,6 +58,9 @@ func (*fakeServer) Logs(
 		Transaction: &pb.Transaction{
 			TxnId: 8, VersionHash: "fedcba654321",
 			ScopePath: "/workspace/proj", State: "auto", Command: "write:a",
+			PosixOperation: "write(a, 2)", ProcessCommand: "echo hi > a",
+			ActorUid: 1000, ActorGid: 1000, ActorPid: 22,
+			ActorName: "tester", ChangeSummary: "\"v1\" -> \"v2\"",
 		},
 	}}}, nil
 }
@@ -68,6 +72,8 @@ func (s *fakeServer) Revert(
 	s.lastRevert = request
 	return &pb.RevertResponse{
 		Applied: 3, NewVersionHash: "aabbccddeeff",
+		ResolvedVersionHash: "111111111111",
+		ResolvedVersionTime: "2026-07-31T10:00:00Z",
 	}, nil
 }
 
@@ -149,7 +155,11 @@ func TestGoSDK_LogsDiffRevert(t *testing.T) {
 	}
 	defer client.Close()
 	logs, err := client.Logs(context.Background(), "/workspace/proj", 5)
-	if err != nil || len(logs) != 1 || logs[0].Command != "write:a" {
+	if err != nil || len(logs) != 1 || logs[0].Command != "write:a" ||
+		logs[0].POSIXOperation != "write(a, 2)" ||
+		logs[0].ProcessCommand != "echo hi > a" ||
+		logs[0].ActorName != "tester" ||
+		logs[0].ChangeSummary != "\"v1\" -> \"v2\"" {
 		t.Fatalf("logs=%+v err=%v", logs, err)
 	}
 	diff, err := client.Diff(
@@ -161,7 +171,8 @@ func TestGoSDK_LogsDiffRevert(t *testing.T) {
 	reverted, err := client.Revert(
 		context.Background(), "111111111111", WithPath("/workspace/proj"))
 	if err != nil || reverted.Applied != 3 ||
-		reverted.NewVersionHash != "aabbccddeeff" {
+		reverted.NewVersionHash != "aabbccddeeff" ||
+		reverted.ResolvedVersionHash != "111111111111" {
 		t.Fatalf("revert=%+v err=%v", reverted, err)
 	}
 	working := t.TempDir()
@@ -179,6 +190,21 @@ func TestGoSDK_LogsDiffRevert(t *testing.T) {
 	}
 	if implementation.lastRevert.GetPath() != "" {
 		t.Fatalf("global revert path=%q", implementation.lastRevert.GetPath())
+	}
+	target := time.Date(2026, 7, 31, 18, 0, 0, 123, time.FixedZone("CST", 8*60*60))
+	if _, err := client.RevertAt(
+		context.Background(), target, WithPath("/workspace/proj")); err != nil {
+		t.Fatal(err)
+	}
+	if implementation.lastRevert.GetVersionHash() != "" ||
+		implementation.lastRevert.GetTargetTime() != target.Format(time.RFC3339Nano) {
+		t.Fatalf("revert at request=%+v", implementation.lastRevert)
+	}
+	if _, err := client.Revert(context.Background(), ""); err == nil {
+		t.Fatal("empty version hash should fail")
+	}
+	if _, err := client.RevertAt(context.Background(), time.Time{}); err == nil {
+		t.Fatal("zero target time should fail")
 	}
 }
 

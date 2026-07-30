@@ -14,12 +14,16 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"pitr_fs/internal/txn"
 )
 
 // VersionManager 是 FUSE 层需要的最小事务接口,便于对失败路径做隔离测试。
 type VersionManager interface {
-	OpenStandaloneVersion(context.Context, string, string) (int64, error)
-	CloseStandaloneVersion(context.Context, int64) error
+	OpenStandaloneVersion(
+		context.Context, string, string, txn.VersionMetadata,
+	) (int64, error)
+	CloseStandaloneVersion(context.Context, int64, string, string) error
 	AbortAutoVersion(context.Context, int64) error
 }
 
@@ -55,6 +59,10 @@ type Loopback struct {
 	fds      map[uint64]fdVersion
 	longPath string
 	nextFD   atomic.Uint64
+
+	auditMu      sync.Mutex
+	processCache map[uint32]processCacheEntry
+	userCache    map[uint32]string
 }
 
 func (l *Loopback) setLongPath(value string) {
@@ -91,9 +99,11 @@ func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
 	}
 
 	loopback := &Loopback{
-		Backend: backend,
-		Mount:   mount,
-		fds:     make(map[uint64]fdVersion),
+		Backend:      backend,
+		Mount:        mount,
+		fds:          make(map[uint64]fdVersion),
+		processCache: make(map[uint32]processCacheEntry),
+		userCache:    make(map[uint32]string),
 	}
 	for _, option := range options {
 		option(loopback)

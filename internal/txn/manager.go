@@ -15,7 +15,11 @@ import (
 )
 
 const txnColumns = `id, version_hash, parent_id, scope_path, state,
-	COALESCE(command, ''), COALESCE(message, ''), created_at, closed_at`
+	COALESCE(command, ''), COALESCE(message, ''),
+	COALESCE(posix_op, ''), COALESCE(process_command, ''),
+	COALESCE(actor_uid, 0), COALESCE(actor_gid, 0), COALESCE(actor_pid, 0),
+	COALESCE(actor_name, ''), COALESCE(change_summary, ''),
+	created_at, closed_at`
 
 const (
 	fdReleaseWait = 2 * time.Second
@@ -44,6 +48,13 @@ func scanTxn(row scanner) (*Txn, error) {
 		&out.State,
 		&out.Command,
 		&out.Message,
+		&out.PosixOp,
+		&out.ProcessCommand,
+		&out.ActorUID,
+		&out.ActorGID,
+		&out.ActorPID,
+		&out.ActorName,
+		&out.ChangeSummary,
 		&out.CreatedAt,
 		&out.ClosedAt,
 	); err != nil {
@@ -224,6 +235,65 @@ func (m *Manager) FindByID(ctx context.Context, txnID int64) (*Txn, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("find txn %d: %w", txnID, err)
+	}
+	return found, nil
+}
+
+func (m *Manager) FindByHash(ctx context.Context, hash string) (*Txn, error) {
+	found, err := scanTxn(m.db.QueryRow(ctx,
+		"SELECT "+txnColumns+" FROM pitr_txn WHERE version_hash=$1", hash))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTxnNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find version hash %s: %w", hash, err)
+	}
+	return found, nil
+}
+
+// FindClosedAtOrBefore 返回目标时间之前最近的完整版本。全局时间线用于
+// 定位时间点，目录范围只在随后 replay 时过滤，避免跨目录写入改变时间语义。
+func (m *Manager) FindClosedAtOrBefore(
+	ctx context.Context,
+	target time.Time,
+) (*Txn, error) {
+	found, err := scanTxn(m.db.QueryRow(ctx, `
+		SELECT `+txnColumns+`
+		  FROM pitr_txn
+		 WHERE state<>'root'
+		   AND closed_at IS NOT NULL
+		   AND closed_at<=$1
+		 ORDER BY closed_at DESC,id DESC
+		 LIMIT 1`, target))
+	if err == nil {
+		return found, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("按时间查找版本: %w", err)
+	}
+
+	var earliest *time.Time
+	if err := m.db.QueryRow(ctx, `
+		SELECT min(closed_at)
+		  FROM pitr_txn
+		 WHERE state<>'root' AND closed_at IS NOT NULL`).Scan(&earliest); err != nil {
+		return nil, fmt.Errorf("读取最早版本时间: %w", err)
+	}
+	if earliest != nil {
+		return nil, fmt.Errorf("%w: %s",
+			ErrTimeBeforeHistory, earliest.Format(time.RFC3339Nano))
+	}
+
+	found, err = scanTxn(m.db.QueryRow(ctx, `
+		SELECT `+txnColumns+`
+		  FROM pitr_txn
+		 WHERE state='root' AND created_at<=$1
+		 ORDER BY id DESC LIMIT 1`, target))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTimeBeforeHistory
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读取 root 基线: %w", err)
 	}
 	return found, nil
 }

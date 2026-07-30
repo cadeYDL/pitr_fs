@@ -102,6 +102,7 @@ func (m *Manager) OpenStandaloneVersion(
 	ctx context.Context,
 	scope string,
 	command string,
+	metadata VersionMetadata,
 ) (int64, error) {
 	normalized, err := NormalizeScope(scope)
 	if err != nil {
@@ -129,10 +130,15 @@ func (m *Manager) OpenStandaloneVersion(
 			}
 			err = tx.QueryRow(ctx, `
 				INSERT INTO pitr_txn
-					(version_hash,parent_id,scope_path,state,command)
-				VALUES ($1,$2,$3,'auto',$4)
+					(version_hash,parent_id,scope_path,state,command,posix_op,
+					 process_command,actor_uid,actor_gid,actor_pid,actor_name)
+				VALUES ($1,$2,$3,'auto',$4,$5,$6,$7,$8,$9,$10)
 				ON CONFLICT (version_hash) DO NOTHING
-				RETURNING id`, hash, parentID, normalized, command).Scan(&versionID)
+				RETURNING id`,
+				hash, parentID, normalized, command,
+				metadata.PosixOp, metadata.ProcessCommand,
+				metadata.ActorUID, metadata.ActorGID, metadata.ActorPID,
+				metadata.ActorName).Scan(&versionID)
 			if err == nil {
 				return nil
 			}
@@ -148,7 +154,12 @@ func (m *Manager) OpenStandaloneVersion(
 	return versionID, nil
 }
 
-func (m *Manager) CloseStandaloneVersion(ctx context.Context, versionID int64) error {
+func (m *Manager) CloseStandaloneVersion(
+	ctx context.Context,
+	versionID int64,
+	posixOp string,
+	changeSummary string,
+) error {
 	err := m.db.InTx(ctx, func(tx pg.Tx) error {
 		if _, err := tx.Exec(ctx,
 			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:versions'))"); err != nil {
@@ -156,9 +167,13 @@ func (m *Manager) CloseStandaloneVersion(ctx context.Context, versionID int64) e
 		}
 		var scope string
 		if err := tx.QueryRow(ctx, `
-			UPDATE pitr_txn SET closed_at=now()
+			UPDATE pitr_txn
+			   SET closed_at=now(),
+			       posix_op=COALESCE(NULLIF($2,''),posix_op),
+			       change_summary=NULLIF($3,'')
 			 WHERE id=$1 AND state='auto' AND closed_at IS NULL
-			 RETURNING scope_path`, versionID).Scan(&scope); err != nil {
+			 RETURNING scope_path`,
+			versionID, posixOp, changeSummary).Scan(&scope); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("%w:auto %d 不存在或已关闭",
 					ErrIllegalTransit, versionID)

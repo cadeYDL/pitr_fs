@@ -27,12 +27,30 @@ CREATE TABLE IF NOT EXISTS pitr_txn (
     state         text      NOT NULL,                 -- active | committed | rolled_back | auto | root
     command       text,
     message       text,
+    posix_op      text,
+    process_command text,
+    actor_uid     bigint,
+    actor_gid     bigint,
+    actor_pid     bigint,
+    actor_name    text,
+    change_summary text,
     created_at    timestamptz NOT NULL DEFAULT now(),
     closed_at     timestamptz
 );
 
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS posix_op text;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS process_command text;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_uid bigint;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_gid bigint;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_pid bigint;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_name text;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS change_summary text;
+
 CREATE INDEX IF NOT EXISTS idx_pitr_txn_scope_state ON pitr_txn (scope_path, state);
 CREATE INDEX IF NOT EXISTS idx_pitr_txn_created     ON pitr_txn (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pitr_txn_closed
+    ON pitr_txn (closed_at DESC, id DESC)
+    WHERE closed_at IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_auto_window
     ON pitr_txn ((1))
     WHERE state = 'auto' AND closed_at IS NULL;

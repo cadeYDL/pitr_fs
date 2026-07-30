@@ -21,7 +21,9 @@ func (n *Node) Create(
 ) (inode *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	path := n.root.visiblePath(n, name)
 	var file *trackedFile
-	errno = n.versionedHook(ctx, path, command("create", path), 0,
+	posixOp := fmt.Sprintf("open(%q, %s, %#o)",
+		path, formatOpenFlags(flags|syscall.O_CREAT), mode)
+	errno = n.versionedHook(ctx, path, command("create", path), posixOp, 0,
 		func() syscall.Errno {
 			var base fs.FileHandle
 			inode, base, fuseFlags, errno = n.LoopbackNode.Create(
@@ -42,7 +44,7 @@ func (n *Node) Create(
 		})
 	if errno == 0 && file != nil && file.writable {
 		if keepErrno := n.keepWritableWindow(
-			ctx, path, command("open-write", path), file); keepErrno != 0 {
+			ctx, path, command("open-write", path), posixOp, file); keepErrno != 0 {
 			_ = file.LoopbackFile.Release(ctx)
 			return nil, nil, 0, keepErrno
 		}
@@ -57,7 +59,8 @@ func (n *Node) Mkdir(
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, errno syscall.Errno) {
 	path := n.root.visiblePath(n, name)
-	errno = n.versionedHook(ctx, path, command("mkdir", path), 0,
+	posixOp := fmt.Sprintf("mkdir(%q, %#o)", path, mode)
+	errno = n.versionedHook(ctx, path, command("mkdir", path), posixOp, 0,
 		func() syscall.Errno {
 			inode, errno = n.LoopbackNode.Mkdir(ctx, name, mode, out)
 			return errno
@@ -67,7 +70,8 @@ func (n *Node) Mkdir(
 
 func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	path := n.root.visiblePath(n, name)
-	return n.versionedHook(ctx, path, command("unlink", path), 0,
+	return n.versionedHook(ctx, path, command("unlink", path),
+		fmt.Sprintf("unlink(%q)", path), 0,
 		func() syscall.Errno {
 			return n.LoopbackNode.Unlink(ctx, name)
 		})
@@ -75,7 +79,8 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 
 func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	path := n.root.visiblePath(n, name)
-	return n.versionedHook(ctx, path, command("rmdir", path), 0,
+	return n.versionedHook(ctx, path, command("rmdir", path),
+		fmt.Sprintf("rmdir(%q)", path), 0,
 		func() syscall.Errno {
 			return n.LoopbackNode.Rmdir(ctx, name)
 		})
@@ -93,8 +98,11 @@ func (n *Node) Rename(
 	if !ok {
 		return syscall.EXDEV
 	}
+	source := n.root.visiblePath(n, name)
 	path := destination.root.visiblePath(destination, newName)
-	return n.versionedHook(ctx, path, command("rename", path), 0,
+	posixOp := fmt.Sprintf("rename(%q, %q)", source, path)
+	return n.versionedHook(ctx, path,
+		fmt.Sprintf("rename:%s->%s", source, path), posixOp, 0,
 		func() syscall.Errno {
 			return n.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
 		})
@@ -106,7 +114,8 @@ func (n *Node) Symlink(
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, errno syscall.Errno) {
 	path := n.root.visiblePath(n, name)
-	errno = n.versionedHook(ctx, path, command("symlink", path), 0,
+	posixOp := fmt.Sprintf("symlink(%q, %q)", target, path)
+	errno = n.versionedHook(ctx, path, command("symlink", path), posixOp, 0,
 		func() syscall.Errno {
 			inode, errno = n.LoopbackNode.Symlink(ctx, target, name, out)
 			return errno
@@ -121,7 +130,8 @@ func (n *Node) Link(
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, errno syscall.Errno) {
 	path := n.root.visiblePath(n, name)
-	errno = n.versionedHook(ctx, path, command("link", path), 0,
+	posixOp := fmt.Sprintf("link(<inode>, %q)", path)
+	errno = n.versionedHook(ctx, path, command("link", path), posixOp, 0,
 		func() syscall.Errno {
 			inode, errno = n.LoopbackNode.Link(ctx, target, name, out)
 			return errno
@@ -134,6 +144,7 @@ func (n *Node) Open(
 	flags uint32,
 ) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	path := n.root.visiblePath(n)
+	posixOp := fmt.Sprintf("open(%q, %s)", path, formatOpenFlags(flags))
 	open := func() syscall.Errno {
 		var base fs.FileHandle
 		base, fuseFlags, errno = n.LoopbackNode.Open(ctx, flags)
@@ -152,12 +163,13 @@ func (n *Node) Open(
 	if flags&(syscall.O_TRUNC|syscall.O_CREAT) == 0 {
 		errno = open()
 	} else {
-		errno = n.versionedHook(ctx, path, command("open", path), 0, open)
+		errno = n.versionedHook(
+			ctx, path, command("open", path), posixOp, 0, open)
 	}
 	if errno == 0 {
 		if file, ok := tracked(fh); ok && file.writable {
 			if keepErrno := n.keepWritableWindow(
-				ctx, path, command("open-write", path), file); keepErrno != 0 {
+				ctx, path, command("open-write", path), posixOp, file); keepErrno != 0 {
 				_ = file.LoopbackFile.Release(ctx)
 				return nil, 0, keepErrno
 			}
@@ -177,11 +189,24 @@ func (n *Node) Write(
 		return 0, syscall.EBADF
 	}
 	path := n.root.visiblePath(n)
-	errno = n.versionedHook(ctx, path, command("write", path), file.id,
+	sample := n.root.sampleWrite(path, data, off)
+	posixOp := fmt.Sprintf("write(%q, offset=%d, len=%d)",
+		path, off, len(data))
+	errno = n.versionedHook(ctx, path, command("write", path), posixOp, file.id,
 		func() syscall.Errno {
 			written, errno = file.LoopbackFile.Write(ctx, data, off)
 			return errno
 		})
+	if errno == 0 && written != 0 {
+		sample.length = int(written)
+		if len(sample.before) > int(written) {
+			sample.before = sample.before[:written]
+		}
+		if len(sample.after) > int(written) {
+			sample.after = sample.after[:written]
+		}
+		file.addWriteSample(sample)
+	}
 	return written, errno
 }
 
@@ -200,7 +225,11 @@ func (n *Node) Setattr(
 	if file, ok := tracked(f); ok {
 		fd = file.id
 	}
-	return n.versionedHook(ctx, path, command(op, path), fd,
+	posixOp := fmt.Sprintf("setattr(%q)", path)
+	if size, ok := in.GetSize(); ok {
+		posixOp = fmt.Sprintf("truncate(%q, %d)", path, size)
+	}
+	return n.versionedHook(ctx, path, command(op, path), posixOp, fd,
 		func() syscall.Errno {
 			return n.LoopbackNode.Setattr(ctx, f, in, out)
 		})
@@ -213,7 +242,8 @@ func (n *Node) Setxattr(
 	flags uint32,
 ) syscall.Errno {
 	path := n.root.visiblePath(n)
-	return n.versionedHook(ctx, path, command("setxattr", path), 0,
+	posixOp := fmt.Sprintf("setxattr(%q, %q, len=%d)", path, attr, len(data))
+	return n.versionedHook(ctx, path, command("setxattr", path), posixOp, 0,
 		func() syscall.Errno {
 			return n.LoopbackNode.Setxattr(ctx, attr, data, flags)
 		})
@@ -221,7 +251,8 @@ func (n *Node) Setxattr(
 
 func (n *Node) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	path := n.root.visiblePath(n)
-	return n.versionedHook(ctx, path, command("removexattr", path), 0,
+	posixOp := fmt.Sprintf("removexattr(%q, %q)", path, attr)
+	return n.versionedHook(ctx, path, command("removexattr", path), posixOp, 0,
 		func() syscall.Errno {
 			return n.LoopbackNode.Removexattr(ctx, attr)
 		})
@@ -238,7 +269,9 @@ func (n *Node) Allocate(
 		return syscall.EBADF
 	}
 	path := n.root.visiblePath(n)
-	return n.versionedHook(ctx, path, command("fallocate", path), file.id,
+	posixOp := fmt.Sprintf("fallocate(%q, offset=%d, len=%d, mode=%d)",
+		path, off, size, mode)
+	return n.versionedHook(ctx, path, command("fallocate", path), posixOp, file.id,
 		func() syscall.Errno {
 			return file.LoopbackFile.Allocate(ctx, off, size, mode)
 		})
@@ -282,8 +315,11 @@ func (n *Node) CopyFileRange(
 		return 0, syscall.EXDEV
 	}
 	path := destinationNode.root.visiblePath(destinationNode)
+	posixOp := fmt.Sprintf(
+		"copy_file_range(<source>, %q, offset=%d, len=%d)",
+		path, offOut, length)
 	errno = destinationNode.versionedHook(
-		ctx, path, command("copy_file_range", path), destination.id,
+		ctx, path, command("copy_file_range", path), posixOp, destination.id,
 		func() syscall.Errno {
 			count, errno = n.LoopbackNode.CopyFileRange(
 				ctx,
@@ -297,5 +333,10 @@ func (n *Node) CopyFileRange(
 			)
 			return errno
 		})
+	if errno == 0 && count != 0 {
+		destination.addWriteSample(writeSample{
+			offset: int64(offOut), length: int(count), calls: 1,
+		})
+	}
 	return count, errno
 }

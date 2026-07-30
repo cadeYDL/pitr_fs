@@ -19,13 +19,20 @@ func transactionPB(in *txn.Txn) *pb.Transaction {
 		return nil
 	}
 	out := &pb.Transaction{
-		TxnId:       in.ID,
-		VersionHash: in.VersionHash,
-		ScopePath:   in.ScopePath,
-		State:       in.State,
-		Command:     in.Command,
-		Message:     in.Message,
-		CreatedAt:   timestamppb.New(in.CreatedAt),
+		TxnId:          in.ID,
+		VersionHash:    in.VersionHash,
+		ScopePath:      in.ScopePath,
+		State:          in.State,
+		Command:        in.Command,
+		Message:        in.Message,
+		PosixOperation: in.PosixOp,
+		ProcessCommand: in.ProcessCommand,
+		ActorUid:       in.ActorUID,
+		ActorGid:       in.ActorGID,
+		ActorPid:       in.ActorPID,
+		ActorName:      in.ActorName,
+		ChangeSummary:  in.ChangeSummary,
+		CreatedAt:      timestamppb.New(in.CreatedAt),
 	}
 	if in.ParentID != nil {
 		parent := *in.ParentID

@@ -241,6 +241,23 @@ func TestSQL_TablesExist(t *testing.T) {
 	if n != 1 {
 		t.Error("uniq_active_txn_per_path 部分索引未建")
 	}
+	n = mustScalarInt(t, conn,
+		"SELECT count(*) FROM pg_indexes WHERE indexname = 'idx_pitr_txn_closed'")
+	if n != 1 {
+		t.Error("idx_pitr_txn_closed 部分索引未建")
+	}
+	for _, column := range []string{
+		"posix_op", "process_command", "actor_uid", "actor_gid",
+		"actor_pid", "actor_name", "change_summary",
+	} {
+		n = mustScalarInt(t, conn, `
+			SELECT count(*)
+			  FROM information_schema.columns
+			 WHERE table_name='pitr_txn' AND column_name=$1`, column)
+		if n != 1 {
+			t.Errorf("pitr_txn.%s 未建", column)
+		}
+	}
 
 	// 存储过程
 	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert", "pitr_rollback",

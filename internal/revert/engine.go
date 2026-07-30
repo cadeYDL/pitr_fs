@@ -17,6 +17,10 @@ import (
 
 var versionHashRE = regexp.MustCompile(`^[0-9a-f]{12}$`)
 
+func ValidVersionHash(value string) bool {
+	return versionHashRE.MatchString(strings.ToLower(strings.TrimSpace(value)))
+}
+
 type Engine struct {
 	db        *pg.DB
 	mountPath string
@@ -51,7 +55,7 @@ func (e *Engine) Revert(
 	options Options,
 ) (applied int64, newVersionHash string, err error) {
 	targetHash := strings.ToLower(strings.TrimSpace(options.TargetHash))
-	if !versionHashRE.MatchString(targetHash) {
+	if !ValidVersionHash(targetHash) {
 		return 0, "", fmt.Errorf("%w: %q", ErrInvalidHash, options.TargetHash)
 	}
 	var scope *string
@@ -157,11 +161,15 @@ func (e *Engine) Revert(
 			}
 			scanErr := tx.QueryRow(ctx, `
 				INSERT INTO pitr_txn
-					(version_hash,parent_id,scope_path,state,command,closed_at)
-				VALUES ($1,$2,$3,'committed',$4,now())
+					(version_hash,parent_id,scope_path,state,command,posix_op,
+					 process_command,actor_name,change_summary,closed_at)
+				VALUES ($1,$2,$3,'committed',$4,$5,$6,'pitrd',$7,now())
 				ON CONFLICT (version_hash) DO NOTHING
 				RETURNING id`,
-				hash, targetID, scopePath, "revert:"+targetHash).
+				hash, targetID, scopePath, "revert:"+targetHash,
+				fmt.Sprintf("revert(%q)", targetHash),
+				"pitr rever...",
+				fmt.Sprintf("replay %d history rows", applied)).
 				Scan(&revertID)
 			if scanErr == nil {
 				newVersionHash = hash

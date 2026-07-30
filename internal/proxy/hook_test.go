@@ -6,6 +6,8 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+
+	"pitr_fs/internal/txn"
 )
 
 type mockManager struct {
@@ -20,18 +22,23 @@ type mockManager struct {
 	abortCalls int
 	commands   []string
 	scopes     []string
+	metadata   []txn.VersionMetadata
+	posixOps   []string
+	summaries  []string
 }
 
 func (m *mockManager) OpenStandaloneVersion(
 	_ context.Context,
 	scope string,
 	command string,
+	metadata txn.VersionMetadata,
 ) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.openCalls++
 	m.commands = append(m.commands, command)
 	m.scopes = append(m.scopes, scope)
+	m.metadata = append(m.metadata, metadata)
 	if m.openErr != nil {
 		return 0, m.openErr
 	}
@@ -39,10 +46,17 @@ func (m *mockManager) OpenStandaloneVersion(
 	return m.nextAuto, nil
 }
 
-func (m *mockManager) CloseStandaloneVersion(context.Context, int64) error {
+func (m *mockManager) CloseStandaloneVersion(
+	_ context.Context,
+	_ int64,
+	posixOp string,
+	summary string,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closeCalls++
+	m.posixOps = append(m.posixOps, posixOp)
+	m.summaries = append(m.summaries, summary)
 	return m.closeErr
 }
 
@@ -65,7 +79,8 @@ func TestHook_EveryMutationCreatesVersion(t *testing.T) {
 	node := newHookNode(manager)
 	called := false
 	errno := node.versionedHook(
-		context.Background(), "/workspace/a", "write:/workspace/a", 1,
+		context.Background(), "/workspace/a", "write:/workspace/a",
+		`write("/workspace/a")`, 1,
 		func() syscall.Errno {
 			called = true
 			return 0
@@ -85,7 +100,8 @@ func TestHook_EachMetadataCallCreatesVersion(t *testing.T) {
 	node := newHookNode(manager)
 	for i := 0; i < 100; i++ {
 		errno := node.versionedHook(
-			context.Background(), "/workspace/a", "write:/workspace/a", 7,
+			context.Background(), "/workspace/a", "write:/workspace/a",
+			`write("/workspace/a")`, 7,
 			func() syscall.Errno { return 0 })
 		if errno != 0 {
 			t.Fatalf("第 %d 次 errno=%v", i, errno)
@@ -104,7 +120,8 @@ func TestHook_PGFail_ReturnsEIO(t *testing.T) {
 	node := newHookNode(manager)
 	called := false
 	errno := node.versionedHook(
-		context.Background(), "/workspace/a", "write:/workspace/a", 7,
+		context.Background(), "/workspace/a", "write:/workspace/a",
+		`write("/workspace/a")`, 7,
 		func() syscall.Errno {
 			called = true
 			return 0
@@ -118,7 +135,8 @@ func TestHook_ActionFail_RollsBackVersion(t *testing.T) {
 	manager := new(mockManager)
 	node := newHookNode(manager)
 	errno := node.versionedHook(
-		context.Background(), "/workspace/a", "write:/workspace/a", 7,
+		context.Background(), "/workspace/a", "write:/workspace/a",
+		`write("/workspace/a")`, 7,
 		func() syscall.Errno { return syscall.ENOSPC })
 	if errno != syscall.ENOSPC {
 		t.Fatalf("应保留 action errno,实际 %v", errno)
@@ -134,7 +152,8 @@ func TestHook_CloseFail_CompensatesAndReturnsEIO(t *testing.T) {
 	}
 	node := newHookNode(manager)
 	errno := node.versionedHook(
-		context.Background(), "/workspace/a", "write:/workspace/a", 7,
+		context.Background(), "/workspace/a", "write:/workspace/a",
+		`write("/workspace/a")`, 7,
 		func() syscall.Errno { return 0 })
 	if errno != syscall.EIO || manager.abortCalls != 1 {
 		t.Fatalf("errno=%v abort=%d", errno, manager.abortCalls)

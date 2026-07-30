@@ -80,6 +80,13 @@ message Transaction {
   string message = 7;
   google.protobuf.Timestamp created_at = 8;
   google.protobuf.Timestamp closed_at = 9;
+  string posix_operation = 10;
+  string process_command = 11;
+  int64 actor_uid = 12;
+  int64 actor_gid = 13;
+  int64 actor_pid = 14;
+  string actor_name = 15;
+  string change_summary = 16;
 }
 
 message BeginRequest {
@@ -138,11 +145,14 @@ message RevertRequest {
   string version_hash = 1;
   string path = 2;
   bool dry_run = 3;
+  string target_time = 4;
 }
 
 message RevertResponse {
   int64 applied = 1;
   string new_version_hash = 2;
+  string resolved_version_hash = 3;
+  string resolved_version_time = 4;
 }
 
 message DiffRequest {

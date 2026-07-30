@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
@@ -19,11 +21,44 @@ func (s *Server) Revert(
 	ctx context.Context,
 	req *pb.RevertRequest,
 ) (*pb.RevertResponse, error) {
-	if req.GetVersionHash() == "" {
-		return nil, status.Error(codes.InvalidArgument, "version_hash 不能为空")
+	versionHash := strings.TrimSpace(req.GetVersionHash())
+	targetTime := strings.TrimSpace(req.GetTargetTime())
+	if (versionHash == "") == (targetTime == "") {
+		return nil, status.Error(codes.InvalidArgument,
+			"version_hash 与 target_time 必须且只能指定一个")
+	}
+	var resolved *txn.Txn
+	if targetTime != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, targetTime)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"target_time 必须是带时区的 RFC3339 时间: %v", err)
+		}
+		if parsed.After(time.Now()) {
+			return nil, status.Error(codes.InvalidArgument,
+				"target_time 不能晚于当前时间")
+		}
+		resolved, err = s.mgr.FindClosedAtOrBefore(ctx, parsed)
+		if err != nil {
+			if errors.Is(err, txn.ErrTimeBeforeHistory) {
+				return nil, status.Error(codes.OutOfRange, err.Error())
+			}
+			return nil, rpcError(err)
+		}
+		versionHash = resolved.VersionHash
+	} else {
+		if !revert.ValidVersionHash(versionHash) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"%v: %q", revert.ErrInvalidHash, versionHash)
+		}
+		var err error
+		resolved, err = s.mgr.FindByHash(ctx, versionHash)
+		if err != nil {
+			return nil, rpcError(err)
+		}
 	}
 	applied, hash, err := s.rev.Revert(ctx, revert.Options{
-		TargetHash: req.GetVersionHash(),
+		TargetHash: versionHash,
 		ScopePath:  req.GetPath(),
 		DryRun:     req.GetDryRun(),
 	})
@@ -41,9 +76,15 @@ func (s *Server) Revert(
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
+	resolvedTime := resolved.CreatedAt
+	if resolved.ClosedAt != nil {
+		resolvedTime = *resolved.ClosedAt
+	}
 	return &pb.RevertResponse{
-		Applied:        applied,
-		NewVersionHash: hash,
+		Applied:             applied,
+		NewVersionHash:      hash,
+		ResolvedVersionHash: resolved.VersionHash,
+		ResolvedVersionTime: resolvedTime.Format(time.RFC3339Nano),
 	}, nil
 }
 

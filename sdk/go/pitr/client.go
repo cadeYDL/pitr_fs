@@ -100,15 +100,22 @@ func (c *Client) Begin(
 }
 
 type Transaction struct {
-	ID          int64
-	VersionHash string
-	ParentID    *int64
-	ScopePath   string
-	State       string
-	Command     string
-	Message     string
-	CreatedAt   time.Time
-	ClosedAt    *time.Time
+	ID             int64
+	VersionHash    string
+	ParentID       *int64
+	ScopePath      string
+	State          string
+	Command        string
+	Message        string
+	CreatedAt      time.Time
+	ClosedAt       *time.Time
+	POSIXOperation string
+	ProcessCommand string
+	ActorUID       int64
+	ActorGID       int64
+	ActorPID       int64
+	ActorName      string
+	ChangeSummary  string
 }
 
 func transactionFromPB(value *pb.Transaction) Transaction {
@@ -116,12 +123,19 @@ func transactionFromPB(value *pb.Transaction) Transaction {
 		return Transaction{}
 	}
 	result := Transaction{
-		ID:          value.GetTxnId(),
-		VersionHash: value.GetVersionHash(),
-		ScopePath:   value.GetScopePath(),
-		State:       value.GetState(),
-		Command:     value.GetCommand(),
-		Message:     value.GetMessage(),
+		ID:             value.GetTxnId(),
+		VersionHash:    value.GetVersionHash(),
+		ScopePath:      value.GetScopePath(),
+		State:          value.GetState(),
+		Command:        value.GetCommand(),
+		Message:        value.GetMessage(),
+		POSIXOperation: value.GetPosixOperation(),
+		ProcessCommand: value.GetProcessCommand(),
+		ActorUID:       value.GetActorUid(),
+		ActorGID:       value.GetActorGid(),
+		ActorPID:       value.GetActorPid(),
+		ActorName:      value.GetActorName(),
+		ChangeSummary:  value.GetChangeSummary(),
 	}
 	if value.ParentId != nil {
 		parent := value.GetParentId()
@@ -194,13 +208,40 @@ func WithDryRun() RevertOption {
 }
 
 type RevertResult struct {
-	Applied        int64
-	NewVersionHash string
+	Applied             int64
+	NewVersionHash      string
+	ResolvedVersionHash string
+	ResolvedVersionTime string
 }
 
 func (c *Client) Revert(
 	ctx context.Context,
 	versionHash string,
+	options ...RevertOption,
+) (RevertResult, error) {
+	if strings.TrimSpace(versionHash) == "" {
+		return RevertResult{}, errors.New("version hash 不能为空")
+	}
+	return c.revert(ctx, versionHash, "", options...)
+}
+
+// RevertAt 回滚到不晚于 target 的最近一个已完成版本。
+func (c *Client) RevertAt(
+	ctx context.Context,
+	target time.Time,
+	options ...RevertOption,
+) (RevertResult, error) {
+	if target.IsZero() {
+		return RevertResult{}, errors.New("target time 不能为空")
+	}
+	return c.revert(
+		ctx, "", target.Format(time.RFC3339Nano), options...)
+}
+
+func (c *Client) revert(
+	ctx context.Context,
+	versionHash string,
+	targetTime string,
 	options ...RevertOption,
 ) (RevertResult, error) {
 	config := revertOptions{path: "."}
@@ -221,13 +262,20 @@ func (c *Client) Revert(
 		VersionHash: versionHash,
 		Path:        resolved,
 		DryRun:      config.dryRun,
+		TargetTime:  targetTime,
 	})
 	if err != nil {
-		return RevertResult{}, fmt.Errorf("revert %s: %w", versionHash, err)
+		target := versionHash
+		if target == "" {
+			target = targetTime
+		}
+		return RevertResult{}, fmt.Errorf("revert %s: %w", target, err)
 	}
 	return RevertResult{
-		Applied:        response.GetApplied(),
-		NewVersionHash: response.GetNewVersionHash(),
+		Applied:             response.GetApplied(),
+		NewVersionHash:      response.GetNewVersionHash(),
+		ResolvedVersionHash: response.GetResolvedVersionHash(),
+		ResolvedVersionTime: response.GetResolvedVersionTime(),
 	}, nil
 }
 
