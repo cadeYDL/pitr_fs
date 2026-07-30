@@ -91,6 +91,23 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 	}
 }
 
+func TestInstall_ReadyRequiresSuccessfulRPC(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	for _, required := range []string{
+		`docker exec "$CONTAINER" test -S /var/run/pitrd.sock`,
+		`docker exec "$CONTAINER" pitr status >/dev/null 2>&1`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("wait_ready 缺少端到端就绪检查 %q", required)
+		}
+	}
+}
+
 // TestInstall_StatusOnMissingContainer — status 在容器不存在时输出"容器未运行"
 // 需要 docker 才能跑; 无 docker 直接跳过
 func TestInstall_StatusOnMissingContainer(t *testing.T) {

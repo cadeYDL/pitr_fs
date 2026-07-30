@@ -41,11 +41,14 @@ need_docker() {
     docker info >/dev/null 2>&1        || { echo "错误: Docker daemon 未运行" >&2; exit 1; }
 }
 
-# 端到端 ready 信号: PG 就绪 && pitrd socket 建立
+# 端到端 ready 信号:socket 建立且一次真实 gRPC Status 成功。只检查 socket
+# 文件会在 SIGKILL 后误认容器可用，因为 writable layer 可能短暂保留
+# 上一进程留下的 unix socket。
 wait_ready() {
     echo "==> 等待 pitrd 就绪 (最多 ${READY_TIMEOUT} 秒)"
     for i in $(seq 1 "$READY_TIMEOUT"); do
-        if docker exec "$CONTAINER" test -S /var/run/pitrd.sock 2>/dev/null; then
+        if docker exec "$CONTAINER" test -S /var/run/pitrd.sock 2>/dev/null \
+            && docker exec "$CONTAINER" pitr status >/dev/null 2>&1; then
             echo "    就绪"
             return 0
         fi
