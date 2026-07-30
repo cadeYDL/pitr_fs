@@ -1,7 +1,7 @@
 // pitr — pitr CLI 客户端。
 //
-// P1 阶段:cobra 骨架覆盖设计文档 §8.1 的所有子命令(逻辑留空,
-// 每个子命令 RunE 返回 "not implemented" 让集成侧能提前接线)。
+// cobra 命令覆盖设计文档 §8.1/§8.2 的控制面，并通过 unix gRPC
+// 调用 pitrd；daemon 子命令用于前台启动 pitrd。
 package main
 
 import (
@@ -138,7 +138,7 @@ func newInitCmd() *cobra.Command {
 	var volume, storage, bucket, accessKey, secretKey, retention, dataDir string
 	c := &cobra.Command{
 		Use:   "init <path>",
-		Short: "首次初始化:格式化 JuiceFS + 装触发器 + 挂载 FUSE 到 <path>",
+		Short: "幂等校准已部署卷并恢复 FUSE 挂载",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client, err := dialDaemon(cmd)
@@ -173,12 +173,12 @@ func newInitCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&volume, "volume", "default", "JuiceFS 卷名")
-	c.Flags().StringVar(&storage, "storage", "file", "juicefs 存储后端 (透传)")
-	c.Flags().StringVar(&bucket, "bucket", "", "juicefs bucket URL/路径 (透传)")
-	c.Flags().StringVar(&accessKey, "access-key", "", "云对象存储 access key (透传)")
-	c.Flags().StringVar(&secretKey, "secret-key", "", "云对象存储 secret key (透传)")
+	c.Flags().StringVar(&storage, "storage", "file", "兼容参数；存储后端在 install 时确定")
+	c.Flags().StringVar(&bucket, "bucket", "", "兼容参数；bucket 在 install 时确定")
+	c.Flags().StringVar(&accessKey, "access-key", "", "兼容参数；凭证在 install 时确定")
+	c.Flags().StringVar(&secretKey, "secret-key", "", "兼容参数；凭证在 install 时确定")
 	c.Flags().StringVar(&retention, "retention", "compact", "保留策略: verbose|compact|archive")
-	c.Flags().StringVar(&dataDir, "data-dir", "", "file 后端本地数据目录")
+	c.Flags().StringVar(&dataDir, "data-dir", "", "兼容参数；file 数据目录在 install 时确定")
 	return c
 }
 

@@ -37,8 +37,8 @@ func TestPitrCLI_Help(t *testing.T) {
 	}
 }
 
-// TestPitrCLI_UnimplementedReturnsErr — 未实现的子命令返回明确错误
-func TestPitrCLI_UnimplementedReturnsErr(t *testing.T) {
+// TestPitrCLI_DaemonUnavailableReturnsErr — daemon 不可用时返回明确错误
+func TestPitrCLI_DaemonUnavailableReturnsErr(t *testing.T) {
 	cases := [][]string{
 		{"init", "/tmp/x"},
 		{"begin", "/tmp/x"},
@@ -51,7 +51,7 @@ func TestPitrCLI_UnimplementedReturnsErr(t *testing.T) {
 		root.SetErr(new(bytes.Buffer))
 		root.SetArgs(args)
 		if err := root.Execute(); err == nil {
-			t.Errorf("args=%v 应报错(未实现),但返回 nil", args)
+			t.Errorf("args=%v 在 daemon 不可用时应报错,但返回 nil", args)
 		}
 	}
 }

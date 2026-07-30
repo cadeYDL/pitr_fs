@@ -61,7 +61,12 @@ install_wrapper() {
     $sudo tee "$BIN_LINK" >/dev/null <<EOF2
 #!/usr/bin/env bash
 # pitr 宿主机 wrapper, 转发到容器内 CLI
-exec docker exec -it "$CONTAINER" pitr "\$@"
+set -euo pipefail
+docker_args=(exec)
+if [ -t 0 ] && [ -t 1 ]; then
+    docker_args+=(-it)
+fi
+exec docker "\${docker_args[@]}" "$CONTAINER" pitr "\$@"
 EOF2
     $sudo chmod +x "$BIN_LINK"
 }

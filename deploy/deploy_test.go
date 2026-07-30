@@ -67,6 +67,30 @@ func TestInstall_UnknownSubcommandFails(t *testing.T) {
 	}
 }
 
+// TestInstall_WrapperSupportsNonTTY — wrapper 在终端中保留交互体验，在脚本和
+// CI 的非 TTY 环境中不得强制 docker exec -it。
+func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	for _, required := range []string{
+		"docker_args=(exec)",
+		`if [ -t 0 ] && [ -t 1 ]; then`,
+		"docker_args+=(-it)",
+		`exec docker "\${docker_args[@]}" "$CONTAINER" pitr "\$@"`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("install.sh wrapper 缺少非 TTY 兼容片段 %q", required)
+		}
+	}
+	if strings.Contains(script, `exec docker exec -it "$CONTAINER"`) {
+		t.Error("install.sh wrapper 仍无条件强制 docker exec -it")
+	}
+}
+
 // TestInstall_StatusOnMissingContainer — status 在容器不存在时输出"容器未运行"
 // 需要 docker 才能跑; 无 docker 直接跳过
 func TestInstall_StatusOnMissingContainer(t *testing.T) {
