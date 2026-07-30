@@ -255,6 +255,30 @@ func TestSQL_TablesExist(t *testing.T) {
 	}
 }
 
+func TestSQL_MigratesLegacyActiveTransaction(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, `
+		INSERT INTO pitr_txn(version_hash,parent_id,scope_path,state,command)
+		VALUES ('legacyactive',1,'/workspace/project','active','begin')`)
+	mustExec(t, conn, InitSQL)
+
+	var state, command string
+	var closed bool
+	if err := conn.QueryRow(context.Background(), `
+		SELECT state,command,closed_at IS NOT NULL
+		  FROM pitr_txn WHERE version_hash='legacyactive'`).
+		Scan(&state, &command, &closed); err != nil {
+		t.Fatal(err)
+	}
+	if state != "auto" || command != "migration:legacy-active" || !closed {
+		t.Fatalf("state=%q command=%q closed=%v", state, command, closed)
+	}
+}
+
 // ============================================================================
 // TestTrigger_CapturesUpdate — mock 一张 jfs_node,UPDATE 后 history 里有 op='U' 记录
 //

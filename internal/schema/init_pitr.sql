@@ -117,6 +117,14 @@ INSERT INTO pitr_txn (version_hash, scope_path, state, command)
 VALUES ('000000000000', '/', 'root', 'init')
 ON CONFLICT (version_hash) DO NOTHING;
 
+-- 自动版本模式升级迁移：旧版本可能遗留 active 手工事务。保留其版本节点
+-- 和子 auto 历史，但将它关闭为普通自动版本，避免永久阻塞 revert/clear。
+UPDATE pitr_txn
+   SET state='auto',
+       command='migration:legacy-active',
+       closed_at=COALESCE(closed_at, now())
+ WHERE state='active';
+
 -- ---------- 4.2 桥接触发器函数 ----------
 --
 -- 通用归属:
