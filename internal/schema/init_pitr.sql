@@ -361,9 +361,14 @@ $$ LANGUAGE sql IMMUTABLE;
 -- 一致性:所有 replay 在同一事务内完成,原子。
 -- ============================================================================
 
+-- Phase 1/3 的旧签名只有两个参数。PostgreSQL 的 OR REPLACE 不会在签名变化
+-- 时删除旧 overload,升级前先显式移除,避免两参数 CALL 解析歧义。
+DROP PROCEDURE IF EXISTS pitr_revert(character, text);
+
 CREATE OR REPLACE PROCEDURE pitr_revert(
     p_target_hash char(12),
-    p_scope_path  text DEFAULT NULL
+    p_scope_path  text DEFAULT NULL,
+    p_capture_txn_id bigint DEFAULT NULL
 ) AS $$
 DECLARE
     v_target_txn_id  bigint;
@@ -378,8 +383,18 @@ BEGIN
         RAISE EXCEPTION 'pitr_revert: version_hash % 不存在', p_target_hash;
     END IF;
 
-    -- 抑制 revert 自身写入触发的打点
-    PERFORM set_config('pitr.suppress_capture', 'on', true);
+    -- Engine 会预先插入一条 revert txn 并传入 id。replay 对主表造成的变化
+    -- 由 trigger 捕获到这条 txn,使本次 revert 自身也可被后续 revert 撤销。
+    -- 直接调用旧的两参数形式时仍保持历史行为:抑制捕获。
+    IF p_capture_txn_id IS NULL THEN
+        PERFORM set_config('pitr.suppress_capture', 'on', true);
+    ELSE
+        PERFORM set_config('pitr.current_txn', p_capture_txn_id::text, true);
+    END IF;
+
+    -- 与 JuiceFS 元数据写互斥。并发写会在事务结束前阻塞,不会观察半完成状态。
+    LOCK TABLE jfs_node, jfs_edge, jfs_chunk, jfs_chunk_ref
+        IN EXCLUSIVE MODE;
 
     -- 反向 replay 全部 history。不能只取最新 snapshot:同一 inode 经历
     -- v1→v2→v3 时,必须依次恢复 v3 前、v2 前的状态才能回到 v1。

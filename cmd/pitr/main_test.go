@@ -111,6 +111,21 @@ func (fakePitrd) Logs(context.Context, *pb.LogsRequest) (*pb.LogsResponse, error
 	}}, nil
 }
 
+func (fakePitrd) Diff(context.Context, *pb.DiffRequest) (*pb.DiffResponse, error) {
+	return &pb.DiffResponse{NodeChanges: 2, EdgeChanges: 3, ChunkChanges: 4}, nil
+}
+
+func (fakePitrd) Revert(context.Context, *pb.RevertRequest) (*pb.RevertResponse, error) {
+	return &pb.RevertResponse{Applied: 9, NewVersionHash: "fedcba654321"}, nil
+}
+
+func (fakePitrd) Recover(context.Context, *pb.RecoverRequest) (*pb.RecoverResponse, error) {
+	return &pb.RecoverResponse{Volumes: []*pb.VolumeStatus{{
+		Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
+		JfsMounted: true, FuseMounted: true,
+	}}}, nil
+}
+
 func startFakePitrd(t *testing.T) string {
 	t.Helper()
 	socket := filepath.Join("/tmp",
@@ -153,6 +168,10 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "commit", "/workspace/proj", "-m", "done"}, "committed txn 012345abcdef"},
 		{[]string{"--socket", socket, "rollback", "/workspace/proj"}, "rolled back txn 012345abcdef"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef   commit   # done"},
+		{[]string{"--socket", socket, "diff", "111111111111", "222222222222", "--path", "/workspace/proj"}, "nodes=2 edges=3 chunks=4"},
+		{[]string{"--socket", socket, "revert", "111111111111", "--path", "/workspace/proj"}, "reverted 9 history rows; new version fedcba654321"},
+		{[]string{"--socket", socket, "revert", "111111111111", "--dry-run"}, "dry-run: would apply 9 history rows"},
+		{[]string{"--socket", socket, "recover", "/workspace"}, "recovered default @ /workspace"},
 	}
 	for _, tc := range cases {
 		got, err := executeCLI(t, tc.args...)

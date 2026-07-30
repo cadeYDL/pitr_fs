@@ -2,6 +2,7 @@ package server
 
 import (
 	"pitr_fs/internal/pg"
+	"pitr_fs/internal/revert"
 	"pitr_fs/internal/txn"
 
 	pb "pitr_fs/api/pitrd/v1"
@@ -24,6 +25,7 @@ type Server struct {
 
 	db  *pg.DB
 	mgr *txn.Manager
+	rev *revert.Engine
 	cfg Config
 }
 
@@ -37,5 +39,5 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 	if cfg.Retention == "" {
 		cfg.Retention = "compact"
 	}
-	return &Server{db: db, mgr: mgr, cfg: cfg}
+	return &Server{db: db, mgr: mgr, rev: revert.NewEngine(db), cfg: cfg}
 }

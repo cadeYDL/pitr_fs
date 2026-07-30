@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -114,11 +115,15 @@ func (l *Loopback) Start() error {
 	if err := os.MkdirAll(l.Mount, 0o755); err != nil {
 		return fmt.Errorf("创建 FUSE 挂载点 %s: %w", l.Mount, err)
 	}
+	zeroCache := time.Duration(0)
 	server, err := fs.Mount(l.Mount, l.rootNode, &fs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName: "pitrfs",
 			Name:   "pitrfs",
 		},
+		EntryTimeout:    &zeroCache,
+		AttrTimeout:     &zeroCache,
+		NegativeTimeout: &zeroCache,
 	})
 	if err != nil {
 		return fmt.Errorf("挂载 FUSE %s: %w", l.Mount, err)

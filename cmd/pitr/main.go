@@ -126,7 +126,30 @@ func newRecoverCmd() *cobra.Command {
 		Use:   "recover [path]",
 		Short: "数据仍在,重新拉起 daemon + 挂载",
 		Args:  cobra.MaximumNArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			var requested string
+			if len(args) == 1 {
+				requested = args[0]
+			}
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Recover(ctx,
+				&pb.RecoverRequest{Path: requested})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			for _, volume := range resp.GetVolumes() {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"recovered %s @ %s (jfs=%s)\n",
+					volume.GetName(), volume.GetFuseMount(), volume.GetJfsMount())
+			}
+			return nil
+		},
 	}
 }
 
@@ -322,21 +345,73 @@ func newLogsCmd() *cobra.Command {
 }
 
 func newDiffCmd() *cobra.Command {
-	return &cobra.Command{
+	var scope string
+	command := &cobra.Command{
 		Use:   "diff <version-a> <version-b>",
 		Short: "对比两个版本",
 		Args:  cobra.ExactArgs(2),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Diff(ctx, &pb.DiffRequest{
+				VersionA: args[0],
+				VersionB: args[1],
+				Path:     scope,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"nodes=%d edges=%d chunks=%d\n",
+				resp.GetNodeChanges(), resp.GetEdgeChanges(), resp.GetChunkChanges())
+			return nil
+		},
 	}
+	command.Flags().StringVar(&scope, "path", "", "只统计指定目录范围")
+	return command
 }
 
 func newRevertCmd() *cobra.Command {
+	var scope string
+	var dryRun bool
 	c := &cobra.Command{
 		Use:   "revert <version-hash>",
 		Short: "回退到指定版本",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Revert(ctx, &pb.RevertRequest{
+				VersionHash: args[0],
+				Path:        scope,
+				DryRun:      dryRun,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			if dryRun {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"dry-run: would apply %d history rows\n", resp.GetApplied())
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"reverted %d history rows; new version %s\n",
+					resp.GetApplied(), resp.GetNewVersionHash())
+			}
+			return nil
+		},
 	}
-	c.Flags().String("scope", "", "目录级 revert 范围(默认全局)")
+	c.Flags().StringVar(&scope, "path", "", "目录级 revert 范围(默认全局)")
+	c.Flags().StringVar(&scope, "scope", "", "已弃用:请使用 --path")
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "只统计将回放的 history")
 	return c
 }

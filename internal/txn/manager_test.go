@@ -379,6 +379,94 @@ func TestAbortAutoVersion_OnlyReplaysTarget(t *testing.T) {
 	}
 }
 
+func TestLogs_OrderScopeAndLimit(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	for _, value := range []struct {
+		hash, scope, command string
+	}{
+		{"111111111111", "/workspace/proj", "commit"},
+		{"222222222222", "/workspace/other", "commit"},
+		{"333333333333", "/workspace/proj/sub", "write:/workspace/proj/sub/a"},
+	} {
+		if _, err := db.Exec(ctx, `
+			INSERT INTO pitr_txn
+				(version_hash,parent_id,scope_path,state,command,closed_at)
+			VALUES ($1,1,$2,'committed',$3,now())`,
+			value.hash, value.scope, value.command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := mgr.List(ctx, "/workspace/proj", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].VersionHash != "333333333333" ||
+		items[1].VersionHash != "111111111111" {
+		t.Fatalf("logs=%+v", items)
+	}
+	for _, item := range items {
+		if item.ScopePath == "/workspace/other" {
+			t.Fatalf("scope filter 泄漏 other:%+v", item)
+		}
+	}
+}
+
+func TestDiff_CountsDistinctKeysAndScope(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	var v1, v2, other int64
+	if err := db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('111111111111',1,'/workspace/proj','committed','commit',now())
+		RETURNING id`).Scan(&v1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('222222222222',$1,'/workspace/proj','committed','commit',now())
+		RETURNING id`, v1).Scan(&v2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('333333333333',$1,'/workspace/other','committed','commit',now())
+		RETURNING id`, v2).Scan(&other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO pitr_node_history(txn_id,inode,op,snapshot)
+			VALUES ($1,10,'U','{}'),($2,20,'U','{}')`, v2, other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO pitr_edge_history(txn_id,parent,name,op,snapshot)
+			VALUES ($1,1,'a','U','{}')`, v2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO pitr_chunk_history(txn_id,inode,indx,op,snapshot)
+			VALUES ($1,10,0,'U','{}')`, v2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO pitr_chunk_ref_history(txn_id,chunkid,op,snapshot)
+			VALUES ($1,99,'U','{}')`, v2); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := mgr.Diff(ctx,
+		"111111111111", "333333333333", "/workspace/proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.NodeChanges != 1 || stats.EdgeChanges != 1 || stats.ChunkChanges != 2 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 func TestVersionHash_NoCollision(t *testing.T) {
 	const count = 1000
 	hashes := make(chan string, count)

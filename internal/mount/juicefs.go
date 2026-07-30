@@ -70,6 +70,12 @@ func (m *JuiceFS) Start(ctx context.Context) error {
 		"--no-bgjob",
 		"--no-usage-report",
 		"--backup-meta", "0",
+		// pitr_revert 直接原子更新 JuiceFS 元数据表。关闭元数据缓存,
+		// 保证存储过程提交后下一次 lookup/getattr 立即读到回放结果。
+		"--attr-cache", "0",
+		"--entry-cache", "0",
+		"--dir-entry-cache", "0",
+		"--negative-entry-cache", "0",
 		m.MetaURL,
 		m.MountPoint,
 	)

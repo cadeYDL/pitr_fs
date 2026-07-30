@@ -106,7 +106,12 @@ func setupServer(t *testing.T) *serverFixture {
 		);
 		CREATE TABLE jfs_chunk_ref (
 			chunkid bigint PRIMARY KEY, size int, refs int
-		)`); err != nil {
+		);
+		CREATE TABLE jfs_setting (
+			name text PRIMARY KEY, value text
+		);
+		INSERT INTO jfs_setting(name,value) VALUES ('name','test-volume')
+		`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
 	if _, err := db.Exec(ctx, schema.InitSQL); err != nil {
@@ -121,6 +126,8 @@ func setupServer(t *testing.T) *serverFixture {
 		JFSMount:      "/jfs",
 		FUSEMount:     "/workspace",
 		Retention:     "compact",
+		JFSMounted:    true,
+		FUSEMounted:   true,
 	}))
 	listener := bufconn.Listen(1024 * 1024)
 	go func() { _ = grpcServer.Serve(listener) }()
@@ -227,5 +234,96 @@ func TestServer_Rollback_E2E(t *testing.T) {
 	}
 	if length != 5 {
 		t.Fatalf("rollback 后 length=%d", length)
+	}
+}
+
+func TestServer_RevertDiffRecover_E2E(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	if _, err := f.db.Exec(ctx,
+		"INSERT INTO jfs_node (inode,mode,nlink,length) VALUES (700,33188,1,10)"); err != nil {
+		t.Fatal(err)
+	}
+	var v1, v2 int64
+	if err := f.db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('111111111111',1,'/workspace/proj','committed','commit',now())
+		RETURNING id`).Scan(&v1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('222222222222',$1,'/workspace/proj','committed','commit',now())
+		RETURNING id`, v1).Scan(&v2); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.InTx(ctx, func(txDB pg.Tx) error {
+		if err := txDB.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(v2)); err != nil {
+			return err
+		}
+		_, err := txDB.Exec(ctx, "UPDATE jfs_node SET length=20 WHERE inode=700")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	diff, err := f.client.Diff(ctx, &pb.DiffRequest{
+		VersionA: "111111111111",
+		VersionB: "222222222222",
+		Path:     "/workspace/proj",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.GetNodeChanges() != 1 || diff.GetEdgeChanges() != 0 {
+		t.Fatalf("diff=%+v", diff)
+	}
+	reverted, err := f.client.Revert(ctx, &pb.RevertRequest{
+		VersionHash: "111111111111",
+		Path:        "/workspace/proj",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reverted.GetApplied() != 1 || len(reverted.GetNewVersionHash()) != 12 {
+		t.Fatalf("revert=%+v", reverted)
+	}
+	var length int64
+	if err := f.db.QueryRow(ctx, "SELECT length FROM jfs_node WHERE inode=700").
+		Scan(&length); err != nil {
+		t.Fatal(err)
+	}
+	if length != 10 {
+		t.Fatalf("length=%d", length)
+	}
+	recovered, err := f.client.Recover(ctx,
+		&pb.RecoverRequest{Path: "/workspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered.GetVolumes()) != 1 ||
+		!recovered.GetVolumes()[0].GetFuseMounted() {
+		t.Fatalf("recover=%+v", recovered)
+	}
+}
+
+func TestServer_RecoverVolumeMissingDoesNotFormat(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	if _, err := f.db.Exec(ctx, "DROP TABLE jfs_setting"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Recover(ctx, &pb.RecoverRequest{}); err == nil {
+		t.Fatal("缺少 jfs_setting 时 recover 应失败")
+	}
+	var exists bool
+	if err := f.db.QueryRow(ctx,
+		"SELECT to_regclass('public.jfs_setting') IS NOT NULL").Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("recover 禁止重新创建/format JuiceFS 元数据")
 	}
 }
