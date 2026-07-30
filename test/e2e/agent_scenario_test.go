@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"pitr_fs/sdk/go/pitr"
 	"pitr_fs/test/testutil"
@@ -44,6 +45,45 @@ func TestE2E_AgentEditFlow(t *testing.T) {
 	}
 	if automatic < 8 {
 		t.Fatalf("自动版本数=%d，期望至少 8: %+v", automatic, logs)
+	}
+}
+
+func TestE2E_RevertAtCompletedVersion(t *testing.T) {
+	env := testutil.Load(t)
+	host, scope := env.Scenario(t, "revert-at")
+	ctx := testutil.Context(t)
+	client := env.Client(t)
+	file := filepath.Join(host, "timeline.txt")
+
+	testutil.WriteString(t, file, "v1")
+	var target time.Time
+	for attempt := 0; attempt < 20; attempt++ {
+		logs, err := client.Logs(ctx, scope, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range logs {
+			if entry.State == "auto" && entry.ClosedAt != nil {
+				target = *entry.ClosedAt
+				break
+			}
+		}
+		if !target.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if target.IsZero() {
+		t.Fatal("未找到已完成 baseline 版本")
+	}
+
+	testutil.WriteString(t, file, "v2")
+	if _, err := client.RevertAt(
+		ctx, target, pitr.WithPath(scope)); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ReadString(t, file); got != "v1" {
+		t.Fatalf("按时间回滚后=%q", got)
 	}
 }
 

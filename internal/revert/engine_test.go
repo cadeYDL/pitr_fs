@@ -329,6 +329,41 @@ func TestRevert_RejectsActiveScope(t *testing.T) {
 	}
 }
 
+func TestRevert_WaitsForAutomaticWriteRelease(t *testing.T) {
+	engine, db := setupEngine(t)
+	ctx := context.Background()
+	insertCommitted(t, db, "111111111111", "/workspace/proj")
+	var openID int64
+	if err := db.QueryRow(ctx, `
+		INSERT INTO pitr_txn
+			(version_hash,parent_id,scope_path,state,command)
+		VALUES ('222222222222',2,'/workspace/proj','auto','write')
+		RETURNING id`).Scan(&openID); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		_, err := db.Exec(ctx,
+			"UPDATE pitr_txn SET closed_at=now() WHERE id=$1", openID)
+		closed <- err
+	}()
+	started := time.Now()
+	if _, _, err := engine.Revert(ctx, Options{
+		TargetHash: "111111111111",
+		ScopePath:  "/workspace/proj",
+		DryRun:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < 50*time.Millisecond {
+		t.Fatalf("revert 未等待自动写窗口: %s", elapsed)
+	}
+}
+
 func TestRevert_10kFilesDir(t *testing.T) {
 	engine, db := setupEngine(t)
 	ctx := context.Background()

@@ -298,6 +298,13 @@ func TestCLI_RelativePathAndGlobalValidation(t *testing.T) {
 		"revert", "abc123", "--global", "--path", "project"); err == nil {
 		t.Fatal("--global 与 --path 同时使用应失败")
 	}
+	if _, err := executeCLI(t, "revert"); err == nil {
+		t.Fatal("revert 缺少版本号或 --at 应失败")
+	}
+	if _, err := executeCLI(t,
+		"revert", "111111111111", "--at", "2026-07-31T10:00:00Z"); err == nil {
+		t.Fatal("revert 同时指定版本号和 --at 应失败")
+	}
 	if _, err := executeCLI(t, "clear", "--global"); err == nil {
 		t.Fatal("clear 缺少 --yes 应失败")
 	}

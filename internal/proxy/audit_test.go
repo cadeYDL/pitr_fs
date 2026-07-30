@@ -18,6 +18,12 @@ func TestAuditShorteningAndOpenFlags(t *testing.T) {
 	if flags != "O_WRONLY|O_CREAT|O_TRUNC" {
 		t.Fatalf("flags=%q", flags)
 	}
+	if got := lookupPasswdName(
+		"root:x:0:0:root:/root:/bin/sh\nydl:x:501:501::/home/ydl:/bin/bash\n",
+		501,
+	); got != "ydl" {
+		t.Fatalf("passwd name=%q", got)
+	}
 }
 
 func TestAuditContentSummaryIsBounded(t *testing.T) {
@@ -36,6 +42,11 @@ func TestAuditContentSummaryIsBounded(t *testing.T) {
 	})
 	if binary != "<binary,9000B>" {
 		t.Fatalf("binary=%q", binary)
+	}
+	if newline := previewValue(contentPreview{
+		exists: true, kind: "file", data: []byte("v1sdadsadas\n"), size: 12,
+	}); newline != `"v1sdadsadas\n"` {
+		t.Fatalf("newline=%q", newline)
 	}
 }
 

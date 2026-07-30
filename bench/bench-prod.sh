@@ -11,6 +11,7 @@ SCOPE="/workspace/__pitr_prod_bench"
 PLAIN="/var/lib/pitr/jfs/__pitr_prod_bench"
 PITR="$SCOPE"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPORT="${PITR_PROD_REPORT:-$SCRIPT_DIR/PROD.md}"
 
 case "$META_COUNT:$IO_MIB" in
     *[!0-9:]*|0:*|*:0) echo "PITR_BENCH_META_COUNT/PITR_BENCH_IO_MIB 必须是正整数" >&2; exit 2 ;;
@@ -167,6 +168,6 @@ SELECT 'history_bytes=' ||
 } >"$ENV_FILE"
 
 python3 "$SCRIPT_DIR/prod_report.py" \
-    "$RAW" "$ENV_FILE" "$RESULTS/space.txt" "$SCRIPT_DIR/PROD.md"
+    "$RAW" "$ENV_FILE" "$RESULTS/space.txt" "$REPORT"
 echo "==> 原始数据: $RAW"
-echo "==> 生产报告: $SCRIPT_DIR/PROD.md"
+echo "==> 生产报告: $REPORT"

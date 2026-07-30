@@ -22,7 +22,7 @@ func (n *Node) Create(
 	path := n.root.visiblePath(n, name)
 	var file *trackedFile
 	posixOp := fmt.Sprintf("open(%q, %s, %#o)",
-		path, formatOpenFlags(flags|syscall.O_CREAT), mode)
+		path, formatOpenFlags(flags|syscall.O_CREAT), mode&0o7777)
 	errno = n.versionedHook(ctx, path, command("create", path), posixOp, 0,
 		func() syscall.Errno {
 			var base fs.FileHandle

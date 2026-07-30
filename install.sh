@@ -89,6 +89,7 @@ run_container() {
     docker run -d --name "$CONTAINER" \
         --restart unless-stopped \
         --privileged \
+        --pid host \
         --device /dev/fuse \
         --cap-add SYS_ADMIN \
         --security-opt apparmor:unconfined \
@@ -98,6 +99,7 @@ run_container() {
         ${AWS_SECRET_ACCESS_KEY:+-e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"} \
         -v "$PG_VOLUME:/var/lib/postgresql/data" \
         -v "$DATA_VOLUME:/data" \
+        --mount "type=bind,source=/etc/passwd,target=/host/etc/passwd,readonly" \
         --mount "type=bind,source=$WORKSPACE,target=/workspace,bind-propagation=rshared" \
         "$IMAGE" >/dev/null
 }

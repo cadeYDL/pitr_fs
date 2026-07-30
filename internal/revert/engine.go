@@ -8,6 +8,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -25,6 +26,11 @@ type Engine struct {
 	db        *pg.DB
 	mountPath string
 }
+
+const (
+	openWriteWait = 2 * time.Second
+	openWritePoll = 10 * time.Millisecond
+)
 
 type Options struct {
 	TargetHash string
@@ -68,6 +74,9 @@ func (e *Engine) Revert(
 	}
 	if e == nil || e.db == nil {
 		return 0, "", errors.New("revert engine 未配置数据库")
+	}
+	if waitErr := e.waitForOpenWrites(ctx, scope); waitErr != nil {
+		return 0, "", waitErr
 	}
 
 	err = e.db.InTx(ctx, func(tx pg.Tx) error {
@@ -197,6 +206,40 @@ func (e *Engine) Revert(
 		return 0, "", fmt.Errorf("revert %s: %w", targetHash, err)
 	}
 	return applied, newVersionHash, nil
+}
+
+// waitForOpenWrites 隐藏 FUSE close 后异步 Release 的短暂窗口。手工 active
+// 事务仍由事务内检查立即拒绝；这里只等待自动写窗口，避免用户刚写完文件就
+// revert 时看到内部实现细节。
+func (e *Engine) waitForOpenWrites(
+	ctx context.Context,
+	scope *string,
+) error {
+	deadline := time.Now().Add(openWriteWait)
+	for {
+		var open int64
+		if err := e.db.QueryRow(ctx, `
+			SELECT count(*)
+			  FROM pitr_txn
+			 WHERE state='auto' AND closed_at IS NULL
+			   AND ($1::text IS NULL OR pitr_scopes_overlap(scope_path,$1))`,
+			scope).Scan(&open); err != nil {
+			return fmt.Errorf("等待开放写窗口: %w", err)
+		}
+		if open == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %d", ErrActiveScope, open)
+		}
+		timer := time.NewTimer(openWritePoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // resolveScopeInodes 用当前 edge 与目标之后的 edge history 合成目录图。这样

@@ -174,6 +174,30 @@ func TestInstall_ReadyRequiresSuccessfulRPC(t *testing.T) {
 	}
 }
 
+func TestInstall_AuditCanResolveHostProcessAndUser(t *testing.T) {
+	root := repoRoot(t)
+	installContent, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"--pid host",
+		"source=/etc/passwd,target=/host/etc/passwd,readonly",
+	} {
+		if !bytes.Contains(installContent, []byte(required)) {
+			t.Errorf("install.sh 缺少主机审计支持 %q", required)
+		}
+	}
+	dockerfile, err := os.ReadFile(filepath.Join(root, "deploy/Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(dockerfile,
+		[]byte(`ENTRYPOINT ["/usr/bin/tini", "-s", "--"`)) {
+		t.Error("共享 PID namespace 后 tini 必须注册为 child subreaper")
+	}
+}
+
 // TestInstall_StatusOnMissingContainer — status 在容器不存在时输出"容器未运行"
 // 需要 docker 才能跑; 无 docker 直接跳过
 func TestInstall_StatusOnMissingContainer(t *testing.T) {

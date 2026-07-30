@@ -22,8 +22,10 @@ undo-log 在不复制完整文件的前提下恢复目录或整个卷。
 
 内容摘要是诊断信息而不是完整 diff：实现最多读取文件前 4 KiB，并为一个
 写窗口保留至多 3 个 64 B 写入样本。二进制文件只显示类型和大小。调用者
-命令从 `/proc/<pid>/cmdline` 尽力获取，因此 shell 内建命令可能只能显示
-shell 进程；命令超过 10 个 Unicode 字符后显示省略号。
+命令从 `/proc/<pid>/cmdline` 尽力获取，用户名按 UID 从 calw 的只读
+`/etc/passwd` 回退解析。安装容器为此与 calw 共享 PID namespace；shell
+内建命令仍可能只能显示 shell 进程。命令超过 10 个 Unicode 字符后显示
+省略号。
 
 ## 使用指南
 
@@ -153,7 +155,8 @@ python3 ./bench/prod_aggregate.py /tmp/pitr-prod-median.csv \
 ```
 
 基准原始数据位于 `PITR_PROD_RESULTS`，默认是
-`/tmp/pitr-prod-bench`。历史基线和详细口径见
+`/tmp/pitr-prod-bench`；可用 `PITR_PROD_REPORT` 指定报告路径，默认更新
+`bench/PROD.md`。历史基线和详细口径见
 [`bench/README.md`](bench/README.md)、[`bench/BASELINE.md`](bench/BASELINE.md)
 和 [`bench/PROD.md`](bench/PROD.md)。
 
@@ -238,8 +241,8 @@ with Client("/var/run/pitrd.sock") as client:
 
 1. 开放目录级 `history-limit` 配置。数据模型已经支持父目录继承和子目录
    覆盖，后续需要补控制面、裁剪分区与配置冲突规则。
-2. 在明确授权和安全边界下增强原始 shell 命令追踪；当前 `/proc` 方案无法
-   保证还原 shell 内建命令、管道和重定向原文。
+2. 在明确授权和安全边界下增强原始 shell 命令追踪；当前共享 PID namespace
+   的 `/proc` 方案仍无法保证还原 shell 内建命令、管道和重定向原文。
 3. 为高频元数据写入加入可证明原子性的批量自动版本，减少每个 POSIX 操作的
    PostgreSQL 往返。
 4. 为大目录 scope 闭包和 history 回放补组合索引、分区与批处理，并持续用

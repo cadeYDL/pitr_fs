@@ -26,6 +26,7 @@ const (
 	contentDisplayRunes = 12
 	processDisplayRunes = 10
 	maxWriteSamples     = 3
+	hostPasswdPath      = "/host/etc/passwd"
 )
 
 type processCacheEntry struct {
@@ -50,6 +51,10 @@ type writeSample struct {
 
 func shortenRunes(value string, limit int) string {
 	value = strings.TrimSpace(value)
+	return truncateRunes(value, limit)
+}
+
+func truncateRunes(value string, limit int) string {
 	runes := []rune(value)
 	if len(runes) <= limit {
 		return value
@@ -105,10 +110,26 @@ func (l *Loopback) actorName(uid uint32) string {
 	if found, err := user.LookupId(strconv.FormatUint(uint64(uid), 10)); err == nil {
 		name = found.Username
 	}
+	if name == "" {
+		if content, err := os.ReadFile(hostPasswdPath); err == nil {
+			name = lookupPasswdName(string(content), uid)
+		}
+	}
 	l.auditMu.Lock()
 	l.userCache[uid] = name
 	l.auditMu.Unlock()
 	return name
+}
+
+func lookupPasswdName(content string, uid uint32) string {
+	uidText := strconv.FormatUint(uint64(uid), 10)
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.SplitN(line, ":", 7)
+		if len(fields) >= 3 && fields[2] == uidText {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 func (l *Loopback) versionMetadata(
@@ -250,16 +271,14 @@ func previewValue(preview contentPreview) string {
 	case "directory":
 		return "<directory>"
 	case "symlink":
-		return fmt.Sprintf("symlink(%q)", shortenRunes(string(preview.data), contentDisplayRunes))
+		return fmt.Sprintf("symlink(%q)",
+			truncateRunes(string(preview.data), contentDisplayRunes))
 	case "file":
 		if !printableText(preview.data) {
 			return fmt.Sprintf("<binary,%dB>", preview.size)
 		}
-		value := strings.NewReplacer(
-			"\r", "\\r", "\n", "\\n", "\t", "\\t",
-		).Replace(string(preview.data))
-		value = shortenRunes(value, contentDisplayRunes)
-		return strconv.Quote(value)
+		return strconv.Quote(
+			truncateRunes(string(preview.data), contentDisplayRunes))
 	case "unreadable":
 		return "<unreadable>"
 	default:
@@ -274,10 +293,7 @@ func sampleValue(data []byte) string {
 	if !printableText(data) {
 		return fmt.Sprintf("<binary,%dB>", len(data))
 	}
-	value := strings.NewReplacer(
-		"\r", "\\r", "\n", "\\n", "\t", "\\t",
-	).Replace(string(data))
-	return strconv.Quote(shortenRunes(value, contentDisplayRunes))
+	return strconv.Quote(truncateRunes(string(data), contentDisplayRunes))
 }
 
 func summarizeContent(

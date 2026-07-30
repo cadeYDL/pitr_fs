@@ -103,8 +103,16 @@ func (e Env) Scenario(t testing.TB, name string) (string, string) {
 		t.Fatalf("等待传播挂载可写并创建场景目录 %s: %v", host, err)
 	}
 	t.Cleanup(func() {
-		if err := os.RemoveAll(host); err != nil {
-			t.Logf("清理场景目录 %s: %v", host, err)
+		var cleanupErr error
+		for attempt := 0; attempt < 20; attempt++ {
+			cleanupErr = os.RemoveAll(host)
+			if cleanupErr == nil {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if cleanupErr != nil {
+			t.Logf("清理场景目录 %s: %v", host, cleanupErr)
 		}
 	})
 	return host, scope

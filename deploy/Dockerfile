@@ -52,4 +52,4 @@ VOLUME ["/var/lib/postgresql/data", "/data"]
 EXPOSE 5432
 
 # tini 转发信号;entrypoint 依次关闭 pitrd 与 PG,且透传 pitrd 异常退出码
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/pitr-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/pitr-entrypoint.sh"]
