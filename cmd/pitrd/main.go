@@ -105,6 +105,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		flagJFSMount,
 		flagFUSEMount,
 		proxy.WithManager(mgr),
+		proxy.WithAllowOther(true),
 	)
 	if err != nil {
 		return fmt.Errorf("初始化 FUSE 代理: %w", err)

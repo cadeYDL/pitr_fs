@@ -35,6 +35,12 @@ func WithManager(manager VersionManager) Option {
 	}
 }
 
+func WithAllowOther(allow bool) Option {
+	return func(loopback *Loopback) {
+		loopback.allowOther = allow
+	}
+}
+
 // Loopback 把 Backend 透明暴露到 Mount。所有变更操作由自定义 Node 拦截,
 // 读取操作继续使用 go-fuse 的 LoopbackNode 实现。
 type Loopback struct {
@@ -42,9 +48,10 @@ type Loopback struct {
 	Mount   string
 	Server  *fuse.Server
 
-	manager  VersionManager
-	rootData *fs.LoopbackRoot
-	rootNode fs.InodeEmbedder
+	manager    VersionManager
+	allowOther bool
+	rootData   *fs.LoopbackRoot
+	rootNode   fs.InodeEmbedder
 
 	mountMu sync.Mutex
 	window  sync.Mutex
@@ -118,8 +125,9 @@ func (l *Loopback) Start() error {
 	zeroCache := time.Duration(0)
 	server, err := fs.Mount(l.Mount, l.rootNode, &fs.Options{
 		MountOptions: fuse.MountOptions{
-			FsName: "pitrfs",
-			Name:   "pitrfs",
+			FsName:     "pitrfs",
+			Name:       "pitrfs",
+			AllowOther: l.allowOther,
 		},
 		EntryTimeout:    &zeroCache,
 		AttrTimeout:     &zeroCache,
