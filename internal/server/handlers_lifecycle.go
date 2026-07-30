@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"path"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -103,11 +104,11 @@ func (s *Server) Umount(
 	if req.GetPath() == "" {
 		return nil, status.Error(codes.InvalidArgument, "path 不能为空")
 	}
-	if active, err := s.mgr.CountActive(ctx); err != nil {
+	if active, err := s.mgr.CountOpenWrites(ctx); err != nil {
 		return nil, rpcError(err)
 	} else if active != 0 {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"仍有 %d 个 active transaction,拒绝卸载", active)
+			"仍有 %d 个开放写窗口，拒绝卸载", active)
 	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -129,11 +130,26 @@ func (s *Server) Umount(
 }
 
 func (s *Server) ConfigSet(
-	_ context.Context,
+	ctx context.Context,
 	req *pb.ConfigSetRequest,
 ) (*pb.ConfigSetResponse, error) {
 	key := strings.ToLower(strings.TrimSpace(req.GetKey()))
 	value := strings.ToLower(strings.TrimSpace(req.GetValue()))
+	if key == "history-limit" {
+		if req.GetWindow() != "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"history-limit 不接受 --window")
+		}
+		limit, err := strconv.Atoi(value)
+		if err != nil || limit < 1 || limit > 100000 {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"history-limit 必须是 1..100000 的整数: %q", value)
+		}
+		if _, err := s.mgr.SetHistoryLimit(ctx, "/", limit); err != nil {
+			return nil, rpcError(err)
+		}
+		return &pb.ConfigSetResponse{Key: key, Value: strconv.Itoa(limit)}, nil
+	}
 	if key != "retention" {
 		return nil, status.Errorf(codes.InvalidArgument, "不支持配置项 %q", key)
 	}

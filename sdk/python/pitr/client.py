@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock
 from typing import Iterator
 
 import grpc
@@ -52,11 +50,12 @@ class Volume:
     jfs_mounted: bool
     fuse_mounted: bool
     retention: str
+    history_limit: int
     error: str
 
 
 class Transaction:
-    """一个 active PITR transaction；commit/rollback 至多成功一次。"""
+    """已废弃的兼容类型；自动版本模式不再创建手工事务。"""
 
     def __init__(
         self,
@@ -71,25 +70,13 @@ class Transaction:
         self.version_hash = version_hash
         self.txn_id = txn_id
         self.state = state
-        self._lock = Lock()
+        self._lock = None
 
     def commit(self, message: str = "", timeout: float | None = None) -> None:
-        with self._lock:
-            self._require_active()
-            response = self._client._stub.Commit(
-                pb.CommitRequest(txn_id=self.txn_id, message=message),
-                timeout=timeout,
-            )
-            self.state = response.transaction.state
+        raise RuntimeError("手工 transaction 已停用：写操作会自动形成版本")
 
     def rollback(self, timeout: float | None = None) -> None:
-        with self._lock:
-            self._require_active()
-            response = self._client._stub.Rollback(
-                pb.RollbackRequest(txn_id=self.txn_id),
-                timeout=timeout,
-            )
-            self.state = response.transaction.state
+        raise RuntimeError("手工 transaction 已停用：请使用 revert")
 
     def _require_active(self) -> None:
         if self.state != "active":
@@ -126,21 +113,10 @@ class Client:
         message: str = "",
         timeout: float | None = None,
     ) -> Transaction:
-        resolved = _resolve_path(path)
-        response = self._stub.Begin(
-            pb.BeginRequest(path=resolved, message=message),
-            timeout=timeout,
-        )
-        value = response.transaction
-        return Transaction(
-            self,
-            value.scope_path,
-            value.version_hash,
-            value.txn_id,
-            value.state,
+        raise RuntimeError(
+            "手工 transaction 已停用：写操作会自动形成版本"
         )
 
-    @contextmanager
     def transaction(
         self,
         path: str,
@@ -149,14 +125,9 @@ class Client:
         commit_message: str = "",
         timeout: float | None = None,
     ) -> Iterator[Transaction]:
-        value = self.begin(path, message, timeout)
-        try:
-            yield value
-        except BaseException:
-            value.rollback(timeout)
-            raise
-        else:
-            value.commit(commit_message, timeout)
+        raise RuntimeError(
+            "手工 transaction 已停用：写操作会自动形成版本"
+        )
 
     def logs(
         self,
@@ -184,11 +155,14 @@ class Client:
         self,
         version_hash: str,
         *,
-        path: str = "",
+        path: str = ".",
+        global_scope: bool = False,
         dry_run: bool = False,
         timeout: float | None = None,
     ) -> RevertResult:
-        resolved = _resolve_path(path)
+        if global_scope and path != ".":
+            raise ValueError("global_scope 与 path 不能同时使用")
+        resolved = "" if global_scope else _resolve_path(path)
         response = self._stub.Revert(
             pb.RevertRequest(
                 version_hash=version_hash,
@@ -240,7 +214,34 @@ class Client:
                 value.jfs_mounted,
                 value.fuse_mounted,
                 value.retention,
+                value.history_limit,
                 value.error,
             )
             for value in response.volumes
         ]
+
+    def set_history_limit(
+        self,
+        limit: int,
+        timeout: float | None = None,
+    ) -> None:
+        if not 1 <= limit <= 100000:
+            raise ValueError(f"history limit 必须在 1..100000 之间: {limit}")
+        self._stub.ConfigSet(
+            pb.ConfigSetRequest(key="history-limit", value=str(limit)),
+            timeout=timeout,
+        )
+
+    def clear(
+        self,
+        *,
+        confirm: bool = False,
+        timeout: float | None = None,
+    ) -> tuple[int, int]:
+        if not confirm:
+            raise ValueError("clear 必须显式 confirm=True")
+        response = self._stub.Clear(
+            pb.ClearRequest(**{"global": True, "confirm": True}),
+            timeout=timeout,
+        )
+        return response.versions_deleted, response.history_deleted

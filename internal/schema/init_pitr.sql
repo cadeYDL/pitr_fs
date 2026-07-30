@@ -98,6 +98,18 @@ CREATE TABLE IF NOT EXISTS pitr_blob_retention (
     retained_until  timestamptz
 );
 
+-- 持久化分层配置。当前控制面只允许写全局 '/'，查询按最长路径前缀解析，
+-- 为后续“子目录继承父目录、就近配置优先”预留数据模型。
+CREATE TABLE IF NOT EXISTS pitr_config (
+    scope_path      text PRIMARY KEY,
+    history_limit   integer NOT NULL CHECK (history_limit > 0),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO pitr_config (scope_path, history_limit)
+VALUES ('/', 100)
+ON CONFLICT (scope_path) DO NOTHING;
+
 -- ---------- 根版本 ----------
 --
 -- id=1 通常预留给 root。用 ON CONFLICT (version_hash) DO NOTHING 保证幂等。
@@ -654,6 +666,7 @@ DECLARE
     v_auto_state     text;
     v_parent_state   text;
     v_parent_command text;
+    v_parent_hash    char(12);
     v_sibling_ids    bigint[];
 BEGIN
     SELECT parent_id, state
@@ -669,14 +682,18 @@ BEGIN
             p_auto_id, v_auto_state, v_parent_id;
     END IF;
 
-    SELECT state, command
-      INTO v_parent_state, v_parent_command
+    SELECT state, command, version_hash
+      INTO v_parent_state, v_parent_command, v_parent_hash
       FROM pitr_txn
      WHERE id = v_parent_id
      FOR UPDATE;
+
+    -- 自动快照模式下 auto 直接挂在最近的已关闭版本上。唯一开放窗口保证它
+    -- 是当前 HEAD；失败时回到 parent 并删除该 auto 即可。
     IF v_parent_state <> 'active' THEN
-        RAISE EXCEPTION 'pitr_abort_auto: parent % state=% 不是 active',
-            v_parent_id, v_parent_state;
+        CALL pitr_revert(v_parent_hash, NULL, NULL, NULL);
+        DELETE FROM pitr_txn WHERE id = p_auto_id;
+        RETURN;
     END IF;
 
     SELECT array_agg(id ORDER BY id)

@@ -15,6 +15,7 @@ class FakePitrd(rpc.PitrdServicer):
     def __init__(self) -> None:
         self.commits = 0
         self.rollbacks = 0
+        self.last_revert_path = None
 
     @staticmethod
     def _transaction(state: str, command: str) -> pb.Transaction:
@@ -51,10 +52,17 @@ class FakePitrd(rpc.PitrdServicer):
         )
 
     def Revert(self, request, context):  # noqa: N802
+        self.last_revert_path = request.path
         return pb.RevertResponse(applied=3, new_version_hash="fedcba654321")
 
     def Diff(self, request, context):  # noqa: N802
         return pb.DiffResponse(node_changes=1, edge_changes=2, chunk_changes=3)
+
+    def ConfigSet(self, request, context):  # noqa: N802
+        return pb.ConfigSetResponse(key=request.key, value=request.value)
+
+    def Clear(self, request, context):  # noqa: N802
+        return pb.ClearResponse(versions_deleted=4, history_deleted=12)
 
 
 @pytest.fixture
@@ -74,37 +82,26 @@ def pitrd(tmp_path: Path):
 def test_client_connect(pitrd):
     socket, _ = pitrd
     with Client(socket) as client:
-        transaction = client.begin("/workspace/proj", "edit", timeout=2)
-        assert transaction.version_hash == "012345abcdef"
-        assert transaction.txn_id == 7
-        assert transaction.path == "/workspace/proj"
+        with pytest.raises(RuntimeError, match="手工 transaction 已停用"):
+            client.begin("/workspace/proj", "edit", timeout=2)
 
 
-def test_begin_resolves_relative_path(pitrd, tmp_path: Path, monkeypatch):
-    socket, _ = pitrd
+def test_revert_defaults_to_current_path(pitrd, tmp_path: Path, monkeypatch):
+    socket, implementation = pitrd
     monkeypatch.chdir(tmp_path)
     with Client(socket) as client:
-        transaction = client.begin("project/../project")
-    assert transaction.path == str(tmp_path / "project")
+        client.revert("111111111111")
+        assert implementation.last_revert_path == str(tmp_path)
+        client.revert("111111111111", global_scope=True)
+        assert implementation.last_revert_path == ""
 
 
-def test_with_transaction_commits_on_success(pitrd):
-    socket, implementation = pitrd
+def test_transaction_context_disabled(pitrd):
+    socket, _ = pitrd
     with Client(socket) as client:
-        with client.transaction("/workspace/proj", commit_message="done"):
-            pass
-    assert implementation.commits == 1
-    assert implementation.rollbacks == 0
-
-
-def test_with_transaction_rolls_back_on_exception(pitrd):
-    socket, implementation = pitrd
-    with pytest.raises(RuntimeError, match="boom"):
-        with Client(socket) as client:
+        with pytest.raises(RuntimeError, match="手工 transaction 已停用"):
             with client.transaction("/workspace/proj"):
-                raise RuntimeError("boom")
-    assert implementation.commits == 0
-    assert implementation.rollbacks == 1
+                pass
 
 
 def test_logs_iteration(pitrd):
@@ -126,3 +123,12 @@ def test_revert_with_path_and_diff(pitrd):
     assert diff.node_changes == 1
     assert diff.edge_changes == 2
     assert diff.chunk_changes == 3
+
+
+def test_config_and_clear(pitrd):
+    socket, _ = pitrd
+    with Client(socket) as client:
+        client.set_history_limit(12)
+        with pytest.raises(ValueError, match="confirm=True"):
+            client.clear()
+        assert client.clear(confirm=True) == (4, 12)

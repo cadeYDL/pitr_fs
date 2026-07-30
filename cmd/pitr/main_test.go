@@ -29,7 +29,7 @@ func TestPitrCLI_Help(t *testing.T) {
 	got := buf.String()
 	for _, sub := range []string{
 		"daemon", "init", "recover", "mount", "umount", "status", "config",
-		"begin", "commit", "rollback", "logs", "diff", "revert",
+		"logs", "diff", "revert", "clear",
 	} {
 		if !bytes.Contains([]byte(got), []byte(sub)) {
 			t.Errorf("--help 输出未包含子命令 %q", sub)
@@ -41,9 +41,9 @@ func TestPitrCLI_Help(t *testing.T) {
 func TestPitrCLI_DaemonUnavailableReturnsErr(t *testing.T) {
 	cases := [][]string{
 		{"init", "/tmp/x"},
-		{"begin", "/tmp/x"},
 		{"logs", "/tmp/x"},
 		{"revert", "abc123"},
+		{"clear", "--global", "--yes"},
 	}
 	for _, args := range cases {
 		root := newRoot()
@@ -84,11 +84,12 @@ func fakeTxn(state, command, message string) *pb.Transaction {
 
 func (fakePitrd) Status(context.Context, *pb.StatusRequest) (*pb.StatusResponse, error) {
 	return &pb.StatusResponse{
-		DaemonVersion:      "test",
-		PostgresHealthy:    true,
-		ActiveTransactions: 1,
+		DaemonVersion:   "test",
+		PostgresHealthy: true,
+		OpenWrites:      0,
 		Volumes: []*pb.VolumeStatus{{
-			Name: "default", JfsMount: "/jfs", FuseMount: "/workspace", Retention: "compact",
+			Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
+			Retention: "compact", HistoryLimit: 100,
 		}},
 	}, nil
 }
@@ -123,6 +124,10 @@ func (fakePitrd) Diff(context.Context, *pb.DiffRequest) (*pb.DiffResponse, error
 
 func (fakePitrd) Revert(context.Context, *pb.RevertRequest) (*pb.RevertResponse, error) {
 	return &pb.RevertResponse{Applied: 9, NewVersionHash: "fedcba654321"}, nil
+}
+
+func (fakePitrd) Clear(context.Context, *pb.ClearRequest) (*pb.ClearResponse, error) {
+	return &pb.ClearResponse{VersionsDeleted: 8, HistoryDeleted: 21}, nil
 }
 
 func (fakePitrd) Recover(context.Context, *pb.RecoverRequest) (*pb.RecoverResponse, error) {
@@ -197,9 +202,7 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		want string
 	}{
 		{[]string{"--socket", socket, "status"}, "connected to pitrd test, 1 volumes"},
-		{[]string{"--socket", socket, "begin", "/workspace/proj", "-m", "edit"}, "started txn 012345abcdef"},
-		{[]string{"--socket", socket, "commit", "/workspace/proj", "-m", "done"}, "committed txn 012345abcdef"},
-		{[]string{"--socket", socket, "rollback", "/workspace/proj"}, "rolled back txn 012345abcdef"},
+		{[]string{"--socket", socket, "status"}, "history-limit=100"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef   commit   # done"},
 		{[]string{"--socket", socket, "diff", "111111111111", "222222222222", "--path", "/workspace/proj"}, "nodes=2 edges=3 chunks=4"},
 		{[]string{"--socket", socket, "revert", "111111111111", "--path", "/workspace/proj"}, "reverted 9 history rows; new version fedcba654321"},
@@ -209,6 +212,8 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "umount", "/workspace"}, "unmounted /workspace"},
 		{[]string{"--socket", socket, "mount", "/workspace"}, "mounted default @ /workspace"},
 		{[]string{"--socket", socket, "config", "set", "retention", "archive", "--window", "30d"}, "set retention=archive window=30d"},
+		{[]string{"--socket", socket, "config", "set", "history-limit", "42"}, "set history-limit=42"},
+		{[]string{"--socket", socket, "clear", "--global", "--yes"}, "cleared 8 versions and 21 history rows"},
 	}
 	for _, tc := range cases {
 		got, err := executeCLI(t, tc.args...)
@@ -221,21 +226,23 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 	}
 }
 
-func TestCLI_BeginResolvesRelativePath(t *testing.T) {
+func TestCLI_RelativePathAndGlobalValidation(t *testing.T) {
 	working := t.TempDir()
 	t.Chdir(working)
-	socket := startFakePitrd(t)
-	got, err := executeCLI(t,
-		"--socket", socket, "begin", "project/../project", "-m", "relative")
-	if err != nil {
-		t.Fatal(err)
-	}
 	want := filepath.Join(working, "project")
-	if !strings.Contains(got, "@ "+want) {
-		t.Fatalf("相对路径未按 cwd 解析，want=%q output=%q", want, got)
+	got, err := resolveCLIPath("project/../project")
+	if err != nil || got != want {
+		t.Fatalf("相对路径未按 cwd 解析，want=%q got=%q err=%v", want, got, err)
 	}
 	if global, err := resolveCLIPath(""); err != nil || global != "" {
 		t.Fatalf("空 path 应保留全局语义，got=%q err=%v", global, err)
+	}
+	if _, err := executeCLI(t,
+		"revert", "abc123", "--global", "--path", "project"); err == nil {
+		t.Fatal("--global 与 --path 同时使用应失败")
+	}
+	if _, err := executeCLI(t, "clear", "--global"); err == nil {
+		t.Fatal("clear 缺少 --yes 应失败")
 	}
 }
 

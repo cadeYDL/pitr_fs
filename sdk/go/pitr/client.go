@@ -15,7 +15,11 @@ import (
 	pb "pitr_fs/api/pitrd/v1"
 )
 
-var ErrTxnClosed = errors.New("transaction 已结束")
+var (
+	ErrTxnClosed                  = errors.New("transaction 已结束")
+	ErrManualTransactionsDisabled = errors.New(
+		"手工 transaction 已停用：写操作会自动形成版本")
+)
 
 func resolvePath(value string) (string, error) {
 	if value == "" {
@@ -92,31 +96,7 @@ func (c *Client) Begin(
 	path string,
 	options ...BeginOption,
 ) (*Txn, error) {
-	if c == nil || c.rpc == nil {
-		return nil, errors.New("pitr client 未连接")
-	}
-	resolved, err := resolvePath(path)
-	if err != nil {
-		return nil, err
-	}
-	config := beginOptions{}
-	for _, option := range options {
-		option(&config)
-	}
-	response, err := c.rpc.Begin(ctx, &pb.BeginRequest{
-		Path: resolved, Message: config.message,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("begin %s: %w", resolved, err)
-	}
-	value := transactionFromPB(response.GetTransaction())
-	return &Txn{
-		client:      c,
-		path:        value.ScopePath,
-		txnID:       value.ID,
-		versionHash: value.VersionHash,
-		state:       value.State,
-	}, nil
+	return nil, ErrManualTransactionsDisabled
 }
 
 type Transaction struct {
@@ -188,13 +168,22 @@ func (c *Client) Logs(
 type RevertOption func(*revertOptions)
 
 type revertOptions struct {
-	path   string
-	dryRun bool
+	path         string
+	pathExplicit bool
+	global       bool
+	dryRun       bool
 }
 
 func WithPath(path string) RevertOption {
 	return func(options *revertOptions) {
 		options.path = path
+		options.pathExplicit = true
+	}
+}
+
+func WithGlobal() RevertOption {
+	return func(options *revertOptions) {
+		options.global = true
 	}
 }
 
@@ -214,9 +203,15 @@ func (c *Client) Revert(
 	versionHash string,
 	options ...RevertOption,
 ) (RevertResult, error) {
-	config := revertOptions{}
+	config := revertOptions{path: "."}
 	for _, option := range options {
 		option(&config)
+	}
+	if config.global && config.pathExplicit {
+		return RevertResult{}, errors.New("WithGlobal 与 WithPath 不能同时使用")
+	}
+	if config.global {
+		config.path = ""
 	}
 	resolved, err := resolvePath(config.path)
 	if err != nil {
@@ -264,25 +259,62 @@ func (c *Client) Diff(
 }
 
 type Volume struct {
-	Name        string
-	JFSMount    string
-	FUSEMount   string
-	JFSMounted  bool
-	FUSEMounted bool
-	Retention   string
-	Error       string
+	Name         string
+	JFSMount     string
+	FUSEMount    string
+	JFSMounted   bool
+	FUSEMounted  bool
+	Retention    string
+	HistoryLimit int
+	Error        string
 }
 
 func volumeFromPB(value *pb.VolumeStatus) Volume {
 	return Volume{
-		Name:        value.GetName(),
-		JFSMount:    value.GetJfsMount(),
-		FUSEMount:   value.GetFuseMount(),
-		JFSMounted:  value.GetJfsMounted(),
-		FUSEMounted: value.GetFuseMounted(),
-		Retention:   value.GetRetention(),
-		Error:       value.GetError(),
+		Name:         value.GetName(),
+		JFSMount:     value.GetJfsMount(),
+		FUSEMount:    value.GetFuseMount(),
+		JFSMounted:   value.GetJfsMounted(),
+		FUSEMounted:  value.GetFuseMounted(),
+		Retention:    value.GetRetention(),
+		HistoryLimit: int(value.GetHistoryLimit()),
+		Error:        value.GetError(),
 	}
+}
+
+func (c *Client) SetHistoryLimit(ctx context.Context, limit int) error {
+	if limit < 1 || limit > 100000 {
+		return fmt.Errorf("history limit 必须在 1..100000 之间: %d", limit)
+	}
+	_, err := c.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "history-limit", Value: fmt.Sprint(limit),
+	})
+	if err != nil {
+		return fmt.Errorf("设置 history limit: %w", err)
+	}
+	return nil
+}
+
+type ClearResult struct {
+	VersionsDeleted int64
+	HistoryDeleted  int64
+}
+
+// Clear permanently removes global version history while preserving current files.
+func (c *Client) Clear(ctx context.Context, confirm bool) (ClearResult, error) {
+	if !confirm {
+		return ClearResult{}, errors.New("clear 必须显式 confirm=true")
+	}
+	response, err := c.rpc.Clear(ctx, &pb.ClearRequest{
+		Global: true, Confirm: true,
+	})
+	if err != nil {
+		return ClearResult{}, fmt.Errorf("clear history: %w", err)
+	}
+	return ClearResult{
+		VersionsDeleted: response.GetVersionsDeleted(),
+		HistoryDeleted:  response.GetHistoryDeleted(),
+	}, nil
 }
 
 func (c *Client) Recover(ctx context.Context, path string) ([]Volume, error) {

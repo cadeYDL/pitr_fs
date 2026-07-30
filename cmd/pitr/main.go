@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -100,6 +101,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newDiffCmd())
 	root.AddCommand(newRevertCmd())
+	root.AddCommand(newClearCmd())
 
 	return root
 }
@@ -320,13 +322,14 @@ func newStatusCmd() *cobra.Command {
 				return friendlyRPCError(cmd, err)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"connected to pitrd %s, %d volumes, %d active transactions\n",
-				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetActiveTransactions())
+				"connected to pitrd %s, %d volumes, %d open writes\n",
+				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetOpenWrites())
 			for _, volume := range resp.GetVolumes() {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"%s\tjfs=%s\tfuse=%s\tretention=%s\n",
+					"%s\tjfs=%s\tfuse=%s\tretention=%s\thistory-limit=%d\n",
 					volume.GetName(), volume.GetJfsMount(),
-					volume.GetFuseMount(), volume.GetRetention())
+					volume.GetFuseMount(), volume.GetRetention(),
+					volume.GetHistoryLimit())
 			}
 			return nil
 		},
@@ -340,7 +343,7 @@ func newConfigCmd() *cobra.Command {
 	}
 	set := &cobra.Command{
 		Use:   "set <key> <value>",
-		Short: "设置配置,例如: pitr config set retention compact --window 30d",
+		Short: "设置配置，例如: pitr config set history-limit 100",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client, err := dialDaemon(cmd)
@@ -376,9 +379,10 @@ func newConfigCmd() *cobra.Command {
 func newBeginCmd() *cobra.Command {
 	var message string
 	c := &cobra.Command{
-		Use:   "begin <path>",
-		Short: "在 <path> 上开一个 active 事务",
-		Args:  cobra.ExactArgs(1),
+		Use:    "begin <path>",
+		Short:  "已废弃：自动快照模式无需 begin",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveCLIPath(args[0])
 			if err != nil {
@@ -410,9 +414,10 @@ func newBeginCmd() *cobra.Command {
 func newCommitCmd() *cobra.Command {
 	var message string
 	c := &cobra.Command{
-		Use:   "commit <path>",
-		Short: "提交 <path> 上的 active 事务(触发坍缩)",
-		Args:  cobra.ExactArgs(1),
+		Use:    "commit <path>",
+		Short:  "已废弃：文件关闭后自动形成版本",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveCLIPath(args[0])
 			if err != nil {
@@ -443,9 +448,10 @@ func newCommitCmd() *cobra.Command {
 
 func newRollbackCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "rollback <path>",
-		Short: "回滚 <path> 上的 active 事务",
-		Args:  cobra.ExactArgs(1),
+		Use:    "rollback <path>",
+		Short:  "已废弃：请使用 revert",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolved, err := resolveCLIPath(args[0])
 			if err != nil {
@@ -552,12 +558,20 @@ func newDiffCmd() *cobra.Command {
 func newRevertCmd() *cobra.Command {
 	var scope string
 	var dryRun bool
+	var global bool
 	c := &cobra.Command{
 		Use:   "revert <version-hash>",
 		Short: "回退到指定版本",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resolved, err := resolveCLIPath(scope)
+			if global && scope != "" {
+				return errors.New("--global 与 --path/--scope 不能同时使用")
+			}
+			requested := scope
+			if !global && requested == "" {
+				requested = "."
+			}
+			resolved, err := resolveCLIPath(requested)
 			if err != nil {
 				return err
 			}
@@ -587,8 +601,46 @@ func newRevertCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&scope, "path", "", "目录级 revert 范围(默认全局)")
+	c.Flags().StringVar(&scope, "path", "", "目录级 revert 范围(默认当前目录)")
 	c.Flags().StringVar(&scope, "scope", "", "已弃用:请使用 --path")
+	c.Flags().BoolVar(&global, "global", false, "回退整个卷(默认只回退当前目录)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "只统计将回放的 history")
+	return c
+}
+
+func newClearCmd() *cobra.Command {
+	var global, yes bool
+	c := &cobra.Command{
+		Use:   "clear",
+		Short: "清空版本历史并保留当前文件作为新基线",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !global {
+				return errors.New("当前仅支持全局 clear，请添加 --global")
+			}
+			if !yes {
+				return errors.New("clear 会永久删除全部历史，请添加 --yes")
+			}
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Clear(ctx, &pb.ClearRequest{
+				Global: true, Confirm: true,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"cleared %d versions and %d history rows; current files kept as baseline\n",
+				resp.GetVersionsDeleted(), resp.GetHistoryDeleted())
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&global, "global", false, "清空整个卷(当前唯一支持的维度)")
+	c.Flags().BoolVar(&yes, "yes", false, "确认永久删除历史")
 	return c
 }

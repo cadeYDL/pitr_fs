@@ -17,19 +17,12 @@ func TestE2E_AgentEditFlow(t *testing.T) {
 	client := env.Client(t)
 
 	testutil.WriteString(t, filepath.Join(host, "obsolete.txt"), "baseline")
-	transaction, err := client.Begin(ctx, scope, pitr.WithMessage("agent edit"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	for index := 1; index <= 5; index++ {
 		testutil.WriteString(t, filepath.Join(host, fmt.Sprintf("file-%d.txt", index)), "v1")
 	}
 	testutil.WriteString(t, filepath.Join(host, "file-2.txt"), "v2")
 	testutil.WriteString(t, filepath.Join(host, "file-4.txt"), "v2")
 	if err := os.Remove(filepath.Join(host, "obsolete.txt")); err != nil {
-		t.Fatal(err)
-	}
-	if err := transaction.Commit(ctx, "agent edit committed"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -43,20 +36,18 @@ func TestE2E_AgentEditFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var found bool
+	var automatic int
 	for _, entry := range logs {
-		if entry.VersionHash == transaction.VersionHash() &&
-			entry.State == "committed" &&
-			entry.Message == "agent edit committed" {
-			found = true
+		if entry.State == "auto" {
+			automatic++
 		}
 	}
-	if !found {
-		t.Fatalf("logs 未展示已提交版本 %s: %+v", transaction.VersionHash(), logs)
+	if automatic < 8 {
+		t.Fatalf("自动版本数=%d，期望至少 8: %+v", automatic, logs)
 	}
 }
 
-func TestE2E_AgentRollback(t *testing.T) {
+func TestE2E_AgentRevert(t *testing.T) {
 	env := testutil.Load(t)
 	host, scope := env.Scenario(t, "agent-rollback")
 	ctx := testutil.Context(t)
@@ -66,17 +57,14 @@ func TestE2E_AgentRollback(t *testing.T) {
 	deleted := filepath.Join(host, "deleted.txt")
 	testutil.WriteString(t, keep, "before")
 	testutil.WriteString(t, deleted, "restore-me")
+	baseline := latestAutoHash(t, client, ctx, scope)
 
-	transaction, err := client.Begin(ctx, scope, pitr.WithMessage("agent failure"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	testutil.WriteString(t, keep, "must-rollback")
 	testutil.WriteString(t, filepath.Join(host, "new.txt"), "must-disappear")
 	if err := os.Remove(deleted); err != nil {
 		t.Fatal(err)
 	}
-	if err := transaction.Rollback(ctx); err != nil {
+	if _, err := client.Revert(ctx, baseline, pitr.WithPath(scope)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -98,22 +86,14 @@ func TestE2E_TimeTravel(t *testing.T) {
 	client := env.Client(t)
 	file := filepath.Join(host, "timeline.txt")
 
-	versions := make([]*pitr.Txn, 0, 3)
-	for index, content := range []string{"v1", "v2", "v3"} {
-		transaction, err := client.Begin(
-			ctx, scope, pitr.WithMessage(fmt.Sprintf("version %d", index+1)))
-		if err != nil {
-			t.Fatal(err)
-		}
+	versions := make([]string, 0, 3)
+	for _, content := range []string{"v1", "v2", "v3"} {
 		testutil.WriteString(t, file, content)
-		if err := transaction.Commit(ctx, content); err != nil {
-			t.Fatal(err)
-		}
-		versions = append(versions, transaction)
+		versions = append(versions, latestAutoHash(t, client, ctx, scope))
 	}
 
 	for _, target := range []struct {
-		version *pitr.Txn
+		version string
 		content string
 	}{
 		{versions[0], "v1"},
@@ -121,12 +101,12 @@ func TestE2E_TimeTravel(t *testing.T) {
 		{versions[1], "v2"},
 	} {
 		if _, err := client.Revert(
-			ctx, target.version.VersionHash(), pitr.WithPath(scope)); err != nil {
+			ctx, target.version, pitr.WithPath(scope)); err != nil {
 			t.Fatal(err)
 		}
 		if got := testutil.ReadString(t, file); got != target.content {
 			t.Fatalf("revert %s 后内容=%q,期望 %q",
-				target.version.VersionHash(), got, target.content)
+				target.version, got, target.content)
 		}
 	}
 }

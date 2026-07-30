@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc"
 
@@ -16,7 +15,7 @@ import (
 
 type fakeServer struct {
 	pb.UnimplementedPitrdServer
-	blockBegin bool
+	lastRevert *pb.RevertRequest
 }
 
 func (*fakeServer) Begin(
@@ -62,10 +61,11 @@ func (*fakeServer) Logs(
 	}}}, nil
 }
 
-func (*fakeServer) Revert(
-	context.Context,
-	*pb.RevertRequest,
+func (s *fakeServer) Revert(
+	_ context.Context,
+	request *pb.RevertRequest,
 ) (*pb.RevertResponse, error) {
+	s.lastRevert = request
 	return &pb.RevertResponse{
 		Applied: 3, NewVersionHash: "aabbccddeeff",
 	}, nil
@@ -80,16 +80,22 @@ func (*fakeServer) Diff(
 	}, nil
 }
 
-type cancelServer struct {
-	pb.UnimplementedPitrdServer
+func (*fakeServer) ConfigSet(
+	_ context.Context,
+	request *pb.ConfigSetRequest,
+) (*pb.ConfigSetResponse, error) {
+	return &pb.ConfigSetResponse{
+		Key: request.GetKey(), Value: request.GetValue(),
+	}, nil
 }
 
-func (*cancelServer) Begin(
-	ctx context.Context,
-	_ *pb.BeginRequest,
-) (*pb.BeginResponse, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
+func (*fakeServer) Clear(
+	context.Context,
+	*pb.ClearRequest,
+) (*pb.ClearResponse, error) {
+	return &pb.ClearResponse{
+		VersionsDeleted: 4, HistoryDeleted: 12,
+	}, nil
 }
 
 func startUnixServer(t *testing.T, server pb.PitrdServer) string {
@@ -116,53 +122,19 @@ func TestGoSDK_Dial_UnixSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	transaction, err := client.Begin(
-		context.Background(), "/workspace/proj", WithMessage("edit"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if transaction.ID() != 7 || transaction.VersionHash() != "012345abcdef" ||
-		transaction.Path() != "/workspace/proj" {
-		t.Fatalf("txn id=%d hash=%s path=%s",
-			transaction.ID(), transaction.VersionHash(), transaction.Path())
+	if _, err := client.Begin(
+		context.Background(), "/workspace/proj", WithMessage("edit")); !errors.Is(
+		err, ErrManualTransactionsDisabled) {
+		t.Fatalf("Begin err=%v", err)
 	}
 }
 
-func TestGoSDK_BeginCommitRollbackAndClosedState(t *testing.T) {
-	client, err := Dial(startUnixServer(t, &fakeServer{}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	transaction, err := client.Begin(context.Background(), "/workspace/proj")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := transaction.Commit(context.Background(), "done"); err != nil {
-		t.Fatal(err)
-	}
-	if transaction.State() != "committed" {
-		t.Fatalf("state=%s", transaction.State())
-	}
-	if err := transaction.Rollback(context.Background()); !errors.Is(err, ErrTxnClosed) {
-		t.Fatalf("重复结束 err=%v", err)
-	}
-}
-
-func TestGoSDK_BeginResolvesRelativePath(t *testing.T) {
+func TestGoSDK_ResolveRelativePath(t *testing.T) {
 	working := t.TempDir()
 	t.Chdir(working)
-	client, err := Dial(startUnixServer(t, &fakeServer{}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	transaction, err := client.Begin(context.Background(), "project/../project")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := filepath.Join(working, "project"); transaction.Path() != want {
-		t.Fatalf("path=%q want=%q", transaction.Path(), want)
+	resolved, err := resolvePath("project/../project")
+	if want := filepath.Join(working, "project"); err != nil || resolved != want {
+		t.Fatalf("path=%q want=%q err=%v", resolved, want, err)
 	}
 	if global, err := resolvePath(""); err != nil || global != "" {
 		t.Fatalf("空 path 应保留全局语义，got=%q err=%v", global, err)
@@ -170,7 +142,8 @@ func TestGoSDK_BeginResolvesRelativePath(t *testing.T) {
 }
 
 func TestGoSDK_LogsDiffRevert(t *testing.T) {
-	client, err := Dial(startUnixServer(t, &fakeServer{}))
+	implementation := &fakeServer{}
+	client, err := Dial(startUnixServer(t, implementation))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,22 +164,41 @@ func TestGoSDK_LogsDiffRevert(t *testing.T) {
 		reverted.NewVersionHash != "aabbccddeeff" {
 		t.Fatalf("revert=%+v err=%v", reverted, err)
 	}
+	working := t.TempDir()
+	t.Chdir(working)
+	if _, err := client.Revert(context.Background(), "111111111111"); err != nil {
+		t.Fatal(err)
+	}
+	if implementation.lastRevert.GetPath() != working {
+		t.Fatalf("default revert path=%q want=%q",
+			implementation.lastRevert.GetPath(), working)
+	}
+	if _, err := client.Revert(
+		context.Background(), "111111111111", WithGlobal()); err != nil {
+		t.Fatal(err)
+	}
+	if implementation.lastRevert.GetPath() != "" {
+		t.Fatalf("global revert path=%q", implementation.lastRevert.GetPath())
+	}
 }
 
-func TestGoSDK_ContextCancel(t *testing.T) {
-	client, err := Dial(startUnixServer(t, &cancelServer{}))
+func TestGoSDK_ConfigAndClear(t *testing.T) {
+	client, err := Dial(startUnixServer(t, &fakeServer{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	started := time.Now()
-	_, err = client.Begin(ctx, "/workspace/proj")
-	if err == nil {
-		t.Fatal("cancel 后 Begin 应失败")
+	if err := client.SetHistoryLimit(context.Background(), 12); err != nil {
+		t.Fatal(err)
 	}
-	if time.Since(started) > 250*time.Millisecond {
-		t.Fatalf("context cancel 返回过慢:%s", time.Since(started))
+	if _, err := client.Clear(context.Background(), false); err == nil {
+		t.Fatal("clear without confirmation should fail")
+	}
+	cleared, err := client.Clear(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.VersionsDeleted != 4 || cleared.HistoryDeleted != 12 {
+		t.Fatalf("clear=%+v", cleared)
 	}
 }

@@ -61,37 +61,34 @@ func (s *Server) Status(
 	if err := s.db.Ping(ctx); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	active, err := s.mgr.CountActive(ctx)
+	openWrites, err := s.mgr.CountOpenWrites(ctx)
 	if err != nil {
 		return nil, rpcError(err)
 	}
 	s.lifecycleMu.Lock()
 	volumes := s.volumeStatusesLocked()
 	s.lifecycleMu.Unlock()
+	historyLimit, err := s.mgr.HistoryLimit(ctx, "/")
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	for _, volume := range volumes {
+		volume.HistoryLimit = int32(historyLimit)
+	}
 	return &pb.StatusResponse{
-		DaemonVersion:      s.cfg.DaemonVersion,
-		PostgresHealthy:    true,
-		ActiveTransactions: active,
-		Volumes:            volumes,
+		DaemonVersion:   s.cfg.DaemonVersion,
+		PostgresHealthy: true,
+		Volumes:         volumes,
+		OpenWrites:      openWrites,
 	}, nil
 }
 
 func (s *Server) Begin(
-	ctx context.Context,
-	req *pb.BeginRequest,
+	_ context.Context,
+	_ *pb.BeginRequest,
 ) (*pb.BeginResponse, error) {
-	if req.GetPath() == "" {
-		return nil, status.Error(codes.InvalidArgument, "path 不能为空")
-	}
-	created, err := s.mgr.Begin(ctx, req.GetPath(), req.GetMessage())
-	if err != nil {
-		return nil, rpcError(err)
-	}
-	return &pb.BeginResponse{
-		VersionHash: created.VersionHash,
-		TxnId:       created.ID,
-		Transaction: transactionPB(created),
-	}, nil
+	return nil, status.Error(codes.FailedPrecondition,
+		"自动快照模式无需 begin；每次写操作会自动形成版本")
 }
 
 func (s *Server) resolveActive(
@@ -124,41 +121,19 @@ func (s *Server) resolveActive(
 }
 
 func (s *Server) Commit(
-	ctx context.Context,
-	req *pb.CommitRequest,
+	_ context.Context,
+	_ *pb.CommitRequest,
 ) (*pb.CommitResponse, error) {
-	active, err := s.resolveActive(ctx, req.GetTxnId(), req.GetPath())
-	if err != nil {
-		return nil, rpcError(err)
-	}
-	committed, err := s.mgr.Commit(ctx, active.ID, req.GetMessage())
-	if err != nil {
-		return nil, rpcError(err)
-	}
-	return &pb.CommitResponse{
-		VersionHash: committed.VersionHash,
-		TxnId:       committed.ID,
-		Transaction: transactionPB(committed),
-	}, nil
+	return nil, status.Error(codes.FailedPrecondition,
+		"自动快照模式无需 commit；文件关闭后版本立即可用")
 }
 
 func (s *Server) Rollback(
-	ctx context.Context,
-	req *pb.RollbackRequest,
+	_ context.Context,
+	_ *pb.RollbackRequest,
 ) (*pb.RollbackResponse, error) {
-	active, err := s.resolveActive(ctx, req.GetTxnId(), req.GetPath())
-	if err != nil {
-		return nil, rpcError(err)
-	}
-	rolledBack, err := s.mgr.Rollback(ctx, active.ID)
-	if err != nil {
-		return nil, rpcError(err)
-	}
-	return &pb.RollbackResponse{
-		VersionHash: rolledBack.VersionHash,
-		TxnId:       rolledBack.ID,
-		Transaction: transactionPB(rolledBack),
-	}, nil
+	return nil, status.Error(codes.FailedPrecondition,
+		"自动快照模式没有 rollback；请用 pitr revert <version>")
 }
 
 func (s *Server) Logs(

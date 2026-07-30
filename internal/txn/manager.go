@@ -377,9 +377,10 @@ func (m *Manager) List(ctx context.Context, scope string, limit int) ([]*Txn, er
 	rows, err := m.db.Query(ctx, `
 		SELECT `+txnColumns+`
 		  FROM pitr_txn
-		 WHERE scope_path='/' OR scope_path=$1
+		 WHERE state<>'root'
+		   AND (scope_path=$1
 		    OR scope_path LIKE rtrim($1, '/') || '/%'
-		    OR $1 LIKE rtrim(scope_path, '/') || '/%'
+		    OR $1 LIKE rtrim(scope_path, '/') || '/%')
 		 ORDER BY created_at DESC, id DESC
 		 LIMIT $2`, normalized, limit)
 	if err != nil {
@@ -405,6 +406,20 @@ func (m *Manager) CountActive(ctx context.Context) (int64, error) {
 	if err := m.db.QueryRow(ctx,
 		"SELECT count(*) FROM pitr_txn WHERE state='active'").Scan(&count); err != nil {
 		return 0, fmt.Errorf("count active: %w", err)
+	}
+	return count, nil
+}
+
+// CountOpenWrites returns write windows that must be closed before unmounting.
+// It includes legacy manual transactions so upgraded installations remain safe.
+func (m *Manager) CountOpenWrites(ctx context.Context) (int64, error) {
+	var count int64
+	if err := m.db.QueryRow(ctx, `
+		SELECT count(*)
+		  FROM pitr_txn
+		 WHERE state='active'
+		    OR (state='auto' AND closed_at IS NULL)`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count open writes: %w", err)
 	}
 	return count, nil
 }

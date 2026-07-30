@@ -21,22 +21,14 @@ def test_python_sdk_real_pitrd_e2e():
     host_path.mkdir(parents=True, exist_ok=True)
     file_path = host_path / "file.txt"
     with Client(socket) as client:
-        with client.transaction(
-            scope, "python-sdk-v1", commit_message="python-sdk-v1"
-        ) as v1:
-            file_path.write_text("python-v1")
-        with client.transaction(
-            scope, "python-sdk-v2", commit_message="python-sdk-v2"
-        ):
-            file_path.write_text("python-v2")
-
+        file_path.write_text("python-v1")
+        v1 = next(entry for entry in client.logs(scope, 20) if entry.state == "auto")
+        file_path.write_text("python-v2")
         reverted = client.revert(v1.version_hash, path=scope)
         assert reverted.applied > 0
         assert file_path.read_text() == "python-v1"
 
-        with pytest.raises(RuntimeError, match="force rollback"):
-            with client.transaction(scope, "python-sdk-rollback"):
-                file_path.write_text("must-rollback")
-                raise RuntimeError("force rollback")
+        file_path.write_text("must-revert")
+        client.revert(v1.version_hash, path=scope)
         assert file_path.read_text() == "python-v1"
-        assert len(list(client.logs(scope, 20))) >= 4
+        assert len(list(client.logs(scope, 20))) >= 3

@@ -67,6 +67,28 @@ func (s *Server) Diff(
 	}, nil
 }
 
+func (s *Server) Clear(
+	ctx context.Context,
+	req *pb.ClearRequest,
+) (*pb.ClearResponse, error) {
+	if !req.GetGlobal() {
+		return nil, status.Error(codes.FailedPrecondition,
+			"当前仅支持全局 clear；请显式使用 --global")
+	}
+	if !req.GetConfirm() {
+		return nil, status.Error(codes.InvalidArgument,
+			"clear 会永久删除全部版本历史；请添加 --yes")
+	}
+	stats, err := s.mgr.ClearHistory(ctx, "/")
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return &pb.ClearResponse{
+		VersionsDeleted: stats.VersionsDeleted,
+		HistoryDeleted:  stats.HistoryDeleted,
+	}, nil
+}
+
 // Recover 是 daemon 层的无损校验。pitrd 启动顺序已经恢复两层 mount;RPC
 // 只确认目标卷元数据和挂载状态,绝不调用 juicefs format。
 func (s *Server) Recover(

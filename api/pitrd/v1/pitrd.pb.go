@@ -320,6 +320,7 @@ type VolumeStatus struct {
 	FuseMounted   bool                   `protobuf:"varint,5,opt,name=fuse_mounted,json=fuseMounted,proto3" json:"fuse_mounted,omitempty"`
 	Retention     string                 `protobuf:"bytes,6,opt,name=retention,proto3" json:"retention,omitempty"`
 	Error         string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
+	HistoryLimit  int32                  `protobuf:"varint,8,opt,name=history_limit,json=historyLimit,proto3" json:"history_limit,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -403,12 +404,21 @@ func (x *VolumeStatus) GetError() string {
 	return ""
 }
 
+func (x *VolumeStatus) GetHistoryLimit() int32 {
+	if x != nil {
+		return x.HistoryLimit
+	}
+	return 0
+}
+
 type StatusResponse struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	DaemonVersion      string                 `protobuf:"bytes,1,opt,name=daemon_version,json=daemonVersion,proto3" json:"daemon_version,omitempty"`
-	PostgresHealthy    bool                   `protobuf:"varint,2,opt,name=postgres_healthy,json=postgresHealthy,proto3" json:"postgres_healthy,omitempty"`
-	Volumes            []*VolumeStatus        `protobuf:"bytes,3,rep,name=volumes,proto3" json:"volumes,omitempty"`
-	ActiveTransactions int64                  `protobuf:"varint,4,opt,name=active_transactions,json=activeTransactions,proto3" json:"active_transactions,omitempty"`
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	DaemonVersion   string                 `protobuf:"bytes,1,opt,name=daemon_version,json=daemonVersion,proto3" json:"daemon_version,omitempty"`
+	PostgresHealthy bool                   `protobuf:"varint,2,opt,name=postgres_healthy,json=postgresHealthy,proto3" json:"postgres_healthy,omitempty"`
+	Volumes         []*VolumeStatus        `protobuf:"bytes,3,rep,name=volumes,proto3" json:"volumes,omitempty"`
+	// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
+	ActiveTransactions int64 `protobuf:"varint,4,opt,name=active_transactions,json=activeTransactions,proto3" json:"active_transactions,omitempty"`
+	OpenWrites         int64 `protobuf:"varint,5,opt,name=open_writes,json=openWrites,proto3" json:"open_writes,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -464,9 +474,17 @@ func (x *StatusResponse) GetVolumes() []*VolumeStatus {
 	return nil
 }
 
+// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
 func (x *StatusResponse) GetActiveTransactions() int64 {
 	if x != nil {
 		return x.ActiveTransactions
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetOpenWrites() int64 {
+	if x != nil {
+		return x.OpenWrites
 	}
 	return 0
 }
@@ -1543,6 +1561,118 @@ func (x *ConfigSetResponse) GetWindow() string {
 	return ""
 }
 
+type ClearRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Global        bool                   `protobuf:"varint,2,opt,name=global,proto3" json:"global,omitempty"`
+	Confirm       bool                   `protobuf:"varint,3,opt,name=confirm,proto3" json:"confirm,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClearRequest) Reset() {
+	*x = ClearRequest{}
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClearRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClearRequest) ProtoMessage() {}
+
+func (x *ClearRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClearRequest.ProtoReflect.Descriptor instead.
+func (*ClearRequest) Descriptor() ([]byte, []int) {
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *ClearRequest) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *ClearRequest) GetGlobal() bool {
+	if x != nil {
+		return x.Global
+	}
+	return false
+}
+
+func (x *ClearRequest) GetConfirm() bool {
+	if x != nil {
+		return x.Confirm
+	}
+	return false
+}
+
+type ClearResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	VersionsDeleted int64                  `protobuf:"varint,1,opt,name=versions_deleted,json=versionsDeleted,proto3" json:"versions_deleted,omitempty"`
+	HistoryDeleted  int64                  `protobuf:"varint,2,opt,name=history_deleted,json=historyDeleted,proto3" json:"history_deleted,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ClearResponse) Reset() {
+	*x = ClearResponse{}
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClearResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClearResponse) ProtoMessage() {}
+
+func (x *ClearResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClearResponse.ProtoReflect.Descriptor instead.
+func (*ClearResponse) Descriptor() ([]byte, []int) {
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *ClearResponse) GetVersionsDeleted() int64 {
+	if x != nil {
+		return x.VersionsDeleted
+	}
+	return 0
+}
+
+func (x *ClearResponse) GetHistoryDeleted() int64 {
+	if x != nil {
+		return x.HistoryDeleted
+	}
+	return 0
+}
+
 var File_pitrd_v1_pitrd_proto protoreflect.FileDescriptor
 
 const file_pitrd_v1_pitrd_proto_rawDesc = "" +
@@ -1562,7 +1692,7 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x06volume\x18\x01 \x01(\v2\x16.pitrd.v1.VolumeStatusR\x06volume\"#\n" +
 	"\rUmountRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\"\x0f\n" +
-	"\rStatusRequest\"\xd6\x01\n" +
+	"\rStatusRequest\"\xfb\x01\n" +
 	"\fVolumeStatus\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tjfs_mount\x18\x02 \x01(\tR\bjfsMount\x12\x1d\n" +
@@ -1572,12 +1702,15 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"jfsMounted\x12!\n" +
 	"\ffuse_mounted\x18\x05 \x01(\bR\vfuseMounted\x12\x1c\n" +
 	"\tretention\x18\x06 \x01(\tR\tretention\x12\x14\n" +
-	"\x05error\x18\a \x01(\tR\x05error\"\xc5\x01\n" +
+	"\x05error\x18\a \x01(\tR\x05error\x12#\n" +
+	"\rhistory_limit\x18\b \x01(\x05R\fhistoryLimit\"\xea\x01\n" +
 	"\x0eStatusResponse\x12%\n" +
 	"\x0edaemon_version\x18\x01 \x01(\tR\rdaemonVersion\x12)\n" +
 	"\x10postgres_healthy\x18\x02 \x01(\bR\x0fpostgresHealthy\x120\n" +
-	"\avolumes\x18\x03 \x03(\v2\x16.pitrd.v1.VolumeStatusR\avolumes\x12/\n" +
-	"\x13active_transactions\x18\x04 \x01(\x03R\x12activeTransactions\"\xd4\x02\n" +
+	"\avolumes\x18\x03 \x03(\v2\x16.pitrd.v1.VolumeStatusR\avolumes\x123\n" +
+	"\x13active_transactions\x18\x04 \x01(\x03B\x02\x18\x01R\x12activeTransactions\x12\x1f\n" +
+	"\vopen_writes\x18\x05 \x01(\x03R\n" +
+	"openWrites\"\xd4\x02\n" +
 	"\vTransaction\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x03R\x05txnId\x12!\n" +
 	"\fversion_hash\x18\x02 \x01(\tR\vversionHash\x12 \n" +
@@ -1653,7 +1786,14 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x11ConfigSetResponse\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value\x12\x16\n" +
-	"\x06window\x18\x03 \x01(\tR\x06window2\xdb\x05\n" +
+	"\x06window\x18\x03 \x01(\tR\x06window\"T\n" +
+	"\fClearRequest\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x16\n" +
+	"\x06global\x18\x02 \x01(\bR\x06global\x12\x18\n" +
+	"\aconfirm\x18\x03 \x01(\bR\aconfirm\"c\n" +
+	"\rClearResponse\x12)\n" +
+	"\x10versions_deleted\x18\x01 \x01(\x03R\x0fversionsDeleted\x12'\n" +
+	"\x0fhistory_deleted\x18\x02 \x01(\x03R\x0ehistoryDeleted2\x95\x06\n" +
 	"\x05Pitrd\x125\n" +
 	"\x04Init\x12\x15.pitrd.v1.InitRequest\x1a\x16.pitrd.v1.InitResponse\x128\n" +
 	"\x05Mount\x12\x16.pitrd.v1.MountRequest\x1a\x17.pitrd.v1.MountResponse\x129\n" +
@@ -1666,7 +1806,8 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x06Revert\x12\x17.pitrd.v1.RevertRequest\x1a\x18.pitrd.v1.RevertResponse\x125\n" +
 	"\x04Diff\x12\x15.pitrd.v1.DiffRequest\x1a\x16.pitrd.v1.DiffResponse\x12>\n" +
 	"\aRecover\x12\x18.pitrd.v1.RecoverRequest\x1a\x19.pitrd.v1.RecoverResponse\x12D\n" +
-	"\tConfigSet\x12\x1a.pitrd.v1.ConfigSetRequest\x1a\x1b.pitrd.v1.ConfigSetResponseB\x19Z\x17pitr_fs/api/pitrd/v1;v1b\x06proto3"
+	"\tConfigSet\x12\x1a.pitrd.v1.ConfigSetRequest\x1a\x1b.pitrd.v1.ConfigSetResponse\x128\n" +
+	"\x05Clear\x12\x16.pitrd.v1.ClearRequest\x1a\x17.pitrd.v1.ClearResponseB\x19Z\x17pitr_fs/api/pitrd/v1;v1b\x06proto3"
 
 var (
 	file_pitrd_v1_pitrd_proto_rawDescOnce sync.Once
@@ -1680,7 +1821,7 @@ func file_pitrd_v1_pitrd_proto_rawDescGZIP() []byte {
 	return file_pitrd_v1_pitrd_proto_rawDescData
 }
 
-var file_pitrd_v1_pitrd_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
+var file_pitrd_v1_pitrd_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_pitrd_v1_pitrd_proto_goTypes = []any{
 	(*InitRequest)(nil),           // 0: pitrd.v1.InitRequest
 	(*InitResponse)(nil),          // 1: pitrd.v1.InitResponse
@@ -1708,15 +1849,17 @@ var file_pitrd_v1_pitrd_proto_goTypes = []any{
 	(*RecoverResponse)(nil),       // 23: pitrd.v1.RecoverResponse
 	(*ConfigSetRequest)(nil),      // 24: pitrd.v1.ConfigSetRequest
 	(*ConfigSetResponse)(nil),     // 25: pitrd.v1.ConfigSetResponse
-	(*timestamppb.Timestamp)(nil), // 26: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),         // 27: google.protobuf.Empty
+	(*ClearRequest)(nil),          // 26: pitrd.v1.ClearRequest
+	(*ClearResponse)(nil),         // 27: pitrd.v1.ClearResponse
+	(*timestamppb.Timestamp)(nil), // 28: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),         // 29: google.protobuf.Empty
 }
 var file_pitrd_v1_pitrd_proto_depIdxs = []int32{
 	6,  // 0: pitrd.v1.InitResponse.volume:type_name -> pitrd.v1.VolumeStatus
 	6,  // 1: pitrd.v1.MountResponse.volume:type_name -> pitrd.v1.VolumeStatus
 	6,  // 2: pitrd.v1.StatusResponse.volumes:type_name -> pitrd.v1.VolumeStatus
-	26, // 3: pitrd.v1.Transaction.created_at:type_name -> google.protobuf.Timestamp
-	26, // 4: pitrd.v1.Transaction.closed_at:type_name -> google.protobuf.Timestamp
+	28, // 3: pitrd.v1.Transaction.created_at:type_name -> google.protobuf.Timestamp
+	28, // 4: pitrd.v1.Transaction.closed_at:type_name -> google.protobuf.Timestamp
 	8,  // 5: pitrd.v1.BeginResponse.transaction:type_name -> pitrd.v1.Transaction
 	8,  // 6: pitrd.v1.CommitResponse.transaction:type_name -> pitrd.v1.Transaction
 	8,  // 7: pitrd.v1.RollbackResponse.transaction:type_name -> pitrd.v1.Transaction
@@ -1735,20 +1878,22 @@ var file_pitrd_v1_pitrd_proto_depIdxs = []int32{
 	20, // 20: pitrd.v1.Pitrd.Diff:input_type -> pitrd.v1.DiffRequest
 	22, // 21: pitrd.v1.Pitrd.Recover:input_type -> pitrd.v1.RecoverRequest
 	24, // 22: pitrd.v1.Pitrd.ConfigSet:input_type -> pitrd.v1.ConfigSetRequest
-	1,  // 23: pitrd.v1.Pitrd.Init:output_type -> pitrd.v1.InitResponse
-	3,  // 24: pitrd.v1.Pitrd.Mount:output_type -> pitrd.v1.MountResponse
-	27, // 25: pitrd.v1.Pitrd.Umount:output_type -> google.protobuf.Empty
-	7,  // 26: pitrd.v1.Pitrd.Status:output_type -> pitrd.v1.StatusResponse
-	10, // 27: pitrd.v1.Pitrd.Begin:output_type -> pitrd.v1.BeginResponse
-	12, // 28: pitrd.v1.Pitrd.Commit:output_type -> pitrd.v1.CommitResponse
-	14, // 29: pitrd.v1.Pitrd.Rollback:output_type -> pitrd.v1.RollbackResponse
-	17, // 30: pitrd.v1.Pitrd.Logs:output_type -> pitrd.v1.LogsResponse
-	19, // 31: pitrd.v1.Pitrd.Revert:output_type -> pitrd.v1.RevertResponse
-	21, // 32: pitrd.v1.Pitrd.Diff:output_type -> pitrd.v1.DiffResponse
-	23, // 33: pitrd.v1.Pitrd.Recover:output_type -> pitrd.v1.RecoverResponse
-	25, // 34: pitrd.v1.Pitrd.ConfigSet:output_type -> pitrd.v1.ConfigSetResponse
-	23, // [23:35] is the sub-list for method output_type
-	11, // [11:23] is the sub-list for method input_type
+	26, // 23: pitrd.v1.Pitrd.Clear:input_type -> pitrd.v1.ClearRequest
+	1,  // 24: pitrd.v1.Pitrd.Init:output_type -> pitrd.v1.InitResponse
+	3,  // 25: pitrd.v1.Pitrd.Mount:output_type -> pitrd.v1.MountResponse
+	29, // 26: pitrd.v1.Pitrd.Umount:output_type -> google.protobuf.Empty
+	7,  // 27: pitrd.v1.Pitrd.Status:output_type -> pitrd.v1.StatusResponse
+	10, // 28: pitrd.v1.Pitrd.Begin:output_type -> pitrd.v1.BeginResponse
+	12, // 29: pitrd.v1.Pitrd.Commit:output_type -> pitrd.v1.CommitResponse
+	14, // 30: pitrd.v1.Pitrd.Rollback:output_type -> pitrd.v1.RollbackResponse
+	17, // 31: pitrd.v1.Pitrd.Logs:output_type -> pitrd.v1.LogsResponse
+	19, // 32: pitrd.v1.Pitrd.Revert:output_type -> pitrd.v1.RevertResponse
+	21, // 33: pitrd.v1.Pitrd.Diff:output_type -> pitrd.v1.DiffResponse
+	23, // 34: pitrd.v1.Pitrd.Recover:output_type -> pitrd.v1.RecoverResponse
+	25, // 35: pitrd.v1.Pitrd.ConfigSet:output_type -> pitrd.v1.ConfigSetResponse
+	27, // 36: pitrd.v1.Pitrd.Clear:output_type -> pitrd.v1.ClearResponse
+	24, // [24:37] is the sub-list for method output_type
+	11, // [11:24] is the sub-list for method input_type
 	11, // [11:11] is the sub-list for extension type_name
 	11, // [11:11] is the sub-list for extension extendee
 	0,  // [0:11] is the sub-list for field type_name
@@ -1766,7 +1911,7 @@ func file_pitrd_v1_pitrd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pitrd_v1_pitrd_proto_rawDesc), len(file_pitrd_v1_pitrd_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   26,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

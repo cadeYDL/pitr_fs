@@ -14,16 +14,12 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-
-	"pitr_fs/internal/txn"
 )
 
 // VersionManager 是 FUSE 层需要的最小事务接口,便于对失败路径做隔离测试。
 type VersionManager interface {
-	FindActiveByPath(context.Context, string) (*txn.Txn, error)
-	OpenAutoVersion(context.Context, int64, string) (int64, error)
-	ReopenAutoVersion(context.Context, int64, int64) error
-	CloseAutoVersion(context.Context, int64) error
+	OpenStandaloneVersion(context.Context, string, string) (int64, error)
+	CloseStandaloneVersion(context.Context, int64) error
 	AbortAutoVersion(context.Context, int64) error
 }
 
@@ -209,7 +205,7 @@ func (l *Loopback) newFile(base fs.FileHandle, flags uint32) *trackedFile {
 
 // O_WRONLY 是普通写入的主路径,用 direct-I/O 保证每次 write 落在 fd 长窗口
 // 内。writable mmap 必须以 O_RDWR 打开;该路径保留页缓存,由同一个 fd 长窗口
-// 覆盖 msync/close。调用方必须在 commit 前关闭可写 fd。
+// 覆盖 msync/close。文件关闭后该自动版本立即可见、可 revert。
 func directWrite(flags uint32) bool {
 	return flags&syscall.O_ACCMODE == syscall.O_WRONLY
 }

@@ -70,7 +70,7 @@ func (e *Engine) Revert(
 		// 所有 revert 串行,同时让 active 检查、计数、replay 和新版本插入
 		// 处在同一个快照与事务里。
 		if _, lockErr := tx.Exec(ctx,
-			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:revert'))"); lockErr != nil {
+			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:versions'))"); lockErr != nil {
 			return lockErr
 		}
 
@@ -94,7 +94,7 @@ func (e *Engine) Revert(
 		if scanErr := tx.QueryRow(ctx, `
 			SELECT count(*)
 			  FROM pitr_txn
-			 WHERE state='active'
+			 WHERE (state='active' OR (state='auto' AND closed_at IS NULL))
 			   AND ($1::text IS NULL OR pitr_scopes_overlap(scope_path, $1))`,
 			scope).Scan(&activeCount); scanErr != nil {
 			return scanErr
@@ -178,6 +178,10 @@ func (e *Engine) Revert(
 			"CALL pitr_revert($1,$2,$3,$4)",
 			targetHash, scope, revertID, scopeInodes); callErr != nil {
 			return callErr
+		}
+		if _, pruneErr := txn.PruneClosedVersions(
+			ctx, tx, scopePath); pruneErr != nil {
+			return pruneErr
 		}
 		return nil
 	})

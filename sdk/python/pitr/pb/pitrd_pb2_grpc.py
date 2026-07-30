@@ -95,6 +95,11 @@ class PitrdStub(object):
                 request_serializer=pitrd__pb2.ConfigSetRequest.SerializeToString,
                 response_deserializer=pitrd__pb2.ConfigSetResponse.FromString,
                 _registered_method=True)
+        self.Clear = channel.unary_unary(
+                '/pitrd.v1.Pitrd/Clear',
+                request_serializer=pitrd__pb2.ClearRequest.SerializeToString,
+                response_deserializer=pitrd__pb2.ClearResponse.FromString,
+                _registered_method=True)
 
 
 class PitrdServicer(object):
@@ -172,6 +177,12 @@ class PitrdServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Clear(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PitrdServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -234,6 +245,11 @@ def add_PitrdServicer_to_server(servicer, server):
                     servicer.ConfigSet,
                     request_deserializer=pitrd__pb2.ConfigSetRequest.FromString,
                     response_serializer=pitrd__pb2.ConfigSetResponse.SerializeToString,
+            ),
+            'Clear': grpc.unary_unary_rpc_method_handler(
+                    servicer.Clear,
+                    request_deserializer=pitrd__pb2.ClearRequest.FromString,
+                    response_serializer=pitrd__pb2.ClearResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -560,6 +576,33 @@ class Pitrd(object):
             '/pitrd.v1.Pitrd/ConfigSet',
             pitrd__pb2.ConfigSetRequest.SerializeToString,
             pitrd__pb2.ConfigSetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Clear(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pitrd.v1.Pitrd/Clear',
+            pitrd__pb2.ClearRequest.SerializeToString,
+            pitrd__pb2.ClearResponse.FromString,
             options,
             channel_credentials,
             insecure,

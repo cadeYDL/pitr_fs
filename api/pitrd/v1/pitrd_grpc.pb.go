@@ -32,6 +32,7 @@ const (
 	Pitrd_Diff_FullMethodName      = "/pitrd.v1.Pitrd/Diff"
 	Pitrd_Recover_FullMethodName   = "/pitrd.v1.Pitrd/Recover"
 	Pitrd_ConfigSet_FullMethodName = "/pitrd.v1.Pitrd/ConfigSet"
+	Pitrd_Clear_FullMethodName     = "/pitrd.v1.Pitrd/Clear"
 )
 
 // PitrdClient is the client API for Pitrd service.
@@ -50,6 +51,7 @@ type PitrdClient interface {
 	Diff(ctx context.Context, in *DiffRequest, opts ...grpc.CallOption) (*DiffResponse, error)
 	Recover(ctx context.Context, in *RecoverRequest, opts ...grpc.CallOption) (*RecoverResponse, error)
 	ConfigSet(ctx context.Context, in *ConfigSetRequest, opts ...grpc.CallOption) (*ConfigSetResponse, error)
+	Clear(ctx context.Context, in *ClearRequest, opts ...grpc.CallOption) (*ClearResponse, error)
 }
 
 type pitrdClient struct {
@@ -180,6 +182,16 @@ func (c *pitrdClient) ConfigSet(ctx context.Context, in *ConfigSetRequest, opts 
 	return out, nil
 }
 
+func (c *pitrdClient) Clear(ctx context.Context, in *ClearRequest, opts ...grpc.CallOption) (*ClearResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClearResponse)
+	err := c.cc.Invoke(ctx, Pitrd_Clear_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PitrdServer is the server API for Pitrd service.
 // All implementations must embed UnimplementedPitrdServer
 // for forward compatibility.
@@ -196,6 +208,7 @@ type PitrdServer interface {
 	Diff(context.Context, *DiffRequest) (*DiffResponse, error)
 	Recover(context.Context, *RecoverRequest) (*RecoverResponse, error)
 	ConfigSet(context.Context, *ConfigSetRequest) (*ConfigSetResponse, error)
+	Clear(context.Context, *ClearRequest) (*ClearResponse, error)
 	mustEmbedUnimplementedPitrdServer()
 }
 
@@ -241,6 +254,9 @@ func (UnimplementedPitrdServer) Recover(context.Context, *RecoverRequest) (*Reco
 }
 func (UnimplementedPitrdServer) ConfigSet(context.Context, *ConfigSetRequest) (*ConfigSetResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ConfigSet not implemented")
+}
+func (UnimplementedPitrdServer) Clear(context.Context, *ClearRequest) (*ClearResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Clear not implemented")
 }
 func (UnimplementedPitrdServer) mustEmbedUnimplementedPitrdServer() {}
 func (UnimplementedPitrdServer) testEmbeddedByValue()               {}
@@ -479,6 +495,24 @@ func _Pitrd_ConfigSet_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Pitrd_Clear_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClearRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PitrdServer).Clear(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Pitrd_Clear_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PitrdServer).Clear(ctx, req.(*ClearRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Pitrd_ServiceDesc is the grpc.ServiceDesc for Pitrd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -533,6 +567,10 @@ var Pitrd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ConfigSet",
 			Handler:    _Pitrd_ConfigSet_Handler,
+		},
+		{
+			MethodName: "Clear",
+			Handler:    _Pitrd_Clear_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

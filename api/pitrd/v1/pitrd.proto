@@ -22,6 +22,7 @@ service Pitrd {
   rpc Diff(DiffRequest) returns (DiffResponse);
   rpc Recover(RecoverRequest) returns (RecoverResponse);
   rpc ConfigSet(ConfigSetRequest) returns (ConfigSetResponse);
+  rpc Clear(ClearRequest) returns (ClearResponse);
 }
 
 message InitRequest {
@@ -58,13 +59,15 @@ message VolumeStatus {
   bool fuse_mounted = 5;
   string retention = 6;
   string error = 7;
+  int32 history_limit = 8;
 }
 
 message StatusResponse {
   string daemon_version = 1;
   bool postgres_healthy = 2;
   repeated VolumeStatus volumes = 3;
-  int64 active_transactions = 4;
+  int64 active_transactions = 4 [deprecated = true];
+  int64 open_writes = 5;
 }
 
 message Transaction {
@@ -172,4 +175,15 @@ message ConfigSetResponse {
   string key = 1;
   string value = 2;
   string window = 3;
+}
+
+message ClearRequest {
+  string path = 1;
+  bool global = 2;
+  bool confirm = 3;
+}
+
+message ClearResponse {
+  int64 versions_deleted = 1;
+  int64 history_deleted = 2;
 }

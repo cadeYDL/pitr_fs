@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "pitr_fs/api/pitrd/v1"
@@ -148,68 +150,49 @@ func setupServer(t *testing.T) *serverFixture {
 	return &serverFixture{db: db, mgr: mgr, client: pb.NewPitrdClient(conn)}
 }
 
-func TestServer_BeginCommit_E2E(t *testing.T) {
+func TestServer_ManualTransactionsDisabled(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	statusResp, err := f.client.Status(ctx, &pb.StatusRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !statusResp.GetPostgresHealthy() || len(statusResp.GetVolumes()) != 1 {
+	if !statusResp.GetPostgresHealthy() || len(statusResp.GetVolumes()) != 1 ||
+		statusResp.GetOpenWrites() != 0 ||
+		statusResp.GetVolumes()[0].GetHistoryLimit() != 100 {
 		t.Fatalf("unexpected status:%+v", statusResp)
 	}
-	beginResp, err := f.client.Begin(ctx, &pb.BeginRequest{
-		Path: "/workspace/proj", Message: "edit",
-	})
-	if err != nil {
-		t.Fatal(err)
+	calls := []func() error{
+		func() error {
+			_, err := f.client.Begin(ctx, &pb.BeginRequest{Path: "/workspace/proj"})
+			return err
+		},
+		func() error {
+			_, err := f.client.Commit(ctx, &pb.CommitRequest{Path: "/workspace/proj"})
+			return err
+		},
+		func() error {
+			_, err := f.client.Rollback(ctx, &pb.RollbackRequest{Path: "/workspace/proj"})
+			return err
+		},
 	}
-	if beginResp.GetTransaction().GetState() != txn.StateActive {
-		t.Fatalf("unexpected begin:%+v", beginResp)
-	}
-	commitResp, err := f.client.Commit(ctx, &pb.CommitRequest{
-		Path: "/workspace/proj", Message: "done",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if commitResp.GetTransaction().GetState() != txn.StateCommitted ||
-		commitResp.GetTransaction().GetMessage() != "done" {
-		t.Fatalf("unexpected commit:%+v", commitResp)
-	}
-	logs, err := f.client.Logs(ctx,
-		&pb.LogsRequest{Path: "/workspace/proj", Limit: 5})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(logs.GetEntries()) < 1 ||
-		logs.GetEntries()[0].GetTransaction().GetState() != txn.StateCommitted {
-		t.Fatalf("unexpected logs:%+v", logs)
+	for _, call := range calls {
+		if code := status.Code(call()); code != codes.FailedPrecondition {
+			t.Fatalf("manual transaction code=%s, want FailedPrecondition", code)
+		}
 	}
 }
 
-func TestServer_Rollback_E2E(t *testing.T) {
+func TestServer_AutomaticVersion_E2E(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	if _, err := f.db.Exec(ctx,
 		"INSERT INTO jfs_node (inode, mode, nlink, length) VALUES (500, 33188, 1, 5)"); err != nil {
 		t.Fatal(err)
 	}
-	beginResp, err := f.client.Begin(ctx,
-		&pb.BeginRequest{Path: "/workspace/proj"})
+	autoID, err := f.mgr.OpenStandaloneVersion(
+		ctx, "/workspace/proj/a", "write:/workspace/proj/a")
 	if err != nil {
-		t.Fatal(err)
-	}
-	activeID := beginResp.GetTransaction().GetTxnId()
-	var autoID int64
-	if err := f.db.InTx(ctx, func(txDB pg.Tx) error {
-		id, _, err := f.mgr.CreateAutoVersion(ctx, txDB, activeID, "write:/workspace/proj/a")
-		autoID = id
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.mgr.CloseAutoVersion(ctx, autoID); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.db.InTx(ctx, func(txDB pg.Tx) error {
@@ -221,21 +204,22 @@ func TestServer_Rollback_E2E(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rollbackResp, err := f.client.Rollback(ctx,
-		&pb.RollbackRequest{TxnId: activeID})
+	if err := f.mgr.CloseStandaloneVersion(ctx, autoID); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := f.client.Logs(ctx,
+		&pb.LogsRequest{Path: "/workspace/proj", Limit: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rollbackResp.GetTransaction().GetState() != txn.StateRolledBack {
-		t.Fatalf("unexpected rollback:%+v", rollbackResp)
+	if len(logs.GetEntries()) < 1 ||
+		logs.GetEntries()[0].GetTransaction().GetState() != txn.StateAuto ||
+		logs.GetEntries()[0].GetTransaction().GetCommand() !=
+			"write:/workspace/proj/a" {
+		t.Fatalf("unexpected logs:%+v", logs)
 	}
-	var length int64
-	if err := f.db.QueryRow(ctx,
-		"SELECT length FROM jfs_node WHERE inode=500").Scan(&length); err != nil {
-		t.Fatal(err)
-	}
-	if length != 5 {
-		t.Fatalf("rollback 后 length=%d", length)
+	if logs.GetEntries()[0].GetTransaction().GetClosedAt() == nil {
+		t.Fatal("自动版本必须已关闭")
 	}
 }
 
@@ -406,22 +390,98 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	if configured.GetValue() != "archive" || configured.GetWindow() != "30d" {
 		t.Fatalf("config=%+v", configured)
 	}
+	historyConfig, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "history-limit", Value: "7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if historyConfig.GetValue() != "7" {
+		t.Fatalf("history config=%+v", historyConfig)
+	}
+	statusResponse, err = f.client.Status(ctx, &pb.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := statusResponse.GetVolumes()[0].GetHistoryLimit(); got != 7 {
+		t.Fatalf("persisted history limit=%d", got)
+	}
 }
 
-func TestServer_UmountRejectsActiveTransaction(t *testing.T) {
+func TestServer_UmountRejectsOpenWrite(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
-	transaction, err := f.client.Begin(ctx,
-		&pb.BeginRequest{Path: "/workspace/proj"})
+	versionID, err := f.mgr.OpenStandaloneVersion(
+		ctx, "/workspace/proj", "write:/workspace/proj/a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.client.Umount(ctx,
 		&pb.UmountRequest{Path: "/workspace"}); err == nil {
-		t.Fatal("存在 active transaction 时 umount 应失败")
+		t.Fatal("存在开放写窗口时 umount 应失败")
 	}
-	if _, err := f.client.Rollback(ctx,
-		&pb.RollbackRequest{TxnId: transaction.GetTxnId()}); err != nil {
+	if err := f.mgr.CloseStandaloneVersion(ctx, versionID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := f.client.Umount(ctx,
+		&pb.UmountRequest{Path: "/workspace"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServer_ClearRequiresConfirmationAndKeepsCurrentData(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	if _, err := f.db.Exec(ctx,
+		"INSERT INTO jfs_node (inode,mode,nlink,length) VALUES (900,33188,1,17)"); err != nil {
+		t.Fatal(err)
+	}
+	versionID, err := f.mgr.OpenStandaloneVersion(
+		ctx, "/workspace/proj/file", "write:/workspace/proj/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.InTx(ctx, func(txDB pg.Tx) error {
+		if err := txDB.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(versionID)); err != nil {
+			return err
+		}
+		_, err := txDB.Exec(ctx, "UPDATE jfs_node SET length=23 WHERE inode=900")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.mgr.CloseStandaloneVersion(ctx, versionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Clear(ctx, &pb.ClearRequest{
+		Global: true,
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("未确认 clear code=%s", status.Code(err))
+	}
+	cleared, err := f.client.Clear(ctx, &pb.ClearRequest{
+		Global: true, Confirm: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.GetVersionsDeleted() != 1 || cleared.GetHistoryDeleted() != 1 {
+		t.Fatalf("clear=%+v", cleared)
+	}
+	var length, versions, configs int64
+	if err := f.db.QueryRow(ctx,
+		"SELECT length FROM jfs_node WHERE inode=900").Scan(&length); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_txn").Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_config").Scan(&configs); err != nil {
+		t.Fatal(err)
+	}
+	if length != 23 || versions != 1 || configs != 1 {
+		t.Fatalf("clear 后 length=%d versions=%d configs=%d",
+			length, versions, configs)
 	}
 }

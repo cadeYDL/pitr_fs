@@ -20,16 +20,10 @@ func Example() {
 		panic(err)
 	}
 	defer client.Close()
-	transaction, err := client.Begin(
-		context.Background(), path, pitr.WithMessage("SDK example"))
-	if err != nil {
-		panic(err)
-	}
 	if err := os.WriteFile(path+"/hello.txt", []byte("hello\n"), 0o644); err != nil {
-		_ = transaction.Rollback(context.Background())
 		panic(err)
 	}
-	if err := transaction.Commit(context.Background(), "write hello"); err != nil {
+	if _, err := client.Logs(context.Background(), path, 20); err != nil {
 		panic(err)
 	}
 }

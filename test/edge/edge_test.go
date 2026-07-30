@@ -27,6 +27,7 @@ func TestEdge_MmapWrite(t *testing.T) {
 	const baseline = "read-only-mmap"
 	const changed = "write-via-mmap"
 	testutil.WriteString(t, file, baseline)
+	baselineVersion := latestAutoHash(t, client, ctx, scope)
 
 	readFile, err := os.Open(file)
 	if err != nil {
@@ -48,10 +49,6 @@ func TestEdge_MmapWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	transaction, err := client.Begin(ctx, scope, pitr.WithMessage("mmap write"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	writeFile, err := os.OpenFile(file, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -67,9 +64,6 @@ func TestEdge_MmapWrite(t *testing.T) {
 	if err := unix.Msync(writeMapping, unix.MS_SYNC); err != nil {
 		t.Fatal(err)
 	}
-	if err := transaction.Commit(ctx, "mapping still open"); err == nil {
-		t.Fatal("writable mmap 句柄未关闭时 commit 应拒绝开放 auto")
-	}
 	if err := unix.Munmap(writeMapping); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +73,8 @@ func TestEdge_MmapWrite(t *testing.T) {
 	if got := testutil.ReadString(t, file); got != changed {
 		t.Fatalf("mmap 写入内容=%q", got)
 	}
-	if err := transaction.Rollback(ctx); err != nil {
+	if _, err := client.Revert(
+		ctx, baselineVersion, pitr.WithPath(scope)); err != nil {
 		t.Fatal(err)
 	}
 	relative := strings.TrimPrefix(scope, "/workspace")
@@ -109,19 +104,13 @@ func TestEdge_RenameCrossScope(t *testing.T) {
 	source := filepath.Join(sourceDir, "value.txt")
 	destination := filepath.Join(destinationDir, "value.txt")
 	testutil.WriteString(t, source, "cross-scope")
+	baselineVersion := latestAutoHash(t, client, ctx, scope)
 
-	sourceTxn, err := client.Begin(ctx, path.Join(scope, "src"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	destinationTxn, err := client.Begin(ctx, path.Join(scope, "dst"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Rename(source, destination); err != nil {
 		t.Fatal(err)
 	}
-	if err := destinationTxn.Rollback(ctx); err != nil {
+	if _, err := client.Revert(
+		ctx, baselineVersion, pitr.WithPath(scope)); err != nil {
 		t.Fatal(err)
 	}
 	if got := testutil.ReadString(t, source); got != "cross-scope" {
@@ -129,9 +118,6 @@ func TestEdge_RenameCrossScope(t *testing.T) {
 	}
 	if _, err := os.Stat(destination); !os.IsNotExist(err) {
 		t.Fatalf("dst rollback 后目标仍存在: %v", err)
-	}
-	if err := sourceTxn.Rollback(ctx); err != nil {
-		t.Fatalf("src 事务不应捕获 rename: %v", err)
 	}
 }
 
@@ -142,20 +128,8 @@ func TestEdge_DaemonCrashRestart(t *testing.T) {
 	client := env.Client(t)
 	file := filepath.Join(host, "survive.txt")
 	testutil.WriteString(t, file, "baseline")
+	baselineVersion := latestAutoHash(t, client, ctx, scope)
 
-	transaction, err := client.Begin(ctx, scope, pitr.WithMessage("crash window"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if transaction.State() == "active" {
-			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := transaction.Rollback(rollbackCtx); err != nil {
-				t.Logf("清理 crash 测试 active transaction: %v", err)
-			}
-		}
-	})
 	testutil.WriteString(t, file, "written-before-crash")
 	env.Docker(t, "kill", "--signal=KILL", env.Container)
 	env.DetachHostMount(t)
@@ -165,9 +139,10 @@ func TestEdge_DaemonCrashRestart(t *testing.T) {
 	if got := testutil.ReadString(t, file); got != "written-before-crash" {
 		t.Fatalf("重启后数据不可读或内容错误: %q", got)
 	}
-	// grpc-go 会对重建后的 unix socket 自动重连;rollback 同时证明 dangling
-	// auto 已在 daemon 启动阶段关闭,active 事务仍可安全收口。
-	if err := transaction.Rollback(ctx); err != nil {
+	// grpc-go 会对重建后的 unix socket 自动重连；revert 证明关闭后的自动
+	// 版本在 daemon 重启后仍然可用。
+	if _, err := client.Revert(
+		ctx, baselineVersion, pitr.WithPath(scope)); err != nil {
 		t.Fatal(err)
 	}
 	if got := testutil.ReadString(t, file); got != "baseline" {
@@ -212,30 +187,18 @@ done`
 		).Run()
 	})
 
-	baseline, err := client.Begin(ctx, scope, pitr.WithMessage("large baseline"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := baseline.Commit(ctx, "large baseline"); err != nil {
-		t.Fatal(err)
-	}
-	rename, err := client.Begin(ctx, scope, pitr.WithMessage("large rename"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteString(t, filepath.Join(host, ".baseline"), "baseline")
+	baselineVersion := latestAutoHash(t, client, ctx, scope)
 	if err := os.Rename(
 		filepath.Join(host, "payload"),
 		filepath.Join(host, "payload-renamed"),
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := rename.Commit(ctx, "large rename"); err != nil {
-		t.Fatal(err)
-	}
 
 	start := time.Now()
 	result, err := client.Revert(
-		ctx, baseline.VersionHash(), pitr.WithPath(scope))
+		ctx, baselineVersion, pitr.WithPath(scope))
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
@@ -262,15 +225,14 @@ func TestEdge_UnicodeFilename(t *testing.T) {
 	ctx := testutil.Context(t)
 	client := env.Client(t)
 	names := []string{"你好，世界.txt", "résumé-Δ.md", "emoji-🧪.json"}
+	testutil.WriteString(t, filepath.Join(host, ".baseline"), "baseline")
+	baselineVersion := latestAutoHash(t, client, ctx, scope)
 
-	transaction, err := client.Begin(ctx, scope, pitr.WithMessage("unicode"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	for index, name := range names {
 		testutil.WriteString(t, filepath.Join(host, name), fmt.Sprintf("内容-%d", index))
 	}
-	if err := transaction.Rollback(ctx); err != nil {
+	if _, err := client.Revert(
+		ctx, baselineVersion, pitr.WithPath(scope)); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range names {
@@ -278,6 +240,26 @@ func TestEdge_UnicodeFilename(t *testing.T) {
 			t.Fatalf("rollback 后 Unicode 文件 %q 仍存在: %v", name, err)
 		}
 	}
+}
+
+func latestAutoHash(
+	t testing.TB,
+	client *pitr.Client,
+	ctx context.Context,
+	scope string,
+) string {
+	t.Helper()
+	logs, err := client.Logs(ctx, scope, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range logs {
+		if entry.State == "auto" {
+			return entry.VersionHash
+		}
+	}
+	t.Fatalf("scope %s 没有自动版本: %+v", scope, logs)
+	return ""
 }
 
 func envInt(t testing.TB, name string, fallback int) int {

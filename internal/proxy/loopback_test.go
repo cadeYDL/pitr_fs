@@ -12,8 +12,6 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
-
-	"pitr_fs/internal/txn"
 )
 
 func mountedLoopback(
@@ -154,7 +152,7 @@ func TestLoopback_Unmount(t *testing.T) {
 }
 
 func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
-	manager := &mockManager{active: &txn.Txn{ID: 42}}
+	manager := new(mockManager)
 	backend, mount, _ := mountedLoopback(t, WithManager(manager))
 	dir := filepath.Join(mount, "dir")
 	if err := os.Mkdir(dir, 0o755); err != nil {
@@ -241,16 +239,15 @@ func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 }
 
 func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
-	manager := &mockManager{active: &txn.Txn{ID: 42}}
+	manager := new(mockManager)
 	backend, mount, _ := mountedLoopback(t, WithManager(manager))
 
 	reset := func() {
 		manager.mu.Lock()
 		defer manager.mu.Unlock()
 		manager.commands = nil
-		manager.parentIDs = nil
+		manager.scopes = nil
 		manager.openCalls = 0
-		manager.reopenCalls = 0
 		manager.closeCalls = 0
 	}
 	assertFirst := func(want ...string) {
@@ -339,7 +336,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 }
 
 func TestLoopback_WriteSequential_FdDedup(t *testing.T) {
-	manager := &mockManager{active: &txn.Txn{ID: 42}}
+	manager := new(mockManager)
 	backend, mount, _ := mountedLoopback(t, WithManager(manager))
 	if err := os.WriteFile(filepath.Join(backend, "file"), nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -362,20 +359,10 @@ func TestLoopback_WriteSequential_FdDedup(t *testing.T) {
 		t.Fatalf("100 次顺序 write 应只创建 1 个 auto,实际 %d; commands=%v",
 			manager.openCalls, manager.commands)
 	}
-	if manager.reopenCalls != 0 {
-		t.Fatalf("fd 长窗口不应逐次 reopen; reopen=%d", manager.reopenCalls)
-	}
 }
 
 func TestLoopback_RenameCrossScope_BelongsToDestination(t *testing.T) {
-	manager := &mockManager{
-		activeFor: func(path string) *txn.Txn {
-			if strings.Contains(path, string(filepath.Separator)+"dst"+string(filepath.Separator)) {
-				return &txn.Txn{ID: 2}
-			}
-			return &txn.Txn{ID: 1}
-		},
-	}
+	manager := new(mockManager)
 	_, mount, _ := mountedLoopback(t, WithManager(manager))
 	if err := os.Mkdir(filepath.Join(mount, "src"), 0o755); err != nil {
 		t.Fatal(err)
@@ -388,7 +375,7 @@ func TestLoopback_RenameCrossScope_BelongsToDestination(t *testing.T) {
 	}
 
 	manager.mu.Lock()
-	manager.parentIDs = nil
+	manager.scopes = nil
 	manager.commands = nil
 	manager.openCalls = 0
 	manager.mu.Unlock()
@@ -400,9 +387,11 @@ func TestLoopback_RenameCrossScope_BelongsToDestination(t *testing.T) {
 	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if manager.openCalls != 1 || len(manager.parentIDs) != 1 || manager.parentIDs[0] != 2 {
-		t.Fatalf("跨 scope rename 应归属 dst txn=2: parents=%v commands=%v",
-			manager.parentIDs, manager.commands)
+	wantScope := filepath.Join(mount, "dst", "file")
+	if manager.openCalls != 1 || len(manager.scopes) != 1 ||
+		manager.scopes[0] != wantScope {
+		t.Fatalf("跨 scope rename 应归属 dst path=%s: scopes=%v commands=%v",
+			wantScope, manager.scopes, manager.commands)
 	}
 }
 
