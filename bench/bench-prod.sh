@@ -29,7 +29,6 @@ echo "metric,plain,pitr,unit,regression_pct,threshold_pct,passed" >"$RAW"
 docker exec "$CONTAINER" rm -rf "$PLAIN"
 docker exec "$CONTAINER" mkdir -p "$PLAIN"
 cleanup() {
-    docker exec "$CONTAINER" pitr rollback "$SCOPE" >/dev/null 2>&1 || true
     docker exec "$CONTAINER" rm -rf "$PLAIN" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -105,9 +104,7 @@ echo "==> 元数据 create: $META_COUNT files"
 plain_meta_ns=$(metadata_ns "$PLAIN/plain-meta" "$META_COUNT")
 docker exec "$CONTAINER" rm -rf "$PITR/pitr-meta"
 docker exec "$CONTAINER" mkdir -p "$PITR/pitr-meta"
-docker exec "$CONTAINER" pitr begin "$PITR/pitr-meta" -m "prod bench metadata" >/dev/null
 pitr_meta_ns=$(metadata_ns "$PITR/pitr-meta" "$META_COUNT")
-docker exec "$CONTAINER" pitr commit "$PITR/pitr-meta" -m "prod bench metadata" >/dev/null
 plain_meta=$(awk -v ns="$plain_meta_ns" -v n="$META_COUNT" 'BEGIN {printf "%.4f",ns/n/1000000}')
 pitr_meta=$(awk -v ns="$pitr_meta_ns" -v n="$META_COUNT" 'BEGIN {printf "%.4f",ns/n/1000000}')
 meta_reg=$(ratio_latency "$plain_meta" "$pitr_meta")
@@ -115,9 +112,7 @@ echo "metadata_create_ms_op,$plain_meta,$pitr_meta,ms/op,$meta_reg,30,$(pass_le 
 
 echo "==> 顺序写: ${IO_MIB} MiB"
 plain_write_ns=$(dd_write_ns "$PLAIN/plain-io.bin" "$IO_MIB")
-docker exec "$CONTAINER" pitr begin "$PITR" -m "prod bench write" >/dev/null
 pitr_write_ns=$(dd_write_ns "$PITR/pitr-io.bin" "$IO_MIB")
-docker exec "$CONTAINER" pitr commit "$PITR" -m "prod bench write" >/dev/null
 plain_write=$(awk -v mib="$IO_MIB" -v ns="$plain_write_ns" 'BEGIN {printf "%.2f",mib/(ns/1000000000)}')
 pitr_write=$(awk -v mib="$IO_MIB" -v ns="$pitr_write_ns" 'BEGIN {printf "%.2f",mib/(ns/1000000000)}')
 write_reg=$(ratio_loss "$plain_write" "$pitr_write")
@@ -134,14 +129,13 @@ echo "sequential_read_mib_s,$plain_read,$pitr_read,MiB/s,$read_reg,10,$(pass_le 
 echo "==> 1 GiB sparse file revert"
 docker exec "$CONTAINER" rm -rf "$PITR/revert"
 docker exec "$CONTAINER" mkdir -p "$PITR/revert"
-baseline_output=$(docker exec "$CONTAINER" pitr begin "$PITR/revert" -m "1GiB baseline")
-baseline_hash=$(printf '%s\n' "$baseline_output" | awk '{print $3}')
 docker exec "$CONTAINER" truncate -s 1G "$PITR/revert/big.bin"
-docker exec "$CONTAINER" pitr commit "$PITR/revert" -m "1GiB baseline" >/dev/null
-docker exec "$CONTAINER" pitr begin "$PITR/revert" -m "1GiB mutate" >/dev/null
+baseline_hash=$(docker exec "$CONTAINER" pitr logs "$PITR/revert/big.bin" -n 1 |
+    awk 'NR==1 {print $1}')
+[ -n "$baseline_hash" ] ||
+    { echo "未找到 1 GiB baseline 自动版本" >&2; exit 1; }
 docker exec "$CONTAINER" sh -c \
     'printf changed | dd of="$1" bs=1 conv=notrunc status=none' write "$PITR/revert/big.bin"
-docker exec "$CONTAINER" pitr commit "$PITR/revert" -m "1GiB mutate" >/dev/null
 revert_ns=$(elapsed_ns pitr revert "$baseline_hash" --path "$PITR/revert")
 revert_ms=$(awk -v ns="$revert_ns" 'BEGIN {printf "%.2f",ns/1000000}')
 size=$(docker exec "$CONTAINER" stat -c %s "$PITR/revert/big.bin")

@@ -155,8 +155,9 @@ Go 阶段完成后需重跑一次完整 bench(P6),那次的报告作为生产版
 
 ## Phase 6 生产版复跑
 
-生产版不再使用上面的 demo 触发器挂载。先用 `install.sh` 启动真实
-`pitrd + JuiceFS + FUSE proxy`,再运行:
+生产版不再使用上面的 demo 触发器挂载，也不需要 `begin/commit`。先用
+`install.sh` 启动真实 `pitrd + JuiceFS + FUSE proxy`，脚本中的每个写操作会
+自动形成版本，再运行：
 
 ```bash
 PITR_CONTAINER=pitrfs ./bench/bench-prod.sh
