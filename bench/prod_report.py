@@ -37,6 +37,7 @@ def main() -> None:
         f"- 时间：{environment.get('date', '-')}",
         f"- 内核：{environment.get('kernel', '-')}",
         f"- 镜像：{environment.get('image', '-')}",
+        f"- 独立轮数：{environment.get('rounds', '1')}（结果取中位数）",
         f"- 元数据样本：{environment.get('meta_count', '-')} 个文件",
         f"- 顺序 I/O 样本：{environment.get('io_mib', '-')} MiB",
         "",
@@ -94,8 +95,9 @@ def main() -> None:
             "",
             "1. 元数据：把连续操作的 auto window 合并为显式批次，减少每个 FUSE "
             "调用的 PostgreSQL 往返；保留失败补偿边界。",
-            "2. 写吞吐：设计带 barrier 的 writeback 协议，在准确归属脏页后再考虑"
-            "取消 writable direct-I/O。",
+            "2. 写吞吐：确认内核 `CAP_PASSTHROUGH`/stacking depth 实际启用，"
+            "用 FUSE profile 定位剩余用户态拷贝；保留 fd auto 与 direct-I/O "
+            "一致性边界。",
             "3. 读吞吐：用 FUSE/JuiceFS profile 区分缓存失效和用户态拷贝成本，"
             "只针对读路径恢复可证明安全的缓存。",
             "4. revert：对 scope 闭包和 history 回放执行 `EXPLAIN ANALYZE`，按结果"

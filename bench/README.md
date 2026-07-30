@@ -166,3 +166,16 @@ PITR_CONTAINER=pitrfs ./bench/bench-prod.sh
 延迟、顺序读写、history 空间以及 1 GiB sparse 文件 revert。原始结果默认写入
 `/tmp/pitr-prod-bench`,并确定性生成 `bench/PROD.md`。可通过
 `PITR_BENCH_META_COUNT`、`PITR_BENCH_IO_MIB` 调整样本规模。
+
+正式报告至少执行三轮,再以中位数消除 VM cache 抖动:
+
+```bash
+for run in 1 2 3; do
+  PITR_PROD_RESULTS="/tmp/pitr-prod-$run" ./bench/bench-prod.sh
+done
+python3 ./bench/prod_aggregate.py /tmp/pitr-prod-median.csv \
+  /tmp/pitr-prod-{1,2,3}/prod.csv
+```
+
+把聚合 CSV 交给 `prod_report.py` 生成最终报告;每轮的原始 CSV 必须保留,
+不能挑选单次最好结果。
