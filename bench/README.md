@@ -152,3 +152,17 @@ pitr 侧未增长说明 `--trash-days 36500` 没生效;plain 侧漂移大说明 
 - **gRPC 控制面**:本 bench 不包含 CLI/SDK → daemon 的通信开销(每次事务操作多一次 unix socket 往返,~0.1 ms 量级,可忽略)。
 
 Go 阶段完成后需重跑一次完整 bench(P6),那次的报告作为生产版性能承诺。
+
+## Phase 6 生产版复跑
+
+生产版不再使用上面的 demo 触发器挂载。先用 `install.sh` 启动真实
+`pitrd + JuiceFS + FUSE proxy`,再运行:
+
+```bash
+PITR_CONTAINER=pitrfs ./bench/bench-prod.sh
+```
+
+脚本在同一容器和同一 JuiceFS 卷中比较底层挂载与用户可见挂载,验证元数据
+延迟、顺序读写、history 空间以及 1 GiB sparse 文件 revert。原始结果默认写入
+`/tmp/pitr-prod-bench`,并确定性生成 `bench/PROD.md`。可通过
+`PITR_BENCH_META_COUNT`、`PITR_BENCH_IO_MIB` 调整样本规模。

@@ -227,9 +227,9 @@ func (n *Node) Allocate(
 		})
 }
 
-// Flush 为已有变更的 mmap/close 提供兜底打点。只有该 fd 已经由 Create、
-// Write、Setattr 或 Allocate 关联 auto 时才重开窗口,避免只读/空写 close
-// 产生空版本。Linux FUSE 的 mmap 脏页会先产生 Write,因此也会建立关联。
+// Flush 为已有变更的 close 提供兜底打点。只有该 fd 已经由 Create、Write、
+// Setattr 或 Allocate 关联 auto 时才重开窗口,避免只读/空写 close 产生空版本。
+// 一期的可写句柄使用 direct I/O,因此 writable mmap 会由内核明确拒绝。
 func (n *Node) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	file, ok := tracked(f)
 	if !ok {
