@@ -136,7 +136,7 @@ func TestEdge_DaemonCrashRestart(t *testing.T) {
 	env.Docker(t, "start", env.Container)
 	env.WaitReady(t, 2*time.Minute)
 
-	if got := testutil.ReadString(t, file); got != "written-before-crash" {
+	if got := waitReadString(t, file, 10*time.Second); got != "written-before-crash" {
 		t.Fatalf("重启后数据不可读或内容错误: %q", got)
 	}
 	// grpc-go 会对重建后的 unix socket 自动重连；revert 证明关闭后的自动
@@ -240,6 +240,22 @@ func TestEdge_UnicodeFilename(t *testing.T) {
 			t.Fatalf("rollback 后 Unicode 文件 %q 仍存在: %v", name, err)
 		}
 	}
+}
+
+func waitReadString(t testing.TB, file string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(file)
+		if err == nil {
+			return string(content)
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("等待读取 %s: %v", file, lastErr)
+	return ""
 }
 
 func latestAutoHash(

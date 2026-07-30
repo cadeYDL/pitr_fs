@@ -126,10 +126,9 @@ do_install() {
   快速试用:
     mkdir -p $WORKSPACE/demo
     cd $WORKSPACE/demo
-    pitr begin  . -m 'try'
     echo hi > $WORKSPACE/demo/a.txt
     pitr logs   . -n 5
-    pitr commit . -m 'done'
+    pitr config set history-limit 100
 EOF
 }
 

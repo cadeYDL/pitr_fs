@@ -16,21 +16,26 @@ import (
 )
 
 type Env struct {
-	Socket    string
-	HostRoot  string
-	ScopeRoot string
-	MountRoot string
-	Container string
+	Socket          string
+	HostRoot        string
+	ScopeRoot       string
+	MountRoot       string
+	Container       string
+	ContainerSocket string
 }
 
 func Load(t testing.TB) Env {
 	t.Helper()
 	env := Env{
-		Socket:    os.Getenv("PITR_E2E_SOCKET"),
-		HostRoot:  os.Getenv("PITR_E2E_HOST_PATH"),
-		ScopeRoot: os.Getenv("PITR_E2E_SCOPE"),
-		MountRoot: os.Getenv("PITR_E2E_MOUNT_ROOT"),
-		Container: os.Getenv("PITR_E2E_CONTAINER"),
+		Socket:          os.Getenv("PITR_E2E_SOCKET"),
+		HostRoot:        os.Getenv("PITR_E2E_HOST_PATH"),
+		ScopeRoot:       os.Getenv("PITR_E2E_SCOPE"),
+		MountRoot:       os.Getenv("PITR_E2E_MOUNT_ROOT"),
+		Container:       os.Getenv("PITR_E2E_CONTAINER"),
+		ContainerSocket: os.Getenv("PITR_E2E_CONTAINER_SOCKET"),
+	}
+	if env.ContainerSocket == "" {
+		env.ContainerSocket = env.Socket
 	}
 	if env.Socket == "" || env.HostRoot == "" || env.ScopeRoot == "" {
 		t.Skip("未设置 PITR_E2E_SOCKET/PITR_E2E_HOST_PATH/PITR_E2E_SCOPE")
@@ -42,7 +47,7 @@ func Load(t testing.TB) Env {
 	if env.Container != "" {
 		if output, err := exec.Command(
 			"docker", "exec", env.Container,
-			"chmod", "666", "/var/run/pitrd.sock",
+			"chmod", "666", env.ContainerSocket,
 		).CombinedOutput(); err != nil {
 			t.Fatalf("设置 E2E socket 权限: %v\n%s", err, output)
 		}
@@ -148,12 +153,13 @@ func (e Env) WaitReady(t testing.TB, timeout time.Duration) {
 	for time.Now().Before(deadline) {
 		command := exec.Command(
 			"docker", "exec", e.Container, "sh", "-c",
-			"test -S /var/run/pitrd.sock && mountpoint -q /workspace",
+			"test -S \"$1\" && pitr --socket \"$1\" status >/dev/null && mountpoint -q /workspace",
+			"wait-ready", e.ContainerSocket,
 		)
 		if output, err := command.CombinedOutput(); err == nil {
 			_ = exec.Command(
 				"docker", "exec", e.Container,
-				"chmod", "666", "/var/run/pitrd.sock",
+				"chmod", "666", e.ContainerSocket,
 			).Run()
 			hostMounted := e.MountRoot == ""
 			if !hostMounted {
