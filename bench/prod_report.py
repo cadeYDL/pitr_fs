@@ -47,10 +47,16 @@ def main() -> None:
     ]
     for row in rows:
         verdict = "PASS" if row["passed"] == "true" else "FAIL"
+        if row["metric"] == "revert_1gib_ms":
+            comparison = f"{row['pitr']} ms"
+            threshold = f"≤ {row['threshold_pct']} ms"
+        else:
+            comparison = f"{row['regression_pct']}%"
+            threshold = f"≤ {row['threshold_pct']}%"
         lines.append(
             f"| {row['metric']} | {row['plain']} {row['unit']} | "
-            f"{row['pitr']} {row['unit']} | {row['regression_pct']}% | "
-            f"≤ {row['threshold_pct']}% | {verdict} |"
+            f"{row['pitr']} {row['unit']} | {comparison} | "
+            f"{threshold} | {verdict} |"
         )
 
     lines += [
@@ -72,10 +78,16 @@ def main() -> None:
         )
         lines.append("")
         for row in failures:
-            lines.append(
-                f"- `{row['metric']}`：实际 {row['regression_pct']}%，"
-                f"目标 ≤ {row['threshold_pct']}%。"
-            )
+            if row["metric"] == "revert_1gib_ms":
+                lines.append(
+                    f"- `{row['metric']}`：实际 {row['pitr']} ms，"
+                    f"目标 ≤ {row['threshold_pct']} ms。"
+                )
+            else:
+                lines.append(
+                    f"- `{row['metric']}`：实际 {row['regression_pct']}%，"
+                    f"目标 ≤ {row['threshold_pct']}%。"
+                )
         lines += [
             "",
             "建议按以下顺序优化并用同一脚本复测：",

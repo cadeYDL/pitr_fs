@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,6 +16,11 @@ import (
 
 const txnColumns = `id, version_hash, parent_id, scope_path, state,
 	COALESCE(command, ''), COALESCE(message, ''), created_at, closed_at`
+
+const (
+	fdReleaseWait = 2 * time.Second
+	fdReleasePoll = 10 * time.Millisecond
+)
 
 type Manager struct {
 	db *pg.DB
@@ -119,11 +125,8 @@ func (m *Manager) Commit(ctx context.Context, txnID int64, message string) (*Txn
 		if state != StateActive {
 			return fmt.Errorf("%w: %s -> committed", ErrIllegalTransit, state)
 		}
-		var openAutos int
-		if err := tx.QueryRow(ctx, `
-			SELECT count(*) FROM pitr_txn
-			 WHERE parent_id=$1 AND state='auto' AND closed_at IS NULL`,
-			txnID).Scan(&openAutos); err != nil {
+		openAutos, err := waitForClosedAutos(ctx, tx, txnID)
+		if err != nil {
 			return err
 		}
 		if openAutos != 0 {
@@ -139,10 +142,10 @@ func (m *Manager) Commit(ctx context.Context, txnID int64, message string) (*Txn
 		if _, err := tx.Exec(ctx, "CALL pitr_collapse_commit($1)", txnID); err != nil {
 			return err
 		}
-		var err error
-		committed, err = scanTxn(tx.QueryRow(ctx,
+		var scanErr error
+		committed, scanErr = scanTxn(tx.QueryRow(ctx,
 			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1", txnID))
-		return err
+		return scanErr
 	})
 	if err != nil {
 		return nil, fmt.Errorf("commit txn %d: %w", txnID, err)
@@ -164,18 +167,53 @@ func (m *Manager) Rollback(ctx context.Context, txnID int64) (*Txn, error) {
 		if state != StateActive {
 			return fmt.Errorf("%w: %s -> rolled_back", ErrIllegalTransit, state)
 		}
+		openAutos, err := waitForClosedAutos(ctx, tx, txnID)
+		if err != nil {
+			return err
+		}
+		if openAutos != 0 {
+			return fmt.Errorf("%w:仍有 %d 个开放 auto",
+				ErrIllegalTransit, openAutos)
+		}
 		if _, err := tx.Exec(ctx, "CALL pitr_rollback($1)", txnID); err != nil {
 			return err
 		}
-		var err error
-		rolledBack, err = scanTxn(tx.QueryRow(ctx,
+		var scanErr error
+		rolledBack, scanErr = scanTxn(tx.QueryRow(ctx,
 			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1", txnID))
-		return err
+		return scanErr
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rollback txn %d: %w", txnID, err)
 	}
 	return rolledBack, nil
+}
+
+func waitForClosedAutos(
+	ctx context.Context,
+	tx pg.Tx,
+	parentID int64,
+) (int, error) {
+	deadline := time.Now().Add(fdReleaseWait)
+	for {
+		var open int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM pitr_txn
+			 WHERE parent_id=$1 AND state='auto' AND closed_at IS NULL`,
+			parentID).Scan(&open); err != nil {
+			return 0, err
+		}
+		if open == 0 || time.Now().After(deadline) {
+			return open, nil
+		}
+		timer := time.NewTimer(fdReleasePoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (m *Manager) FindByID(ctx context.Context, txnID int64) (*Txn, error) {

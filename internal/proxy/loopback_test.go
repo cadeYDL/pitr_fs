@@ -63,6 +63,18 @@ func TestLoopback_WriteRead(t *testing.T) {
 	}
 }
 
+func TestDirectWritePolicy(t *testing.T) {
+	if !directWrite(syscall.O_WRONLY) {
+		t.Fatal("O_WRONLY 应启用 direct-I/O")
+	}
+	if directWrite(syscall.O_RDWR) {
+		t.Fatal("O_RDWR 必须保留缓存以支持可捕获的 writable mmap")
+	}
+	if directWrite(syscall.O_RDONLY) {
+		t.Fatal("O_RDONLY 不应启用 direct-I/O")
+	}
+}
+
 func TestLoopback_Mkdir_Ls(t *testing.T) {
 	backend, mount, _ := mountedLoopback(t)
 	if err := os.Mkdir(filepath.Join(mount, "dir"), 0o750); err != nil {
@@ -210,8 +222,8 @@ func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 		seen[op] = true
 	}
 	for _, op := range []string{
-		"mkdir", "create", "write", "setxattr", "removexattr", "truncate", "link", "symlink",
-		"rename", "unlink", "rmdir",
+		"mkdir", "create", "open-write", "setxattr", "removexattr", "link",
+		"symlink", "rename", "unlink", "rmdir",
 	} {
 		if !seen[op] {
 			t.Errorf("操作 %s 未打点; commands=%v", op, manager.commands)
@@ -236,7 +248,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 		t.Helper()
 		manager.mu.Lock()
 		defer manager.mu.Unlock()
-		if manager.openCalls != 1 || len(manager.commands) != 1 {
+		if manager.openCalls < 1 || len(manager.commands) < 1 {
 			t.Fatalf("open=%d commands=%v", manager.openCalls, manager.commands)
 		}
 		got, _, _ := strings.Cut(manager.commands[0], ":")
@@ -267,7 +279,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		assertFirst("write")
+		assertFirst("open-write")
 	})
 
 	t.Run("setattr", func(t *testing.T) {
@@ -300,7 +312,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		assertFirst("fallocate")
+		assertFirst("open-write")
 	})
 
 	t.Run("open_trunc", func(t *testing.T) {
@@ -313,7 +325,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Linux FUSE 可把 O_TRUNC 下沉成 SETATTR(size=0),两种路径都满足语义。
-		assertFirst("open", "truncate")
+		assertFirst("open", "truncate", "open-write")
 	})
 }
 
@@ -341,8 +353,8 @@ func TestLoopback_WriteSequential_FdDedup(t *testing.T) {
 		t.Fatalf("100 次顺序 write 应只创建 1 个 auto,实际 %d; commands=%v",
 			manager.openCalls, manager.commands)
 	}
-	if manager.reopenCalls == 0 {
-		t.Fatalf("顺序 write/flush 应复用 auto; reopen=%d", manager.reopenCalls)
+	if manager.reopenCalls != 0 {
+		t.Fatalf("fd 长窗口不应逐次 reopen; reopen=%d", manager.reopenCalls)
 	}
 }
 

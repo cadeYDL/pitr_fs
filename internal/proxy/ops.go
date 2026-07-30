@@ -32,12 +32,21 @@ func (n *Node) Create(
 					return syscall.EIO
 				}
 				fh = file
-				// 可写句柄必须绕过上层内核页缓存,否则小写入可能在 auto
-				// 窗口关闭后才下发到 JuiceFS,无法确定 history 归属。
-				fuseFlags |= fuse.FOPEN_DIRECT_IO
+				if directWrite(flags) {
+					// 普通 O_WRONLY 句柄绕过上层页缓存,防止小写入在
+					// active txn 结束后才下发到 JuiceFS。
+					fuseFlags |= fuse.FOPEN_DIRECT_IO
+				}
 			}
 			return errno
 		})
+	if errno == 0 && file != nil && file.writable {
+		if keepErrno := n.keepWritableWindow(
+			ctx, path, command("open-write", path), file); keepErrno != 0 {
+			_ = file.LoopbackFile.Release(ctx)
+			return nil, nil, 0, keepErrno
+		}
+	}
 	return inode, fh, fuseFlags, errno
 }
 
@@ -134,7 +143,7 @@ func (n *Node) Open(
 				return syscall.EIO
 			}
 			fh = file
-			if file.writable {
+			if directWrite(flags) {
 				fuseFlags |= fuse.FOPEN_DIRECT_IO
 			}
 		}
@@ -142,10 +151,18 @@ func (n *Node) Open(
 	}
 	if flags&(syscall.O_TRUNC|syscall.O_CREAT) == 0 {
 		errno = open()
-		return fh, fuseFlags, errno
+	} else {
+		errno = n.versionedHook(ctx, path, command("open", path), 0, open)
 	}
-
-	errno = n.versionedHook(ctx, path, command("open", path), 0, open)
+	if errno == 0 {
+		if file, ok := tracked(fh); ok && file.writable {
+			if keepErrno := n.keepWritableWindow(
+				ctx, path, command("open-write", path), file); keepErrno != 0 {
+				_ = file.LoopbackFile.Release(ctx)
+				return nil, 0, keepErrno
+			}
+		}
+	}
 	return fh, fuseFlags, errno
 }
 
@@ -227,9 +244,10 @@ func (n *Node) Allocate(
 		})
 }
 
-// Flush 为已有变更的 close 提供兜底打点。只有该 fd 已经由 Create、Write、
-// Setattr 或 Allocate 关联 auto 时才重开窗口,避免只读/空写 close 产生空版本。
-// 一期的可写句柄使用 direct I/O,因此 writable mmap 会由内核明确拒绝。
+// Flush 为已有变更的 mmap/close 提供兜底打点。只有该 fd 已经由 Create、
+// Write、Setattr 或 Allocate 关联 auto 时才重开窗口,避免只读/空写 close
+// 产生空版本。支持 FUSE direct-I/O mmap 的 Linux 内核会先把脏页下沉为 Write,
+// 因而沿用同一 fd auto,Flush 只负责持久化窗口的最后收口。
 func (n *Node) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	file, ok := tracked(f)
 	if !ok {
@@ -241,14 +259,9 @@ func (n *Node) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	if !file.writable {
 		return file.LoopbackFile.Flush(ctx)
 	}
-	if _, versioned := n.root.loadFD(file.id); !versioned {
-		return file.LoopbackFile.Flush(ctx)
-	}
-	path := n.root.visiblePath(n)
-	return n.versionedHook(ctx, path, command("flush", path), file.id,
-		func() syscall.Errno {
-			return file.LoopbackFile.Flush(ctx)
-		})
+	// auto 必须保留到 Release:JuiceFS 可能只在关闭原始底层 fd 时提交
+	// 大块写的 chunk 元数据。Commit/Rollback 会短暂等待异步 Release。
+	return file.LoopbackFile.Flush(ctx)
 }
 
 func (n *Node) CopyFileRange(

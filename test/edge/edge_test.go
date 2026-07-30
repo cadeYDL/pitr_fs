@@ -1,7 +1,7 @@
 package edge
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,23 +18,27 @@ import (
 	"pitr_fs/test/testutil"
 )
 
-func TestEdge_MmapPolicy(t *testing.T) {
+func TestEdge_MmapWrite(t *testing.T) {
 	env := testutil.Load(t)
-	host, _ := env.Scenario(t, "mmap-policy")
+	host, scope := env.Scenario(t, "mmap-write")
+	ctx := testutil.Context(t)
+	client := env.Client(t)
 	file := filepath.Join(host, "mapped.txt")
-	testutil.WriteString(t, file, "read-only-mmap")
+	const baseline = "read-only-mmap"
+	const changed = "write-via-mmap"
+	testutil.WriteString(t, file, baseline)
 
 	readFile, err := os.Open(file)
 	if err != nil {
 		t.Fatal(err)
 	}
 	readMapping, err := unix.Mmap(
-		int(readFile.Fd()), 0, len("read-only-mmap"), unix.PROT_READ, unix.MAP_SHARED)
+		int(readFile.Fd()), 0, len(baseline), unix.PROT_READ, unix.MAP_SHARED)
 	if err != nil {
 		_ = readFile.Close()
 		t.Fatalf("只读 mmap 应受支持: %v", err)
 	}
-	if string(readMapping) != "read-only-mmap" {
+	if string(readMapping) != baseline {
 		t.Fatalf("只读 mmap 内容=%q", readMapping)
 	}
 	if err := unix.Munmap(readMapping); err != nil {
@@ -44,22 +48,49 @@ func TestEdge_MmapPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	transaction, err := client.Begin(ctx, scope, pitr.WithMessage("mmap write"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeFile, err := os.OpenFile(file, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer writeFile.Close()
 	writeMapping, err := unix.Mmap(
-		int(writeFile.Fd()), 0, len("read-only-mmap"),
+		int(writeFile.Fd()), 0, len(baseline),
 		unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err == nil {
-		_ = unix.Munmap(writeMapping)
-		t.Fatal("direct-I/O 可写句柄不应允许 writable mmap")
+	if err != nil {
+		_ = writeFile.Close()
+		t.Fatalf("当前 Linux/FUSE 应支持 writable mmap: %v", err)
 	}
-	if !errors.Is(err, unix.ENODEV) &&
-		!errors.Is(err, unix.EINVAL) &&
-		!errors.Is(err, unix.EOPNOTSUPP) {
-		t.Fatalf("writable mmap 应以明确的不支持错误失败,实际: %v", err)
+	copy(writeMapping, changed)
+	if err := unix.Msync(writeMapping, unix.MS_SYNC); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(ctx, "mapping still open"); err == nil {
+		t.Fatal("writable mmap 句柄未关闭时 commit 应拒绝开放 auto")
+	}
+	if err := unix.Munmap(writeMapping); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ReadString(t, file); got != changed {
+		t.Fatalf("mmap 写入内容=%q", got)
+	}
+	if err := transaction.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	relative := strings.TrimPrefix(scope, "/workspace")
+	lowerContent := env.Docker(
+		t, "exec", env.Container, "cat",
+		path.Join("/var/lib/pitr/jfs", relative, "mapped.txt"))
+	if lowerContent != baseline {
+		t.Fatalf("mmap rollback 后底层内容=%q", lowerContent)
+	}
+	if got := testutil.ReadString(t, file); got != baseline {
+		t.Fatalf("mmap 写入 rollback 后内容=%q", got)
 	}
 }
 
@@ -116,8 +147,18 @@ func TestEdge_DaemonCrashRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if transaction.State() == "active" {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := transaction.Rollback(rollbackCtx); err != nil {
+				t.Logf("清理 crash 测试 active transaction: %v", err)
+			}
+		}
+	})
 	testutil.WriteString(t, file, "written-before-crash")
 	env.Docker(t, "kill", "--signal=KILL", env.Container)
+	env.DetachHostMount(t)
 	env.Docker(t, "start", env.Container)
 	env.WaitReady(t, 2*time.Minute)
 
@@ -132,7 +173,8 @@ func TestEdge_DaemonCrashRestart(t *testing.T) {
 	if got := testutil.ReadString(t, file); got != "baseline" {
 		t.Fatalf("崩溃恢复后的 rollback 内容=%q", got)
 	}
-	volumes, err := client.Recover(ctx, scope[:len(env.ScopeRoot)])
+	mountPath := "/" + strings.Split(strings.Trim(env.ScopeRoot, "/"), "/")[0]
+	volumes, err := client.Recover(ctx, mountPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +191,7 @@ func TestEdge_LargeDirectoryRevert(t *testing.T) {
 	count := envInt(t, "PITR_E2E_LARGE_COUNT", 100000)
 	maxSeconds := envInt(t, "PITR_E2E_LARGE_MAX_SECONDS", 30)
 
-	relative, ok := strings.CutPrefix(scope, env.ScopeRoot)
+	relative, ok := strings.CutPrefix(scope, "/workspace")
 	if !ok || strings.Contains(relative, "..") {
 		t.Fatalf("非法测试 scope: %s", scope)
 	}

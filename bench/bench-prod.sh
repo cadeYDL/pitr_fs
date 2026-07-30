@@ -36,9 +36,9 @@ trap cleanup EXIT
 
 elapsed_ns() {
     docker exec "$CONTAINER" sh -c '
+set -e
 start=$(date +%s%N)
-shift
-"$@"
+"$@" >/dev/null
 end=$(date +%s%N)
 echo $((end-start))
 ' timer "$@"

@@ -194,3 +194,26 @@ func TestHook_FindFail_DoesNotMutate(t *testing.T) {
 		t.Fatalf("errno=%v called=%v", errno, called)
 	}
 }
+
+func TestTakeFD_ConcurrentSingleOwner(t *testing.T) {
+	loopback := &Loopback{fds: make(map[uint64]fdVersion)}
+	loopback.storeFD(7, fdVersion{autoID: 42, long: true})
+	var owners int
+	var mu sync.Mutex
+	var wait sync.WaitGroup
+	for index := 0; index < 100; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if _, ok := loopback.takeFD(7); ok {
+				mu.Lock()
+				owners++
+				mu.Unlock()
+			}
+		}()
+	}
+	wait.Wait()
+	if owners != 1 {
+		t.Fatalf("Flush/Release 窗口终结权=%d,期望 1", owners)
+	}
+}

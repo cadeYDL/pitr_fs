@@ -25,8 +25,7 @@ func tracked(f fs.FileHandle) (*trackedFile, bool) {
 
 func (n *Node) Release(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	if file, ok := tracked(f); ok {
-		n.root.deleteFD(file.id)
-		return file.LoopbackFile.Release(ctx)
+		return n.closeWritableWindow(ctx, file)
 	}
 	if releaser, ok := f.(fs.FileReleaser); ok {
 		return releaser.Release(ctx)

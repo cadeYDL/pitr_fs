@@ -19,6 +19,7 @@ type Env struct {
 	Socket    string
 	HostRoot  string
 	ScopeRoot string
+	MountRoot string
 	Container string
 }
 
@@ -28,6 +29,7 @@ func Load(t testing.TB) Env {
 		Socket:    os.Getenv("PITR_E2E_SOCKET"),
 		HostRoot:  os.Getenv("PITR_E2E_HOST_PATH"),
 		ScopeRoot: os.Getenv("PITR_E2E_SCOPE"),
+		MountRoot: os.Getenv("PITR_E2E_MOUNT_ROOT"),
 		Container: os.Getenv("PITR_E2E_CONTAINER"),
 	}
 	if env.Socket == "" || env.HostRoot == "" || env.ScopeRoot == "" {
@@ -37,7 +39,31 @@ func Load(t testing.TB) Env {
 		!path.IsAbs(env.ScopeRoot) {
 		t.Fatalf("E2E 路径必须为绝对路径: %+v", env)
 	}
+	if env.Container != "" {
+		if output, err := exec.Command(
+			"docker", "exec", env.Container,
+			"chmod", "666", "/var/run/pitrd.sock",
+		).CombinedOutput(); err != nil {
+			t.Fatalf("设置 E2E socket 权限: %v\n%s", err, output)
+		}
+	}
 	return env
+}
+
+// DetachHostMount 清理 daemon 非优雅退出后由 rshared 传播到测试 VM 的失联
+// FUSE 挂载。只允许操作显式传入的绝对测试挂载点。
+func (e Env) DetachHostMount(t testing.TB) {
+	t.Helper()
+	if !filepath.IsAbs(e.MountRoot) || e.MountRoot == "/" {
+		t.Fatalf("PITR_E2E_MOUNT_ROOT 必须是非根绝对路径,实际 %q", e.MountRoot)
+	}
+	if err := exec.Command("fusermount3", "-uz", e.MountRoot).Run(); err == nil {
+		return
+	}
+	output, err := exec.Command("sudo", "umount", "-l", e.MountRoot).CombinedOutput()
+	if err != nil {
+		t.Fatalf("卸载失联传播挂载 %s: %v\n%s", e.MountRoot, err, output)
+	}
 }
 
 func (e Env) Client(t testing.TB) *pitr.Client {
@@ -60,8 +86,16 @@ func (e Env) Scenario(t testing.TB, name string) (string, string) {
 	if err := os.RemoveAll(host); err != nil {
 		t.Fatalf("清理场景目录 %s: %v", host, err)
 	}
-	if err := os.MkdirAll(host, 0o755); err != nil {
-		t.Fatalf("创建场景目录 %s: %v", host, err)
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		err = os.MkdirAll(host, 0o755)
+		if err == nil {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("等待传播挂载可写并创建场景目录 %s: %v", host, err)
 	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(host); err != nil {
@@ -121,8 +155,18 @@ func (e Env) WaitReady(t testing.TB, timeout time.Duration) {
 				"docker", "exec", e.Container,
 				"chmod", "666", "/var/run/pitrd.sock",
 			).Run()
-			if _, err := os.Stat(e.Socket); err == nil {
-				return
+			hostMounted := e.MountRoot == ""
+			if !hostMounted {
+				hostMounted = exec.Command("mountpoint", "-q", e.MountRoot).Run() == nil
+			}
+			if _, err := os.Stat(e.Socket); err == nil && hostMounted {
+				probe := filepath.Join(e.HostRoot, ".pitr-ready")
+				if err := os.MkdirAll(e.HostRoot, 0o755); err == nil {
+					if err := os.WriteFile(probe, []byte("ready"), 0o600); err == nil {
+						_ = os.Remove(probe)
+						return
+					}
+				}
 			}
 		} else {
 			last = fmt.Sprintf("%v: %s", err, output)

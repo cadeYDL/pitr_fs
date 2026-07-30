@@ -53,11 +53,24 @@ type Loopback struct {
 	rootData   *fs.LoopbackRoot
 	rootNode   fs.InodeEmbedder
 
-	mountMu sync.Mutex
-	window  sync.Mutex
-	fdMu    sync.Mutex
-	fds     map[uint64]fdVersion
-	nextFD  atomic.Uint64
+	mountMu  sync.Mutex
+	window   sync.Mutex
+	fdMu     sync.Mutex
+	fds      map[uint64]fdVersion
+	longPath string
+	nextFD   atomic.Uint64
+}
+
+func (l *Loopback) setLongPath(value string) {
+	l.fdMu.Lock()
+	l.longPath = value
+	l.fdMu.Unlock()
+}
+
+func (l *Loopback) isLongPath(value string) bool {
+	l.fdMu.Lock()
+	defer l.fdMu.Unlock()
+	return l.longPath != "" && l.longPath == value
 }
 
 func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
@@ -192,6 +205,13 @@ func (l *Loopback) newFile(base fs.FileHandle, flags uint32) *trackedFile {
 		id:           l.nextFD.Add(1),
 		writable:     flags&syscall.O_ACCMODE != syscall.O_RDONLY,
 	}
+}
+
+// O_WRONLY 是普通写入的主路径,用 direct-I/O 保证每次 write 落在 fd 长窗口
+// 内。writable mmap 必须以 O_RDWR 打开;该路径保留页缓存,由同一个 fd 长窗口
+// 覆盖 msync/close。调用方必须在 commit 前关闭可写 fd。
+func directWrite(flags uint32) bool {
+	return flags&syscall.O_ACCMODE == syscall.O_WRONLY
 }
 
 func (l *Loopback) visiblePath(node *Node, names ...string) string {
