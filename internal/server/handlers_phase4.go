@@ -74,12 +74,24 @@ func (s *Server) Recover(
 	req *pb.RecoverRequest,
 ) (*pb.RecoverResponse, error) {
 	requested := path.Clean(req.GetPath())
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	var results []*pb.VolumeStatus
 	successes := 0
-	for _, volume := range s.volumes {
+	for index := range s.volumes {
+		volume := s.volumes[index]
 		if req.GetPath() != "" && requested != "/" &&
 			requested != path.Clean(volume.FUSEMount) {
 			continue
+		}
+		if !volume.FUSEMounted && s.cfg.MountFunc != nil {
+			if err := s.mountLocked(ctx, index); err != nil {
+				item := volumeStatusPB(volume)
+				item.Error = err.Error()
+				results = append(results, item)
+				continue
+			}
+			volume = s.volumes[index]
 		}
 		item := volumeStatusPB(volume)
 		if err := recoverVolume(ctx, volume); err != nil {
@@ -134,7 +146,7 @@ func volumeStatusPB(volume VolumeConfig) *pb.VolumeStatus {
 	}
 }
 
-func (s *Server) volumeStatuses() []*pb.VolumeStatus {
+func (s *Server) volumeStatusesLocked() []*pb.VolumeStatus {
 	out := make([]*pb.VolumeStatus, 0, len(s.volumes))
 	for _, volume := range s.volumes {
 		out = append(out, volumeStatusPB(volume))

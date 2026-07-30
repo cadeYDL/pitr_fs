@@ -126,6 +126,12 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		Retention:   flagRetention,
 		JFSMounted:  true,
 		FUSEMounted: true,
+		MountFunc: func(context.Context) error {
+			return fuseProxy.Start()
+		},
+		UmountFunc: func(context.Context) error {
+			return fuseProxy.Unmount()
+		},
 	})
 	grpcServer := grpc.NewServer()
 	pb.RegisterPitrdServer(grpcServer, handler)

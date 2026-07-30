@@ -6,9 +6,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,8 +17,6 @@ import (
 
 	pb "pitr_fs/api/pitrd/v1"
 )
-
-var errNotImpl = errors.New("尚未实现;将在 Phase 2/4 落地")
 
 const rpcTimeout = 5 * time.Second
 
@@ -95,29 +93,92 @@ func newRoot() *cobra.Command {
 // ---------- 生命周期 ----------
 
 func newDaemonCmd() *cobra.Command {
+	var pgDSN, volume, jfsMount, fuseMount, retention, logLevel string
 	c := &cobra.Command{
 		Use:   "daemon",
 		Short: "前台启动 pitrd(通常由 install/systemd 拉起)",
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			binary, err := exec.LookPath("pitrd")
+			if err != nil {
+				return fmt.Errorf("查找 pitrd: %w", err)
+			}
+			socket, _ := cmd.Root().PersistentFlags().GetString("socket")
+			arguments := []string{
+				"--volume", volume,
+				"--jfs-mount", jfsMount,
+				"--fuse-mount", fuseMount,
+				"--socket", socket,
+				"--retention", retention,
+				"--log-level", logLevel,
+			}
+			if pgDSN != "" {
+				arguments = append(arguments, "--pg-dsn", pgDSN)
+			}
+			process := exec.CommandContext(cmd.Context(), binary, arguments...)
+			process.Stdin = cmd.InOrStdin()
+			process.Stdout = cmd.OutOrStdout()
+			process.Stderr = cmd.ErrOrStderr()
+			if err := process.Run(); err != nil {
+				return fmt.Errorf("pitrd 退出: %w", err)
+			}
+			return nil
+		},
 	}
-	c.Flags().String("pg-dsn", "", "PostgreSQL DSN(可用 $PITR_PG_DSN)")
+	c.Flags().StringVar(&pgDSN, "pg-dsn", "", "PostgreSQL DSN(可用 $PITR_PG_DSN)")
+	c.Flags().StringVar(&volume, "volume", "default", "JuiceFS 卷名")
+	c.Flags().StringVar(&jfsMount, "jfs-mount", "/var/lib/pitr/jfs", "底层 JuiceFS 挂载点")
+	c.Flags().StringVar(&fuseMount, "fuse-mount", "/workspace", "用户可见 FUSE 挂载点")
+	c.Flags().StringVar(&retention, "retention", "compact", "保留策略")
+	c.Flags().StringVar(&logLevel, "log-level", "info", "日志级别")
 	return c
 }
 
 func newInitCmd() *cobra.Command {
+	var volume, storage, bucket, accessKey, secretKey, retention, dataDir string
 	c := &cobra.Command{
 		Use:   "init <path>",
 		Short: "首次初始化:格式化 JuiceFS + 装触发器 + 挂载 FUSE 到 <path>",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			storageArgs := []string{"storage=" + storage}
+			for key, value := range map[string]string{
+				"bucket": bucket, "access-key": accessKey,
+				"secret-key": secretKey, "data-dir": dataDir,
+			} {
+				if value != "" {
+					storageArgs = append(storageArgs, key+"="+value)
+				}
+			}
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Init(ctx, &pb.InitRequest{
+				Path: args[0], Volume: volume,
+				Retention: retention, StorageArgs: storageArgs,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			item := resp.GetVolume()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"initialized %s @ %s (jfs=%s retention=%s)\n",
+				item.GetName(), item.GetFuseMount(),
+				item.GetJfsMount(), item.GetRetention())
+			return nil
+		},
 	}
-	c.Flags().String("volume", "default", "JuiceFS 卷名")
-	c.Flags().String("storage", "file", "juicefs 存储后端 (透传)")
-	c.Flags().String("bucket", "", "juicefs bucket URL/路径 (透传)")
-	c.Flags().String("access-key", "", "云对象存储 access key (透传)")
-	c.Flags().String("secret-key", "", "云对象存储 secret key (透传)")
-	c.Flags().String("retention", "compact", "保留策略: verbose|compact|archive")
-	c.Flags().String("data-dir", "", "file 后端本地数据目录")
+	c.Flags().StringVar(&volume, "volume", "default", "JuiceFS 卷名")
+	c.Flags().StringVar(&storage, "storage", "file", "juicefs 存储后端 (透传)")
+	c.Flags().StringVar(&bucket, "bucket", "", "juicefs bucket URL/路径 (透传)")
+	c.Flags().StringVar(&accessKey, "access-key", "", "云对象存储 access key (透传)")
+	c.Flags().StringVar(&secretKey, "secret-key", "", "云对象存储 secret key (透传)")
+	c.Flags().StringVar(&retention, "retention", "compact", "保留策略: verbose|compact|archive")
+	c.Flags().StringVar(&dataDir, "data-dir", "", "file 后端本地数据目录")
 	return c
 }
 
@@ -160,12 +221,32 @@ func newRecoverCmd() *cobra.Command {
 }
 
 func newMountCmd() *cobra.Command {
-	return &cobra.Command{
+	var volume string
+	c := &cobra.Command{
 		Use:   "mount <path>",
 		Short: "已格式化的卷单独恢复 FUSE 挂载",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.Mount(ctx,
+				&pb.MountRequest{Path: args[0], Volume: volume})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			item := resp.GetVolume()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"mounted %s @ %s\n", item.GetName(), item.GetFuseMount())
+			return nil
+		},
 	}
+	c.Flags().StringVar(&volume, "volume", "", "卷名(默认按 path 匹配)")
+	return c
 }
 
 func newUmountCmd() *cobra.Command {
@@ -173,7 +254,21 @@ func newUmountCmd() *cobra.Command {
 		Use:   "umount <path>",
 		Short: "卸载 FUSE",
 		Args:  cobra.ExactArgs(1),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			if _, err := client.rpc.Umount(ctx,
+				&pb.UmountRequest{Path: args[0]}); err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "unmounted %s\n", args[0])
+			return nil
+		},
 	}
 }
 
@@ -216,8 +311,30 @@ func newConfigCmd() *cobra.Command {
 	set := &cobra.Command{
 		Use:   "set <key> <value>",
 		Short: "设置配置,例如: pitr config set retention compact --window 30d",
-		Args:  cobra.MinimumNArgs(2),
-		RunE:  func(cmd *cobra.Command, args []string) error { return errNotImpl },
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			window, _ := cmd.Flags().GetString("window")
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			resp, err := client.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
+				Key: args[0], Value: args[1], Window: window,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "set %s=%s",
+				resp.GetKey(), resp.GetValue())
+			if resp.GetWindow() != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), " window=%s", resp.GetWindow())
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout())
+			return nil
+		},
 	}
 	set.Flags().String("window", "", "archive 策略的保留窗口,如 30d")
 	c.AddCommand(set)

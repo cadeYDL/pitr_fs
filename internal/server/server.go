@@ -1,6 +1,9 @@
 package server
 
 import (
+	"context"
+	"sync"
+
 	"pitr_fs/internal/pg"
 	"pitr_fs/internal/revert"
 	"pitr_fs/internal/txn"
@@ -19,6 +22,8 @@ type Config struct {
 	JFSMounted    bool
 	FUSEMounted   bool
 	Volumes       []VolumeConfig
+	MountFunc     func(context.Context) error
+	UmountFunc    func(context.Context) error
 }
 
 // VolumeConfig 描述 recover/status 可管理的一个卷。每卷可以使用独立的
@@ -41,6 +46,9 @@ type Server struct {
 	rev     *revert.Engine
 	cfg     Config
 	volumes []VolumeConfig
+
+	lifecycleMu sync.Mutex
+	windows     map[string]string
 }
 
 func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
@@ -75,5 +83,6 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 		rev:     revert.NewEngine(db, revert.WithMountPath(cfg.FUSEMount)),
 		cfg:     cfg,
 		volumes: volumes,
+		windows: make(map[string]string),
 	}
 }

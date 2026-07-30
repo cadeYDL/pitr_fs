@@ -128,6 +128,8 @@ func setupServer(t *testing.T) *serverFixture {
 		Retention:     "compact",
 		JFSMounted:    true,
 		FUSEMounted:   true,
+		MountFunc:     func(context.Context) error { return nil },
+		UmountFunc:    func(context.Context) error { return nil },
 	}))
 	listener := bufconn.Listen(1024 * 1024)
 	go func() { _ = grpcServer.Serve(listener) }()
@@ -358,5 +360,68 @@ func TestServer_RecoverMultiVolume_OneFailureDoesNotHideSuccess(t *testing.T) {
 		response.GetVolumes()[1].GetError() == "" {
 		t.Fatalf("healthy=%+v missing=%+v",
 			response.GetVolumes()[0], response.GetVolumes()[1])
+	}
+}
+
+func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+
+	initialized, err := f.client.Init(ctx, &pb.InitRequest{
+		Path: "/workspace", Volume: "test-volume", Retention: "verbose",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initialized.GetVolume().GetFuseMounted() ||
+		initialized.GetVolume().GetRetention() != "verbose" {
+		t.Fatalf("init=%+v", initialized)
+	}
+	if _, err := f.client.Umount(ctx,
+		&pb.UmountRequest{Path: "/workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	statusResponse, err := f.client.Status(ctx, &pb.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statusResponse.GetVolumes()[0].GetFuseMounted() {
+		t.Fatal("umount 后 status 仍显示 mounted")
+	}
+	mounted, err := f.client.Mount(ctx, &pb.MountRequest{
+		Path: "/workspace", Volume: "test-volume",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mounted.GetVolume().GetFuseMounted() {
+		t.Fatalf("mount=%+v", mounted)
+	}
+	configured, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "retention", Value: "archive", Window: "30d",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.GetValue() != "archive" || configured.GetWindow() != "30d" {
+		t.Fatalf("config=%+v", configured)
+	}
+}
+
+func TestServer_UmountRejectsActiveTransaction(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	transaction, err := f.client.Begin(ctx,
+		&pb.BeginRequest{Path: "/workspace/proj"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client.Umount(ctx,
+		&pb.UmountRequest{Path: "/workspace"}); err == nil {
+		t.Fatal("存在 active transaction 时 umount 应失败")
+	}
+	if _, err := f.client.Rollback(ctx,
+		&pb.RollbackRequest{TxnId: transaction.GetTxnId()}); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "pitr_fs/api/pitrd/v1"
 )
@@ -126,6 +127,33 @@ func (fakePitrd) Recover(context.Context, *pb.RecoverRequest) (*pb.RecoverRespon
 	}}}, nil
 }
 
+func (fakePitrd) Init(context.Context, *pb.InitRequest) (*pb.InitResponse, error) {
+	return &pb.InitResponse{Volume: &pb.VolumeStatus{
+		Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
+		JfsMounted: true, FuseMounted: true, Retention: "compact",
+	}}, nil
+}
+
+func (fakePitrd) Mount(context.Context, *pb.MountRequest) (*pb.MountResponse, error) {
+	return &pb.MountResponse{Volume: &pb.VolumeStatus{
+		Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
+		JfsMounted: true, FuseMounted: true,
+	}}, nil
+}
+
+func (fakePitrd) Umount(context.Context, *pb.UmountRequest) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+
+func (fakePitrd) ConfigSet(
+	_ context.Context,
+	req *pb.ConfigSetRequest,
+) (*pb.ConfigSetResponse, error) {
+	return &pb.ConfigSetResponse{
+		Key: req.GetKey(), Value: req.GetValue(), Window: req.GetWindow(),
+	}, nil
+}
+
 func startFakePitrd(t *testing.T) string {
 	t.Helper()
 	socket := filepath.Join("/tmp",
@@ -172,6 +200,10 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "revert", "111111111111", "--path", "/workspace/proj"}, "reverted 9 history rows; new version fedcba654321"},
 		{[]string{"--socket", socket, "revert", "111111111111", "--dry-run"}, "dry-run: would apply 9 history rows"},
 		{[]string{"--socket", socket, "recover", "/workspace"}, "recovered default @ /workspace"},
+		{[]string{"--socket", socket, "init", "/workspace"}, "initialized default @ /workspace"},
+		{[]string{"--socket", socket, "umount", "/workspace"}, "unmounted /workspace"},
+		{[]string{"--socket", socket, "mount", "/workspace"}, "mounted default @ /workspace"},
+		{[]string{"--socket", socket, "config", "set", "retention", "archive", "--window", "30d"}, "set retention=archive window=30d"},
 	}
 	for _, tc := range cases {
 		got, err := executeCLI(t, tc.args...)

@@ -65,11 +65,14 @@ func (s *Server) Status(
 	if err != nil {
 		return nil, rpcError(err)
 	}
+	s.lifecycleMu.Lock()
+	volumes := s.volumeStatusesLocked()
+	s.lifecycleMu.Unlock()
 	return &pb.StatusResponse{
 		DaemonVersion:      s.cfg.DaemonVersion,
 		PostgresHealthy:    true,
 		ActiveTransactions: active,
-		Volumes:            s.volumeStatuses(),
+		Volumes:            volumes,
 	}, nil
 }
 
