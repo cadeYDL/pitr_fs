@@ -77,7 +77,9 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 	}
 	script := string(content)
 	for _, required := range []string{
-		"docker_args=(exec)",
+		`host_workspace=$quoted_workspace`,
+		`container_workdir="/workspace/\${PWD#"\$host_workspace"/}"`,
+		`docker_args=(exec --workdir "\$container_workdir")`,
 		`if [ -t 0 ] && [ -t 1 ]; then`,
 		"docker_args+=(-it)",
 		`exec docker "\${docker_args[@]}" "$CONTAINER" pitr "\$@"`,
@@ -88,6 +90,70 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 	}
 	if strings.Contains(script, `exec docker exec -it "$CONTAINER"`) {
 		t.Error("install.sh wrapper 仍无条件强制 docker exec -it")
+	}
+}
+
+func TestInstall_WrapperMapsHostCWD(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\ncase \"${1:-install}\" in\n")
+	index := bytes.Index(content, marker)
+	if index < 0 {
+		t.Fatal("install.sh 未找到主命令 case")
+	}
+	temp := t.TempDir()
+	functions := filepath.Join(temp, "install-functions.sh")
+	if err := os.WriteFile(functions, content[:index], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(temp, "workspace with space")
+	subdir := filepath.Join(workspace, "project")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(temp, "pitr")
+	generate := exec.Command("bash", "-c", `source "$1"; install_wrapper`, "bash", functions)
+	generate.Env = append(os.Environ(),
+		"PITR_WORKSPACE="+workspace,
+		"PITR_BIN="+wrapper,
+		"PITR_CONTAINER=test-container",
+	)
+	if output, err := generate.CombinedOutput(); err != nil {
+		t.Fatalf("生成 wrapper: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("bash", "-n", wrapper).CombinedOutput(); err != nil {
+		t.Fatalf("生成的 wrapper 语法错误: %v\n%s", err, output)
+	}
+
+	bin := filepath.Join(temp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeDocker := filepath.Join(bin, "docker")
+	if err := os.WriteFile(fakeDocker,
+		[]byte("#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(wrapper, "begin", ".")
+	command.Dir = subdir
+	command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("运行 wrapper: %v\n%s", err, output)
+	}
+	for _, expected := range []string{
+		"<exec>", "<--workdir>", "</workspace/project>",
+		"<test-container>", "<pitr>", "<begin>", "<.>",
+	} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Errorf("wrapper 输出缺少 %q:\n%s", expected, output)
+		}
+	}
+	if bytes.Contains(output, []byte("<-it>")) {
+		t.Errorf("非 TTY wrapper 不应传 -it:\n%s", output)
 	}
 }
 

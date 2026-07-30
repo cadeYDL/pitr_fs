@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +16,17 @@ import (
 )
 
 var ErrTxnClosed = errors.New("transaction 已结束")
+
+func resolvePath(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("解析路径 %q: %w", value, err)
+	}
+	return filepath.Clean(absolute), nil
+}
 
 type Client struct {
 	conn *grpc.ClientConn
@@ -83,15 +95,19 @@ func (c *Client) Begin(
 	if c == nil || c.rpc == nil {
 		return nil, errors.New("pitr client 未连接")
 	}
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return nil, err
+	}
 	config := beginOptions{}
 	for _, option := range options {
 		option(&config)
 	}
 	response, err := c.rpc.Begin(ctx, &pb.BeginRequest{
-		Path: path, Message: config.message,
+		Path: resolved, Message: config.message,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("begin %s: %w", path, err)
+		return nil, fmt.Errorf("begin %s: %w", resolved, err)
 	}
 	value := transactionFromPB(response.GetTransaction())
 	return &Txn{
@@ -150,11 +166,15 @@ func (c *Client) Logs(
 	path string,
 	limit int,
 ) ([]LogEntry, error) {
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return nil, err
+	}
 	response, err := c.rpc.Logs(ctx, &pb.LogsRequest{
-		Path: path, Limit: int32(limit),
+		Path: resolved, Limit: int32(limit),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("logs %s: %w", path, err)
+		return nil, fmt.Errorf("logs %s: %w", resolved, err)
 	}
 	result := make([]LogEntry, 0, len(response.GetEntries()))
 	for _, entry := range response.GetEntries() {
@@ -198,9 +218,13 @@ func (c *Client) Revert(
 	for _, option := range options {
 		option(&config)
 	}
+	resolved, err := resolvePath(config.path)
+	if err != nil {
+		return RevertResult{}, err
+	}
 	response, err := c.rpc.Revert(ctx, &pb.RevertRequest{
 		VersionHash: versionHash,
-		Path:        config.path,
+		Path:        resolved,
 		DryRun:      config.dryRun,
 	})
 	if err != nil {
@@ -222,8 +246,12 @@ func (c *Client) Diff(
 	ctx context.Context,
 	versionA, versionB, path string,
 ) (DiffStats, error) {
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return DiffStats{}, err
+	}
 	response, err := c.rpc.Diff(ctx, &pb.DiffRequest{
-		VersionA: versionA, VersionB: versionB, Path: path,
+		VersionA: versionA, VersionB: versionB, Path: resolved,
 	})
 	if err != nil {
 		return DiffStats{}, fmt.Errorf("diff %s..%s: %w", versionA, versionB, err)
@@ -258,9 +286,13 @@ func volumeFromPB(value *pb.VolumeStatus) Volume {
 }
 
 func (c *Client) Recover(ctx context.Context, path string) ([]Volume, error) {
-	response, err := c.rpc.Recover(ctx, &pb.RecoverRequest{Path: path})
+	resolved, err := resolvePath(path)
 	if err != nil {
-		return nil, fmt.Errorf("recover %s: %w", path, err)
+		return nil, err
+	}
+	response, err := c.rpc.Recover(ctx, &pb.RecoverRequest{Path: resolved})
+	if err != nil {
+		return nil, fmt.Errorf("recover %s: %w", resolved, err)
 	}
 	result := make([]Volume, 0, len(response.GetVolumes()))
 	for _, volume := range response.GetVolumes() {

@@ -149,6 +149,26 @@ func TestGoSDK_BeginCommitRollbackAndClosedState(t *testing.T) {
 	}
 }
 
+func TestGoSDK_BeginResolvesRelativePath(t *testing.T) {
+	working := t.TempDir()
+	t.Chdir(working)
+	client, err := Dial(startUnixServer(t, &fakeServer{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	transaction, err := client.Begin(context.Background(), "project/../project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(working, "project"); transaction.Path() != want {
+		t.Fatalf("path=%q want=%q", transaction.Path(), want)
+	}
+	if global, err := resolvePath(""); err != nil || global != "" {
+		t.Fatalf("空 path 应保留全局语义，got=%q err=%v", global, err)
+	}
+}
+
 func TestGoSDK_LogsDiffRevert(t *testing.T) {
 	client, err := Dial(startUnixServer(t, &fakeServer{}))
 	if err != nil {

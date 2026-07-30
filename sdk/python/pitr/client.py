@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
@@ -11,6 +12,13 @@ import grpc
 
 from .pb import pitrd_pb2 as pb
 from .pb import pitrd_pb2_grpc as rpc
+
+
+def _resolve_path(path: str) -> str:
+    """按客户端当前工作目录解析路径；空值继续表示全局范围。"""
+    if not path:
+        return ""
+    return os.path.abspath(path)
 
 
 @dataclass(frozen=True)
@@ -118,8 +126,9 @@ class Client:
         message: str = "",
         timeout: float | None = None,
     ) -> Transaction:
+        resolved = _resolve_path(path)
         response = self._stub.Begin(
-            pb.BeginRequest(path=path, message=message),
+            pb.BeginRequest(path=resolved, message=message),
             timeout=timeout,
         )
         value = response.transaction
@@ -155,8 +164,9 @@ class Client:
         limit: int = 20,
         timeout: float | None = None,
     ) -> Iterator[LogEntry]:
+        resolved = _resolve_path(path)
         response = self._stub.Logs(
-            pb.LogsRequest(path=path, limit=limit),
+            pb.LogsRequest(path=resolved, limit=limit),
             timeout=timeout,
         )
         for entry in response.entries:
@@ -178,10 +188,11 @@ class Client:
         dry_run: bool = False,
         timeout: float | None = None,
     ) -> RevertResult:
+        resolved = _resolve_path(path)
         response = self._stub.Revert(
             pb.RevertRequest(
                 version_hash=version_hash,
-                path=path,
+                path=resolved,
                 dry_run=dry_run,
             ),
             timeout=timeout,
@@ -196,11 +207,12 @@ class Client:
         path: str = "",
         timeout: float | None = None,
     ) -> DiffStats:
+        resolved = _resolve_path(path)
         response = self._stub.Diff(
             pb.DiffRequest(
                 version_a=version_a,
                 version_b=version_b,
-                path=path,
+                path=resolved,
             ),
             timeout=timeout,
         )
@@ -215,8 +227,9 @@ class Client:
         path: str = "",
         timeout: float | None = None,
     ) -> list[Volume]:
+        resolved = _resolve_path(path)
         response = self._stub.Recover(
-            pb.RecoverRequest(path=path),
+            pb.RecoverRequest(path=resolved),
             timeout=timeout,
         )
         return [

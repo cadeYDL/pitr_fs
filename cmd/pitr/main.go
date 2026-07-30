@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -46,6 +47,19 @@ func (c *daemonClient) close() {
 
 func rpcContext(cmd *cobra.Command) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(cmd.Context(), rpcTimeout)
+}
+
+// resolveCLIPath 把用户路径按 pitr 进程的工作目录转成 daemon 使用的绝对
+// scope。空值表示 diff/revert/recover 的全局范围，必须原样保留。
+func resolveCLIPath(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("解析路径 %q: %w", value, err)
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func friendlyRPCError(cmd *cobra.Command, err error) error {
@@ -141,6 +155,10 @@ func newInitCmd() *cobra.Command {
 		Short: "幂等校准已部署卷并恢复 FUSE 挂载",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -158,7 +176,7 @@ func newInitCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Init(ctx, &pb.InitRequest{
-				Path: args[0], Volume: volume,
+				Path: resolved, Volume: volume,
 				Retention: retention, StorageArgs: storageArgs,
 			})
 			if err != nil {
@@ -188,15 +206,19 @@ func newRecoverCmd() *cobra.Command {
 		Short: "数据仍在,重新拉起 daemon + 挂载",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			var requested string
+			var err error
+			if len(args) == 1 {
+				requested, err = resolveCLIPath(args[0])
+				if err != nil {
+					return err
+				}
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
 			}
 			defer client.close()
-			var requested string
-			if len(args) == 1 {
-				requested = args[0]
-			}
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Recover(ctx,
@@ -227,6 +249,10 @@ func newMountCmd() *cobra.Command {
 		Short: "已格式化的卷单独恢复 FUSE 挂载",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -235,7 +261,7 @@ func newMountCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Mount(ctx,
-				&pb.MountRequest{Path: args[0], Volume: volume})
+				&pb.MountRequest{Path: resolved, Volume: volume})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
@@ -255,6 +281,10 @@ func newUmountCmd() *cobra.Command {
 		Short: "卸载 FUSE",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -263,10 +293,10 @@ func newUmountCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			if _, err := client.rpc.Umount(ctx,
-				&pb.UmountRequest{Path: args[0]}); err != nil {
+				&pb.UmountRequest{Path: resolved}); err != nil {
 				return friendlyRPCError(cmd, err)
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "unmounted %s\n", args[0])
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "unmounted %s\n", resolved)
 			return nil
 		},
 	}
@@ -350,6 +380,10 @@ func newBeginCmd() *cobra.Command {
 		Short: "在 <path> 上开一个 active 事务",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -358,7 +392,7 @@ func newBeginCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Begin(ctx, &pb.BeginRequest{
-				Path: args[0], Message: message,
+				Path: resolved, Message: message,
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
@@ -380,6 +414,10 @@ func newCommitCmd() *cobra.Command {
 		Short: "提交 <path> 上的 active 事务(触发坍缩)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -388,7 +426,7 @@ func newCommitCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Commit(ctx, &pb.CommitRequest{
-				Path: args[0], Message: message,
+				Path: resolved, Message: message,
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
@@ -409,6 +447,10 @@ func newRollbackCmd() *cobra.Command {
 		Short: "回滚 <path> 上的 active 事务",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -417,7 +459,7 @@ func newRollbackCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Rollback(ctx,
-				&pb.RollbackRequest{Path: args[0]})
+				&pb.RollbackRequest{Path: resolved})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
@@ -436,6 +478,10 @@ func newLogsCmd() *cobra.Command {
 		Short: "查看 <path> 的版本历史",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(args[0])
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -444,7 +490,7 @@ func newLogsCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Logs(ctx, &pb.LogsRequest{
-				Path: args[0], Limit: int32(limit),
+				Path: resolved, Limit: int32(limit),
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
@@ -474,6 +520,10 @@ func newDiffCmd() *cobra.Command {
 		Short: "对比两个版本",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(scope)
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -484,7 +534,7 @@ func newDiffCmd() *cobra.Command {
 			resp, err := client.rpc.Diff(ctx, &pb.DiffRequest{
 				VersionA: args[0],
 				VersionB: args[1],
-				Path:     scope,
+				Path:     resolved,
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
@@ -507,6 +557,10 @@ func newRevertCmd() *cobra.Command {
 		Short: "回退到指定版本",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolved, err := resolveCLIPath(scope)
+			if err != nil {
+				return err
+			}
 			client, err := dialDaemon(cmd)
 			if err != nil {
 				return err
@@ -516,7 +570,7 @@ func newRevertCmd() *cobra.Command {
 			defer cancel()
 			resp, err := client.rpc.Revert(ctx, &pb.RevertRequest{
 				VersionHash: args[0],
-				Path:        scope,
+				Path:        resolved,
 				DryRun:      dryRun,
 			})
 			if err != nil {

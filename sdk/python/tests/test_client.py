@@ -80,6 +80,14 @@ def test_client_connect(pitrd):
         assert transaction.path == "/workspace/proj"
 
 
+def test_begin_resolves_relative_path(pitrd, tmp_path: Path, monkeypatch):
+    socket, _ = pitrd
+    monkeypatch.chdir(tmp_path)
+    with Client(socket) as client:
+        transaction = client.begin("project/../project")
+    assert transaction.path == str(tmp_path / "project")
+
+
 def test_with_transaction_commits_on_success(pitrd):
     socket, implementation = pitrd
     with Client(socket) as client:

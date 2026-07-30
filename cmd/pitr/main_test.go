@@ -93,8 +93,13 @@ func (fakePitrd) Status(context.Context, *pb.StatusRequest) (*pb.StatusResponse,
 	}, nil
 }
 
-func (fakePitrd) Begin(context.Context, *pb.BeginRequest) (*pb.BeginResponse, error) {
-	return &pb.BeginResponse{Transaction: fakeTxn("active", "begin", "edit")}, nil
+func (fakePitrd) Begin(
+	_ context.Context,
+	request *pb.BeginRequest,
+) (*pb.BeginResponse, error) {
+	transaction := fakeTxn("active", "begin", "edit")
+	transaction.ScopePath = request.GetPath()
+	return &pb.BeginResponse{Transaction: transaction}, nil
 }
 
 func (fakePitrd) Commit(context.Context, *pb.CommitRequest) (*pb.CommitResponse, error) {
@@ -213,6 +218,24 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		if !strings.Contains(got, tc.want) {
 			t.Fatalf("%v 输出不包含 %q:\n%s", tc.args, tc.want, got)
 		}
+	}
+}
+
+func TestCLI_BeginResolvesRelativePath(t *testing.T) {
+	working := t.TempDir()
+	t.Chdir(working)
+	socket := startFakePitrd(t)
+	got, err := executeCLI(t,
+		"--socket", socket, "begin", "project/../project", "-m", "relative")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(working, "project")
+	if !strings.Contains(got, "@ "+want) {
+		t.Fatalf("相对路径未按 cwd 解析，want=%q output=%q", want, got)
+	}
+	if global, err := resolveCLIPath(""); err != nil || global != "" {
+		t.Fatalf("空 path 应保留全局语义，got=%q err=%v", global, err)
 	}
 }
 

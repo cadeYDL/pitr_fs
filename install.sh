@@ -60,12 +60,22 @@ wait_ready() {
 }
 
 install_wrapper() {
-    local sudo; sudo=$(sudo_if_needed "$BIN_LINK")
+    local sudo quoted_workspace
+    sudo=$(sudo_if_needed "$BIN_LINK")
+    printf -v quoted_workspace '%q' "$WORKSPACE"
     $sudo tee "$BIN_LINK" >/dev/null <<EOF2
 #!/usr/bin/env bash
 # pitr 宿主机 wrapper, 转发到容器内 CLI
 set -euo pipefail
-docker_args=(exec)
+host_workspace=$quoted_workspace
+container_workdir=/workspace
+case "\$PWD" in
+    "\$host_workspace") ;;
+    "\$host_workspace"/*)
+        container_workdir="/workspace/\${PWD#"\$host_workspace"/}"
+        ;;
+esac
+docker_args=(exec --workdir "\$container_workdir")
 if [ -t 0 ] && [ -t 1 ]; then
     docker_args+=(-it)
 fi
@@ -115,10 +125,11 @@ do_install() {
 
   快速试用:
     mkdir -p $WORKSPACE/demo
-    pitr begin  /workspace/demo -m 'try'
+    cd $WORKSPACE/demo
+    pitr begin  . -m 'try'
     echo hi > $WORKSPACE/demo/a.txt
-    pitr logs   /workspace/demo -n 5
-    pitr commit /workspace/demo -m 'done'
+    pitr logs   . -n 5
+    pitr commit . -m 'done'
 EOF
 }
 
