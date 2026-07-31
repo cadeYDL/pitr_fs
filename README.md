@@ -39,8 +39,8 @@ cd pitr-fs
 ```
 
 依赖脚本支持使用 `apt`、`dnf`、`yum`、`pacman` 或 `zypper` 的常见 Linux
-发行版，会安装 Docker、FUSE3、util-linux、CA 证书、curl 和 git，并尽力
-启动 Docker。最小宿主机要求是可用的 `/dev/fuse`、Docker daemon 和支持
+发行版，会安装 Docker、FUSE3、util-linux、CA 证书、curl、git、Python 3
+和 awk，并尽力启动 Docker。最小宿主机要求是可用的 `/dev/fuse`、Docker daemon 和支持
 shared bind propagation 的 Linux 内核。
 
 ### 2. 安装服务

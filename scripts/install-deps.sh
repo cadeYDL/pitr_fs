@@ -20,7 +20,7 @@ run_root() {
 
 check_dependencies() {
     local failed=0 command_name
-    for command_name in docker fusermount3 findmnt realpath curl git; do
+    for command_name in docker fusermount3 findmnt mountpoint realpath curl git python3 awk; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             echo "缺少: $command_name" >&2
             failed=1
@@ -49,17 +49,17 @@ fi
 
 if command -v apt-get >/dev/null 2>&1; then
     run_root apt-get update
-    run_root apt-get install -y docker.io fuse3 util-linux ca-certificates curl git
+    run_root apt-get install -y docker.io fuse3 util-linux ca-certificates curl git python3 gawk
 elif command -v dnf >/dev/null 2>&1; then
-    run_root dnf install -y docker fuse3 util-linux ca-certificates curl git
+    run_root dnf install -y docker fuse3 util-linux ca-certificates curl git python3 gawk
 elif command -v yum >/dev/null 2>&1; then
-    run_root yum install -y docker fuse3 util-linux ca-certificates curl git
+    run_root yum install -y docker fuse3 util-linux ca-certificates curl git python3 gawk
 elif command -v pacman >/dev/null 2>&1; then
-    run_root pacman -Sy --needed --noconfirm docker fuse3 util-linux ca-certificates curl git
+    run_root pacman -Sy --needed --noconfirm docker fuse3 util-linux ca-certificates curl git python gawk
 elif command -v zypper >/dev/null 2>&1; then
-    run_root zypper --non-interactive install docker fuse3 util-linux ca-certificates curl git
+    run_root zypper --non-interactive install docker fuse3 util-linux ca-certificates curl git python3 gawk
 else
-    echo "错误: 不支持当前 Linux 发行版的包管理器，请手动安装 Docker、FUSE3、util-linux、curl、git" >&2
+    echo "错误: 不支持当前 Linux 发行版的包管理器，请手动安装 Docker、FUSE3、util-linux、curl、git、Python 3 和 awk" >&2
     exit 1
 fi
 

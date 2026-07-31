@@ -5,7 +5,8 @@
 ## 验收范围
 
 - 服务端和安装脚本仅允许在 Linux 运行。
-- 一键依赖脚本覆盖 Docker、FUSE3、util-linux、CA 证书、curl 和 git。
+- 一键依赖脚本覆盖 Docker、FUSE3、util-linux、CA 证书、curl、git、
+  Python 3 和 awk。
 - `install.sh install` 启动服务但不自动占用用户目录。
 - `pitr init <path>` 支持绝对路径与相对路径，动态创建 FUSE 挂载。
 - 挂载路径和 retention 在 PostgreSQL 中持久化，服务重启后自动恢复。
