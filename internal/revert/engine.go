@@ -8,6 +8,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,7 +25,27 @@ func ValidVersionHash(value string) bool {
 
 type Engine struct {
 	db        *pg.DB
+	mountMu   sync.RWMutex
 	mountPath string
+}
+
+// SetMountPath 在 init 选定用户挂载点后更新目录级 revert 的路径基准。
+func (e *Engine) SetMountPath(value string) {
+	if e == nil {
+		return
+	}
+	e.mountMu.Lock()
+	defer e.mountMu.Unlock()
+	e.mountPath = ""
+	if value != "" {
+		e.mountPath = path.Clean(value)
+	}
+}
+
+func (e *Engine) getMountPath() string {
+	e.mountMu.RLock()
+	defer e.mountMu.RUnlock()
+	return e.mountPath
 }
 
 const (
@@ -251,10 +272,11 @@ func (e *Engine) resolveScopeInodes(
 	targetID int64,
 	scope string,
 ) ([]int64, error) {
-	if e.mountPath == "" {
+	mountPath := e.getMountPath()
+	if mountPath == "" {
 		return nil, nil
 	}
-	relative, ok := strings.CutPrefix(path.Clean(scope), e.mountPath)
+	relative, ok := strings.CutPrefix(path.Clean(scope), mountPath)
 	if !ok || (relative != "" && !strings.HasPrefix(relative, "/")) {
 		return []int64{}, nil
 	}

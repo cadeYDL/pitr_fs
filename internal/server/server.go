@@ -18,11 +18,12 @@ type Config struct {
 	Volume        string
 	JFSMount      string
 	FUSEMount     string
+	MountRoot     string
 	Retention     string
 	JFSMounted    bool
 	FUSEMounted   bool
 	Volumes       []VolumeConfig
-	MountFunc     func(context.Context) error
+	MountFunc     func(context.Context, string) error
 	UmountFunc    func(context.Context) error
 }
 
@@ -60,6 +61,9 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 	}
 	if cfg.Retention == "" {
 		cfg.Retention = "compact"
+	}
+	if cfg.MountRoot == "" {
+		cfg.MountRoot = "/"
 	}
 	volumes := cfg.Volumes
 	if len(volumes) == 0 {

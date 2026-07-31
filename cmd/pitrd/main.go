@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -30,7 +31,7 @@ var (
 	flagPGDSN     string
 	flagVolume    string
 	flagJFSMount  string
-	flagFUSEMount string
+	flagMountRoot string
 	flagSocket    string
 	flagRetention string
 	flagLogLevel  string
@@ -50,7 +51,7 @@ gRPC 控制面 unix socket。`,
 	root.Flags().StringVar(&flagPGDSN, "pg-dsn", "", "PostgreSQL DSN(必填,可用 $PITR_PG_DSN)")
 	root.Flags().StringVar(&flagVolume, "volume", "default", "JuiceFS 卷名")
 	root.Flags().StringVar(&flagJFSMount, "jfs-mount", "/var/lib/pitr/jfs", "JuiceFS 底层挂载目录")
-	root.Flags().StringVar(&flagFUSEMount, "fuse-mount", "/workspace", "FUSE loopback 对用户暴露的挂载点")
+	root.Flags().StringVar(&flagMountRoot, "mount-root", "/pitr", "允许 init 使用的宿主机挂载根目录")
 	root.Flags().StringVar(&flagSocket, "socket", "/var/run/pitrd.sock", "pitrd unix 控制 socket")
 	root.Flags().StringVar(&flagRetention, "retention", "compact", "保留策略")
 	root.Flags().StringVar(&flagLogLevel, "log-level", "info", "日志级别:debug|info|warn|error")
@@ -63,6 +64,13 @@ gRPC 控制面 unix socket。`,
 }
 
 func runDaemon(cmd *cobra.Command, _ []string) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("pitrd 仅支持 Linux，当前系统为 %s", runtime.GOOS)
+	}
+	flagMountRoot = filepath.Clean(flagMountRoot)
+	if !filepath.IsAbs(flagMountRoot) || flagMountRoot == "/" {
+		return errors.New("--mount-root 必须是非根目录的绝对路径")
+	}
 	dsn := flagPGDSN
 	if dsn == "" {
 		dsn = os.Getenv("PITR_PG_DSN")
@@ -101,20 +109,54 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	} else if closed != 0 {
 		slog.Warn("closed dangling auto windows", "count", closed)
 	}
-	fuseProxy, err := proxy.NewLoopback(
-		flagJFSMount,
-		flagFUSEMount,
-		proxy.WithManager(mgr),
-		proxy.WithAllowOther(true),
-	)
+	persisted, err := mgr.LoadVolumeMountConfig(cmd.Context(), flagVolume)
 	if err != nil {
-		return fmt.Errorf("初始化 FUSE 代理: %w", err)
+		return err
 	}
-	if err := fuseProxy.Start(); err != nil {
-		return fmt.Errorf("挂载 FUSE 代理: %w", err)
+	var fuseProxy *proxy.Loopback
+	mountProxy := func(_ context.Context, mountPath string) error {
+		if fuseProxy != nil {
+			if fuseProxy.Mount != filepath.Clean(mountPath) {
+				return fmt.Errorf("FUSE 已配置到 %s", fuseProxy.Mount)
+			}
+			return fuseProxy.Start()
+		}
+		created, createErr := proxy.NewLoopback(
+			flagJFSMount,
+			mountPath,
+			proxy.WithManager(mgr),
+			proxy.WithAllowOther(true),
+		)
+		if createErr != nil {
+			return createErr
+		}
+		if startErr := created.Start(); startErr != nil {
+			return startErr
+		}
+		fuseProxy = created
+		return nil
+	}
+	umountProxy := func(context.Context) error {
+		if fuseProxy == nil {
+			return nil
+		}
+		return fuseProxy.Unmount()
+	}
+	fuseMount := ""
+	retention := flagRetention
+	if persisted != nil {
+		fuseMount = persisted.FUSEMount
+		retention = persisted.Retention
+		if !pathInsideMountRoot(fuseMount, flagMountRoot) {
+			return fmt.Errorf("持久化挂载点 %q 不在 mount root %q 下",
+				fuseMount, flagMountRoot)
+		}
+		if err := mountProxy(cmd.Context(), fuseMount); err != nil {
+			return fmt.Errorf("恢复 FUSE 代理: %w", err)
+		}
 	}
 	defer func() {
-		if err := fuseProxy.Unmount(); err != nil {
+		if err := umountProxy(context.Background()); err != nil {
 			slog.Error("stop FUSE proxy", "error", err)
 		}
 	}()
@@ -122,16 +164,13 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	handler := pitrserver.New(db, mgr, pitrserver.Config{
 		Volume:      flagVolume,
 		JFSMount:    flagJFSMount,
-		FUSEMount:   flagFUSEMount,
-		Retention:   flagRetention,
+		FUSEMount:   fuseMount,
+		MountRoot:   flagMountRoot,
+		Retention:   retention,
 		JFSMounted:  true,
-		FUSEMounted: true,
-		MountFunc: func(context.Context) error {
-			return fuseProxy.Start()
-		},
-		UmountFunc: func(context.Context) error {
-			return fuseProxy.Unmount()
-		},
+		FUSEMounted: fuseProxy != nil && fuseProxy.Mounted(),
+		MountFunc:   mountProxy,
+		UmountFunc:  umountProxy,
 	})
 	grpcServer := grpc.NewServer()
 	pb.RegisterPitrdServer(grpcServer, handler)
@@ -141,9 +180,19 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		"socket", flagSocket,
 		"volume", flagVolume,
 		"jfs_mount", flagJFSMount,
-		"fuse_mount", flagFUSEMount,
+		"mount_root", flagMountRoot,
+		"fuse_mount", fuseMount,
 	)
 	return serveSocket(cmd.Context(), flagSocket, grpcServer)
+}
+
+func pathInsideMountRoot(candidate, root string) bool {
+	candidate = filepath.Clean(candidate)
+	root = filepath.Clean(root)
+	if !filepath.IsAbs(candidate) || !filepath.IsAbs(root) || root == "/" {
+		return false
+	}
+	return candidate != root && strings.HasPrefix(candidate, root+string(os.PathSeparator))
 }
 
 func configureLogging(level string) error {

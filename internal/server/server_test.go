@@ -127,10 +127,11 @@ func setupServer(t *testing.T) *serverFixture {
 		Volume:        "test-volume",
 		JFSMount:      "/jfs",
 		FUSEMount:     "/workspace",
+		MountRoot:     "/",
 		Retention:     "compact",
 		JFSMounted:    true,
 		FUSEMounted:   true,
-		MountFunc:     func(context.Context) error { return nil },
+		MountFunc:     func(context.Context, string) error { return nil },
 		UmountFunc:    func(context.Context) error { return nil },
 	}))
 	listener := bufconn.Listen(1024 * 1024)
@@ -472,6 +473,65 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	}
 	if got := statusResponse.GetVolumes()[0].GetHistoryLimit(); got != 7 {
 		t.Fatalf("persisted history limit=%d", got)
+	}
+}
+
+func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	var mounted []string
+	handler := New(f.db, f.mgr, Config{
+		Volume:     "dynamic-volume",
+		JFSMount:   "/jfs",
+		MountRoot:  "/pitr",
+		Retention:  "compact",
+		JFSMounted: true,
+		MountFunc: func(_ context.Context, mountPath string) error {
+			mounted = append(mounted, mountPath)
+			return nil
+		},
+		UmountFunc: func(context.Context) error { return nil },
+	})
+	for _, invalid := range []string{"relative", "/pitr", "/other/data"} {
+		if _, err := handler.Init(ctx, &pb.InitRequest{
+			Path: invalid, Volume: "dynamic-volume",
+		}); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("init(%q) code=%s err=%v", invalid, status.Code(err), err)
+		}
+	}
+	initialized, err := handler.Init(ctx, &pb.InitRequest{
+		Path: "/pitr/data", Volume: "dynamic-volume", Retention: "verbose",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initialized.GetVolume().GetFuseMount() != "/pitr/data" ||
+		!initialized.GetVolume().GetFuseMounted() || len(mounted) != 1 ||
+		mounted[0] != "/pitr/data" {
+		t.Fatalf("init=%+v mounted=%v", initialized, mounted)
+	}
+	persisted, err := f.mgr.LoadVolumeMountConfig(ctx, "dynamic-volume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted == nil || persisted.FUSEMount != "/pitr/data" ||
+		persisted.Retention != "verbose" {
+		t.Fatalf("persisted=%+v", persisted)
+	}
+	if _, err := handler.Init(ctx, &pb.InitRequest{
+		Path: "/pitr/data", Volume: "dynamic-volume", Retention: "compact",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err = f.mgr.LoadVolumeMountConfig(ctx, "dynamic-volume")
+	if err != nil || persisted.Retention != "compact" || len(mounted) != 1 {
+		t.Fatalf("idempotent persisted=%+v mounted=%v err=%v",
+			persisted, mounted, err)
+	}
+	if _, err := handler.Init(ctx, &pb.InitRequest{
+		Path: "/pitr/other", Volume: "dynamic-volume",
+	}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("第二挂载路径 code=%s err=%v", status.Code(err), err)
 	}
 }
 

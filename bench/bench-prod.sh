@@ -7,7 +7,8 @@ CONTAINER="${PITR_CONTAINER:-pitrfs}"
 RESULTS="${PITR_PROD_RESULTS:-/tmp/pitr-prod-bench}"
 META_COUNT="${PITR_BENCH_META_COUNT:-2000}"
 IO_MIB="${PITR_BENCH_IO_MIB:-256}"
-SCOPE="/workspace/__pitr_prod_bench"
+MOUNT="${PITR_BENCH_MOUNT:-/pitr/data}"
+SCOPE="$MOUNT/__pitr_prod_bench"
 PLAIN="/var/lib/pitr/jfs/__pitr_prod_bench"
 PITR="$SCOPE"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +20,7 @@ esac
 docker inspect "$CONTAINER" >/dev/null 2>&1 ||
     { echo "生产容器 $CONTAINER 不存在" >&2; exit 1; }
 docker exec "$CONTAINER" sh -c \
-    'test -S /var/run/pitrd.sock && mountpoint -q /workspace' ||
+    'test -S /var/run/pitrd.sock && mountpoint -q "$1"' check "$MOUNT" ||
     { echo "pitrd 或生产 FUSE 未就绪" >&2; exit 1; }
 
 mkdir -p "$RESULTS"

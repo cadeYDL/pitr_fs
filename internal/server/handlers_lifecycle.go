@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "pitr_fs/api/pitrd/v1"
+	"pitr_fs/internal/txn"
 )
 
 func (s *Server) findVolumeLocked(requestedPath, requestedName string) (int, error) {
@@ -29,19 +31,68 @@ func (s *Server) findVolumeLocked(requestedPath, requestedName string) (int, err
 		"未找到卷 name=%q path=%q", requestedName, requestedPath)
 }
 
-func (s *Server) mountLocked(ctx context.Context, index int) error {
+func (s *Server) validateMountPath(requestedPath string) (string, error) {
+	if !path.IsAbs(requestedPath) {
+		return "", status.Error(codes.InvalidArgument, "path 必须是绝对路径")
+	}
+	cleaned := path.Clean(requestedPath)
+	root := path.Clean(s.cfg.MountRoot)
+	if root == "." || !path.IsAbs(root) {
+		return "", status.Error(codes.FailedPrecondition, "daemon mount root 配置无效")
+	}
+	inside := strings.HasPrefix(cleaned, root+"/")
+	if root == "/" {
+		inside = cleaned != "/"
+	}
+	if cleaned == root || !inside {
+		return "", status.Errorf(codes.InvalidArgument,
+			"挂载路径 %q 必须位于 %q 下且不能等于根目录", cleaned, root)
+	}
+	return cleaned, nil
+}
+
+func (s *Server) mountLocked(ctx context.Context, index int, requestedPath string) error {
 	volume := &s.volumes[index]
+	cleaned, err := s.validateMountPath(requestedPath)
+	if err != nil {
+		return err
+	}
+	if volume.FUSEMount != "" && path.Clean(volume.FUSEMount) != cleaned {
+		return status.Errorf(codes.FailedPrecondition,
+			"当前卷已初始化到 %q；当前版本仅支持一个挂载路径", volume.FUSEMount)
+	}
 	if volume.FUSEMounted {
+		if err := s.mgr.SaveVolumeMountConfig(ctx, txn.VolumeMountConfig{
+			VolumeName: volume.Name,
+			FUSEMount:  cleaned,
+			Retention:  volume.Retention,
+		}); err != nil {
+			return status.Error(codes.Internal,
+				fmt.Sprintf("持久化挂载配置: %v", err))
+		}
 		return nil
 	}
 	if s.cfg.MountFunc == nil {
 		return status.Error(codes.FailedPrecondition, "daemon 未配置动态 mount")
 	}
-	if err := s.cfg.MountFunc(ctx); err != nil {
+	if err := s.cfg.MountFunc(ctx, cleaned); err != nil {
 		return status.Errorf(codes.Internal, "挂载 FUSE: %v", err)
 	}
+	volume.FUSEMount = cleaned
 	volume.JFSMounted = true
 	volume.FUSEMounted = true
+	if err := s.mgr.SaveVolumeMountConfig(ctx, txn.VolumeMountConfig{
+		VolumeName: volume.Name,
+		FUSEMount:  cleaned,
+		Retention:  volume.Retention,
+	}); err != nil {
+		if s.cfg.UmountFunc != nil {
+			_ = s.cfg.UmountFunc(ctx)
+		}
+		volume.FUSEMounted = false
+		return status.Error(codes.Internal, fmt.Sprintf("持久化挂载配置: %v", err))
+	}
+	s.rev.SetMountPath(cleaned)
 	return nil
 }
 
@@ -62,15 +113,15 @@ func (s *Server) Init(
 	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
-	index, err := s.findVolumeLocked(req.GetPath(), req.GetVolume())
+	index, err := s.findVolumeLocked("", req.GetVolume())
 	if err != nil {
-		return nil, err
-	}
-	if err := s.mountLocked(ctx, index); err != nil {
 		return nil, err
 	}
 	if req.GetRetention() != "" {
 		s.volumes[index].Retention = req.GetRetention()
+	}
+	if err := s.mountLocked(ctx, index, req.GetPath()); err != nil {
+		return nil, err
 	}
 	if err := recoverVolume(ctx, s.volumes[index]); err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
@@ -91,7 +142,7 @@ func (s *Server) Mount(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.mountLocked(ctx, index); err != nil {
+	if err := s.mountLocked(ctx, index, req.GetPath()); err != nil {
 		return nil, err
 	}
 	return &pb.MountResponse{Volume: volumeStatusPB(s.volumes[index])}, nil

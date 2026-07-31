@@ -44,7 +44,7 @@ ENV POSTGRES_USER=pitr \
     POSTGRES_PASSWORD=pitr \
     POSTGRES_DB=pitr_fs \
     PITR_VOLUME=default \
-    PITR_MOUNT=/workspace \
+    PITR_MOUNT_ROOT=/pitr \
     PITR_SOCKET=/var/run/pitrd.sock \
     PITR_DATA_DIR=/data
 

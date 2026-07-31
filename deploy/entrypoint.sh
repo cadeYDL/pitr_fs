@@ -43,7 +43,7 @@ else
 fi
 
 # 5. 建目录
-mkdir -p "$(dirname "$PITR_SOCKET")" "$PITR_MOUNT" /var/lib/pitr/jfs
+mkdir -p "$(dirname "$PITR_SOCKET")" "$PITR_MOUNT_ROOT" /var/lib/pitr/jfs
 
 # 6. 启动 pitrd。entrypoint 保持为编排进程,确保容器停止时先让 gRPC 优雅退出,
 # 再关闭 PostgreSQL,避免下次启动触发 WAL crash recovery。
@@ -52,7 +52,7 @@ pitrd \
     --pg-dsn "$PG_DSN" \
     --volume "$PITR_VOLUME" \
     --jfs-mount /var/lib/pitr/jfs \
-    --fuse-mount "$PITR_MOUNT" \
+    --mount-root "$PITR_MOUNT_ROOT" \
     --socket   "$PITR_SOCKET" &
 PITRD_PID=$!
 

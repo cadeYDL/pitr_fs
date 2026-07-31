@@ -124,6 +124,15 @@ CREATE TABLE IF NOT EXISTS pitr_config (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
+-- 卷挂载配置。当前服务只管理一个全局卷；单独建表可让 daemon 在重启后
+-- 恢复由 `pitr init <path>` 选定的用户挂载点。
+CREATE TABLE IF NOT EXISTS pitr_volume_config (
+    volume_name    text PRIMARY KEY,
+    fuse_mount     text NOT NULL,
+    retention      text NOT NULL DEFAULT 'compact',
+    updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
 INSERT INTO pitr_config (scope_path, history_limit)
 VALUES ('/', 100)
 ON CONFLICT (scope_path) DO NOTHING;

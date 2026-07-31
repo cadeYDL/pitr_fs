@@ -147,8 +147,8 @@ func (s *Server) Recover(
 			requested != path.Clean(volume.FUSEMount) {
 			continue
 		}
-		if !volume.FUSEMounted && s.cfg.MountFunc != nil {
-			if err := s.mountLocked(ctx, index); err != nil {
+		if !volume.FUSEMounted && s.cfg.MountFunc != nil && volume.FUSEMount != "" {
+			if err := s.mountLocked(ctx, index, volume.FUSEMount); err != nil {
 				item := volumeStatusPB(volume)
 				item.Error = err.Error()
 				results = append(results, item)

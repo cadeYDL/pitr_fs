@@ -30,7 +30,9 @@ func repoRoot(t *testing.T) string {
 // TestScripts_BashSyntax — install.sh 与 entrypoint.sh 必须过 `bash -n`
 func TestScripts_BashSyntax(t *testing.T) {
 	root := repoRoot(t)
-	for _, rel := range []string{"install.sh", "deploy/entrypoint.sh"} {
+	for _, rel := range []string{
+		"install.sh", "scripts/install-deps.sh", "deploy/entrypoint.sh",
+	} {
 		p := filepath.Join(root, rel)
 		out, err := exec.Command("bash", "-n", p).CombinedOutput()
 		if err != nil {
@@ -77,12 +79,13 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 	}
 	script := string(content)
 	for _, required := range []string{
-		`host_workspace=$quoted_workspace`,
-		`container_workdir="/workspace/\${PWD#"\$host_workspace"/}"`,
+		`host_mount_root=$quoted_root`,
+		`pitr_args=("\$@")`,
+		`container_workdir="\$PWD"`,
 		`docker_args=(exec --workdir "\$container_workdir")`,
 		`if [ -t 0 ] && [ -t 1 ]; then`,
 		"docker_args+=(-it)",
-		`exec docker "\${docker_args[@]}" "$CONTAINER" pitr "\$@"`,
+		`exec docker "\${docker_args[@]}" "$CONTAINER" pitr "\${pitr_args[@]}"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh wrapper 缺少非 TTY 兼容片段 %q", required)
@@ -99,7 +102,7 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := []byte("\ncase \"${1:-install}\" in\n")
+	marker := []byte("\nACTION=\"${1:-install}\"\n")
 	index := bytes.Index(content, marker)
 	if index < 0 {
 		t.Fatal("install.sh 未找到主命令 case")
@@ -109,15 +112,15 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	if err := os.WriteFile(functions, content[:index], 0o600); err != nil {
 		t.Fatal(err)
 	}
-	workspace := filepath.Join(temp, "workspace with space")
-	subdir := filepath.Join(workspace, "project")
+	mountRoot := filepath.Join(temp, "mount root")
+	subdir := filepath.Join(mountRoot, "project")
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	wrapper := filepath.Join(temp, "pitr")
 	generate := exec.Command("bash", "-c", `source "$1"; install_wrapper`, "bash", functions)
 	generate.Env = append(os.Environ(),
-		"PITR_WORKSPACE="+workspace,
+		"PITR_MOUNT_ROOT="+mountRoot,
 		"PITR_BIN="+wrapper,
 		"PITR_CONTAINER=test-container",
 	)
@@ -145,7 +148,7 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 		t.Fatalf("运行 wrapper: %v\n%s", err, output)
 	}
 	for _, expected := range []string{
-		"<exec>", "<--workdir>", "</workspace/project>",
+		"<exec>", "<--workdir>", "<" + subdir + ">",
 		"<test-container>", "<pitr>", "<begin>", "<.>",
 	} {
 		if !bytes.Contains(output, []byte(expected)) {
@@ -154,6 +157,17 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	}
 	if bytes.Contains(output, []byte("<-it>")) {
 		t.Errorf("非 TTY wrapper 不应传 -it:\n%s", output)
+	}
+
+	command = exec.Command(wrapper, "init", ".")
+	command.Dir = subdir
+	command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	output, err = command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("运行 init wrapper: %v\n%s", err, output)
+	}
+	if !bytes.Contains(output, []byte("<"+subdir+">")) {
+		t.Fatalf("init 相对路径没有解析为宿主绝对路径:\n%s", output)
 	}
 }
 
@@ -207,13 +221,30 @@ func TestInstall_DetachesOnlyPitrFuseBeforeRecover(t *testing.T) {
 	script := string(content)
 	for _, required := range []string{
 		`for attempt in $(seq 1 8); do`,
-		`grep -qx "fuse.pitrfs"`,
-		`fusermount3 -uz "$WORKSPACE"`,
+		`findmnt -rn -t fuse.pitrfs -o TARGET`,
+		`fusermount3 -uz "$target"`,
 		`pitr FUSE 层超过安全清理上限 8`,
 		"detach_stale_fuse\n            docker start",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh 缺少安全的失联 FUSE 恢复片段 %q", required)
+		}
+	}
+}
+
+func TestInstall_IsLinuxOnlyAndUsesGenericMountRoot(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`[ "$(uname -s)" = "Linux" ]`,
+		`MOUNT_ROOT="${PITR_MOUNT_ROOT:-/pitr}"`,
+		`source=$MOUNT_ROOT,target=$MOUNT_ROOT,bind-propagation=rshared`,
+	} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("install.sh 缺少 Linux/动态挂载约束 %q", required)
 		}
 	}
 }

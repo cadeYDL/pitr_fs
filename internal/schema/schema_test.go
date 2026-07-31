@@ -226,7 +226,7 @@ func TestSQL_TablesExist(t *testing.T) {
 	for _, tbl := range []string{
 		"pitr_txn", "pitr_node_history", "pitr_edge_history",
 		"pitr_chunk_history", "pitr_chunk_ref_history", "pitr_blob_retention",
-		"pitr_config",
+		"pitr_config", "pitr_volume_config",
 	} {
 		n := mustScalarInt(t, conn,
 			"SELECT count(*) FROM information_schema.tables WHERE table_name = $1", tbl)

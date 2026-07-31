@@ -216,7 +216,7 @@ $(brew --prefix)/share/zsh/site-functions/_pitr。
 // ---------- 生命周期 ----------
 
 func newDaemonCmd() *cobra.Command {
-	var pgDSN, volume, jfsMount, fuseMount, retention, logLevel string
+	var pgDSN, volume, jfsMount, mountRoot, retention, logLevel string
 	c := &cobra.Command{
 		Use:   "daemon",
 		Short: "前台启动 pitrd(通常由 install/systemd 拉起)",
@@ -230,7 +230,7 @@ func newDaemonCmd() *cobra.Command {
 			arguments := []string{
 				"--volume", volume,
 				"--jfs-mount", jfsMount,
-				"--fuse-mount", fuseMount,
+				"--mount-root", mountRoot,
 				"--socket", socket,
 				"--retention", retention,
 				"--log-level", logLevel,
@@ -251,7 +251,7 @@ func newDaemonCmd() *cobra.Command {
 	c.Flags().StringVar(&pgDSN, "pg-dsn", "", "PostgreSQL DSN(可用 $PITR_PG_DSN)")
 	c.Flags().StringVar(&volume, "volume", "default", "JuiceFS 卷名")
 	c.Flags().StringVar(&jfsMount, "jfs-mount", "/var/lib/pitr/jfs", "底层 JuiceFS 挂载点")
-	c.Flags().StringVar(&fuseMount, "fuse-mount", "/workspace", "用户可见 FUSE 挂载点")
+	c.Flags().StringVar(&mountRoot, "mount-root", "/pitr", "允许 init 使用的挂载根目录")
 	c.Flags().StringVar(&retention, "retention", "compact", "保留策略")
 	c.Flags().StringVar(&logLevel, "log-level", "info", "日志级别")
 	return c

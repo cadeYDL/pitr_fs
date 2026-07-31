@@ -105,3 +105,23 @@ func TestServe_StaleSocketReplaced(t *testing.T) {
 		t.Fatalf("退出后 socket 应清理,stat err=%v", err)
 	}
 }
+
+func TestPathInsideMountRoot(t *testing.T) {
+	for _, item := range []struct {
+		candidate string
+		root      string
+		want      bool
+	}{
+		{"/pitr/data", "/pitr", true},
+		{"/pitr/team/data", "/pitr/", true},
+		{"/pitr", "/pitr", false},
+		{"/pitr-other/data", "/pitr", false},
+		{"data", "/pitr", false},
+		{"/pitr/data", "/", false},
+	} {
+		if got := pathInsideMountRoot(item.candidate, item.root); got != item.want {
+			t.Errorf("pathInsideMountRoot(%q,%q)=%v, want %v",
+				item.candidate, item.root, got, item.want)
+		}
+	}
+}
