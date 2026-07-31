@@ -49,20 +49,28 @@ detach_stale_fuse() {
     [ "$WORKSPACE" != "/" ] ||
         { echo "错误: PITR_WORKSPACE 不能是根目录" >&2; return 1; }
 
-    local fs_type
-    fs_type=$(findmnt -n -o FSTYPE --target "$WORKSPACE" 2>/dev/null || true)
-    [ "$fs_type" = "fuse.pitrfs" ] || return 0
-
-    echo "==> 卸载失联的 pitr FUSE: $WORKSPACE"
-    if fusermount3 -uz "$WORKSPACE" >/dev/null 2>&1; then
-        return 0
+    local attempt
+    for attempt in $(seq 1 8); do
+        if ! findmnt -n -o FSTYPE --target "$WORKSPACE" 2>/dev/null |
+            grep -qx "fuse.pitrfs"; then
+            return 0
+        fi
+        echo "==> 卸载失联的 pitr FUSE: $WORKSPACE (第 $attempt 层)"
+        if fusermount3 -uz "$WORKSPACE" >/dev/null 2>&1; then
+            continue
+        fi
+        if command -v sudo >/dev/null 2>&1; then
+            sudo fusermount3 -uz "$WORKSPACE" >/dev/null 2>&1 ||
+                sudo umount -l "$WORKSPACE"
+            continue
+        fi
+        umount -l "$WORKSPACE"
+    done
+    if findmnt -n -o FSTYPE --target "$WORKSPACE" 2>/dev/null |
+        grep -qx "fuse.pitrfs"; then
+        echo "错误: $WORKSPACE 的 pitr FUSE 层超过安全清理上限 8" >&2
+        return 1
     fi
-    if command -v sudo >/dev/null 2>&1; then
-        sudo fusermount3 -uz "$WORKSPACE" >/dev/null 2>&1 ||
-            sudo umount -l "$WORKSPACE"
-        return
-    fi
-    umount -l "$WORKSPACE"
 }
 
 # 端到端 ready 信号:socket 建立且一次真实 gRPC Status 成功。只检查 socket

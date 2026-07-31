@@ -206,9 +206,10 @@ func TestInstall_DetachesOnlyPitrFuseBeforeRecover(t *testing.T) {
 	}
 	script := string(content)
 	for _, required := range []string{
-		`fs_type=$(findmnt -n -o FSTYPE --target "$WORKSPACE"`,
-		`[ "$fs_type" = "fuse.pitrfs" ] || return 0`,
+		`for attempt in $(seq 1 8); do`,
+		`grep -qx "fuse.pitrfs"`,
 		`fusermount3 -uz "$WORKSPACE"`,
+		`pitr FUSE 层超过安全清理上限 8`,
 		"detach_stale_fuse\n            docker start",
 	} {
 		if !strings.Contains(script, required) {
