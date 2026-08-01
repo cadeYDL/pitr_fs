@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "pitr_fs/api/pitrd/v1"
+	"pitr_fs/internal/buildinfo"
 	"pitr_fs/internal/txn"
 )
 
@@ -96,6 +97,8 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newMountCmd())
 	root.AddCommand(newUmountCmd())
 	root.AddCommand(newStatusCmd())
+	root.AddCommand(newVersionCmd())
+	root.AddCommand(newUpgradeCmd())
 	root.AddCommand(newSpaceCmd())
 	root.AddCommand(newConfigCmd())
 
@@ -111,6 +114,51 @@ func newRoot() *cobra.Command {
 	root.InitDefaultCompletionCmd()
 	localizeCompletionCommand(root)
 	return root
+}
+
+func newVersionCmd() *cobra.Command {
+	var clientOnly bool
+	command := &cobra.Command{
+		Use:   "version",
+		Short: "查看 pitr 客户端和 pitrd 服务端版本",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "pitr %s\n", buildinfo.Full())
+			if clientOnly {
+				return nil
+			}
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			response, err := client.rpc.Status(ctx, &pb.StatusRequest{})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "pitrd %s\n",
+				response.GetDaemonVersion())
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&clientOnly, "client-only", false,
+		"只显示客户端版本，不连接 pitrd")
+	return command
+}
+
+func newUpgradeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "upgrade",
+		Short: "升级或回退 pitr/pitrd 逻辑版本",
+		Long: `升级由 Linux 宿主机安装的 pitr wrapper 执行。
+默认不会跟踪未发布的 main；当前请使用经过校验的本地升级包。`,
+		Args: cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			return errors.New("upgrade 只能通过 Linux 宿主机安装的 pitr wrapper 执行")
+		},
+	}
 }
 
 func localizeCompletionCommand(root *cobra.Command) {

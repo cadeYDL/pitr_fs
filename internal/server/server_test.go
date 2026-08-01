@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,9 +78,15 @@ func TestMain(m *testing.M) {
 }
 
 type serverFixture struct {
-	db     *pg.DB
-	mgr    *txn.Manager
-	client pb.PitrdClient
+	db             *pg.DB
+	mgr            *txn.Manager
+	client         pb.PitrdClient
+	quiesceMu      sync.Mutex
+	quiesce        []bool
+	upgradeDiscard atomic.Bool
+	discardFails   atomic.Bool
+	discardCalls   atomic.Int32
+	forceUmounts   atomic.Int32
 }
 
 func setupServer(t *testing.T) *serverFixture {
@@ -125,6 +133,7 @@ func setupServer(t *testing.T) *serverFixture {
 
 	mgr := txn.NewManager(db)
 	grpcServer := grpc.NewServer()
+	fixture := &serverFixture{db: db, mgr: mgr}
 	pb.RegisterPitrdServer(grpcServer, New(db, mgr, Config{
 		DaemonVersion: "test",
 		Volume:        "test-volume",
@@ -136,6 +145,33 @@ func setupServer(t *testing.T) *serverFixture {
 		FUSEMounted:   true,
 		MountFunc:     func(context.Context, string) error { return nil },
 		UmountFunc:    func(context.Context) error { return nil },
+		ForceUmountFunc: func(context.Context) error {
+			fixture.forceUmounts.Add(1)
+			return nil
+		},
+		QuiesceFunc: func(enabled bool) {
+			fixture.quiesceMu.Lock()
+			fixture.quiesce = append(fixture.quiesce, enabled)
+			fixture.quiesceMu.Unlock()
+		},
+		UpgradeDiscardRequested: fixture.upgradeDiscard.Load,
+		DiscardWritesFunc: func(ctx context.Context) (int, error) {
+			fixture.discardCalls.Add(1)
+			if fixture.discardFails.Load() {
+				return 0, fmt.Errorf("注入的丢弃失败")
+			}
+			var id int64
+			if err := db.QueryRow(ctx, `
+				SELECT id FROM pitr_txn
+				 WHERE state='auto' AND closed_at IS NULL
+				 ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+				return 0, err
+			}
+			if err := mgr.AbortAutoVersion(ctx, id); err != nil {
+				return 0, err
+			}
+			return 1, nil
+		},
 	}))
 	listener := bufconn.Listen(1024 * 1024)
 	go func() { _ = grpcServer.Serve(listener) }()
@@ -151,7 +187,8 @@ func setupServer(t *testing.T) *serverFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return &serverFixture{db: db, mgr: mgr, client: pb.NewPitrdClient(conn)}
+	fixture.client = pb.NewPitrdClient(conn)
+	return fixture
 }
 
 func TestServer_ManualTransactionsDisabled(t *testing.T) {
@@ -584,9 +621,26 @@ func TestServer_UmountRejectsOpenWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.client.Umount(ctx,
+	timeoutCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := f.client.Umount(timeoutCtx,
 		&pb.UmountRequest{Path: "/workspace"}); err == nil {
 		t.Fatal("存在开放写窗口时 umount 应失败")
+	}
+	var quiesce []bool
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.quiesceMu.Lock()
+		quiesce = append([]bool(nil), f.quiesce...)
+		f.quiesceMu.Unlock()
+		if len(quiesce) >= 2 && !quiesce[len(quiesce)-1] ||
+			time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(quiesce) < 2 || !quiesce[0] || quiesce[len(quiesce)-1] {
+		t.Fatalf("失败卸载应先冻结写入再恢复: %v", quiesce)
 	}
 	if err := f.mgr.CloseStandaloneVersion(ctx, versionID, "", ""); err != nil {
 		t.Fatal(err)
@@ -594,6 +648,57 @@ func TestServer_UmountRejectsOpenWrite(t *testing.T) {
 	if _, err := f.client.Umount(ctx,
 		&pb.UmountRequest{Path: "/workspace"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServer_UpgradeUmountDiscardsOpenWrite(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	if _, err := f.mgr.OpenStandaloneVersion(
+		ctx, "/workspace/large", "write:/workspace/large",
+		txn.VersionMetadata{}); err != nil {
+		t.Fatal(err)
+	}
+	f.upgradeDiscard.Store(true)
+	if _, err := f.client.Umount(ctx,
+		&pb.UmountRequest{Path: "/workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	if f.discardCalls.Load() != 1 {
+		t.Fatalf("discard calls=%d", f.discardCalls.Load())
+	}
+	if f.forceUmounts.Load() != 1 {
+		t.Fatalf("force umount calls=%d", f.forceUmounts.Load())
+	}
+	open, err := f.mgr.CountOpenWrites(ctx)
+	if err != nil || open != 0 {
+		t.Fatalf("open=%d err=%v", open, err)
+	}
+	f.quiesceMu.Lock()
+	defer f.quiesceMu.Unlock()
+	if len(f.quiesce) == 0 || !f.quiesce[len(f.quiesce)-1] {
+		t.Fatalf("升级卸载成功后应保持写冻结: %v", f.quiesce)
+	}
+}
+
+func TestServer_UpgradeDiscardFailureKeepsWritesFrozen(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	if _, err := f.mgr.OpenStandaloneVersion(
+		ctx, "/workspace/large", "write:/workspace/large",
+		txn.VersionMetadata{}); err != nil {
+		t.Fatal(err)
+	}
+	f.upgradeDiscard.Store(true)
+	f.discardFails.Store(true)
+	if _, err := f.client.Umount(ctx,
+		&pb.UmountRequest{Path: "/workspace"}); status.Code(err) != codes.Internal {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	f.quiesceMu.Lock()
+	defer f.quiesceMu.Unlock()
+	if len(f.quiesce) == 0 || !f.quiesce[len(f.quiesce)-1] {
+		t.Fatalf("丢弃失败后不应恢复写入: %v", f.quiesce)
 	}
 }
 

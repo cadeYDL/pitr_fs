@@ -170,6 +170,26 @@ func TestHook_CloseFail_CompensatesAndReturnsEIO(t *testing.T) {
 	}
 }
 
+func TestHook_QuiescingRejectsBeforeMutation(t *testing.T) {
+	manager := new(mockManager)
+	node := newHookNode(manager)
+	node.root.SetQuiescing(true)
+	called := false
+	errno := node.versionedHook(
+		context.Background(), "/workspace/a", "write:/workspace/a",
+		`write("/workspace/a")`, 0,
+		func() syscall.Errno {
+			called = true
+			return 0
+		})
+	if errno != syscall.EBUSY || called {
+		t.Fatalf("errno=%v called=%v", errno, called)
+	}
+	if manager.openCalls != 0 || manager.closeCalls != 0 {
+		t.Fatalf("冻结写入不应创建中间版本: %+v", manager)
+	}
+}
+
 func TestKeepWritableWindow_MultipleFDsDoNotHoldLifetimeLock(t *testing.T) {
 	manager := new(mockManager)
 	node := newHookNode(manager)

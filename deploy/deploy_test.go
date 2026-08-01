@@ -32,6 +32,7 @@ func TestScripts_BashSyntax(t *testing.T) {
 	root := repoRoot(t)
 	for _, rel := range []string{
 		"install.sh", "uninstall.sh", "scripts/install-deps.sh", "deploy/entrypoint.sh",
+		"scripts/build-upgrade-bundle.sh", "scripts/pitr-host-upgrade.sh",
 	} {
 		p := filepath.Join(root, rel)
 		out, err := exec.Command("bash", "-n", p).CombinedOutput()
@@ -43,13 +44,148 @@ func TestScripts_BashSyntax(t *testing.T) {
 
 func TestUserFacingScriptsAreExecutable(t *testing.T) {
 	root := repoRoot(t)
-	for _, rel := range []string{"install.sh", "uninstall.sh", "scripts/install-deps.sh"} {
+	for _, rel := range []string{
+		"install.sh", "uninstall.sh", "scripts/install-deps.sh",
+		"scripts/build-upgrade-bundle.sh", "scripts/pitr-host-upgrade.sh",
+	} {
 		info, err := os.Stat(filepath.Join(root, rel))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if info.Mode()&0o111 == 0 {
 			t.Errorf("%s 缺少可执行权限", rel)
+		}
+	}
+}
+
+func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
+	root := repoRoot(t)
+	install, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`if [ "\${1:-}" = "upgrade" ]`,
+		`exec env PITR_INSTALL_CONFIG="\$install_config" "\$host_upgrader" "\$@"`,
+		`source=$RUNTIME_DIR,target=/opt/pitr`,
+		`install_host_upgrader`,
+		`SAVED_RUNTIME_DIR=%q`,
+		`prepare_schema_marker`,
+	} {
+		if !bytes.Contains(install, []byte(required)) {
+			t.Errorf("install.sh 缺少逻辑升级片段 %q", required)
+		}
+	}
+
+	upgrader, err := os.ReadFile(filepath.Join(root, "scripts/pitr-host-upgrade.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"警告: 升级会先停止 pitr 文件系统服务",
+		"请确保当前没有任何写入操作",
+		"非交互升级必须显式指定 --yes",
+		`/run/pitr/discard-open-writes`,
+		`--bundle <本地升级包>`,
+		`upgrade-fallback`,
+		`request_restart`,
+		`文件系统未能安全卸载，逻辑版本未切换`,
+		`current_schema_digest`,
+		`target_schema_digest`,
+		`schema 内容未变化`,
+		`record_schema_digest`,
+	} {
+		if !bytes.Contains(upgrader, []byte(required)) {
+			t.Errorf("宿主升级器缺少 %q", required)
+		}
+	}
+	if bytes.Contains(upgrader, []byte("docker rm")) ||
+		bytes.Contains(upgrader, []byte("docker run")) {
+		t.Error("逻辑升级器不应删除或重建容器")
+	}
+}
+
+func TestInstall_PrepareSchemaMarkerSupportsStoppedContainer(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\ninstall_main() {\n")
+	index := bytes.Index(content, marker)
+	if index < 0 {
+		t.Fatal("install.sh 未找到主命令 case")
+	}
+	temp := t.TempDir()
+	functions := filepath.Join(temp, "install-functions.sh")
+	if err := os.WriteFile(functions, content[:index], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeDocker := filepath.Join(temp, "docker")
+	fake := `#!/usr/bin/env bash
+case "$1" in
+  inspect) exit 0 ;;
+  exec) exit 1 ;;
+  cp) printf 'stopped-container-schema\n' >"$3" ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := filepath.Join(temp, "runtime")
+	if err := os.Mkdir(runtimeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "-c", `
+source "$1"
+DOCKER_COMMAND=("$2")
+RUNTIME_DIR=$3
+CONTAINER=stopped-pitrfs
+prepare_schema_marker
+test -s "$RUNTIME_DIR/schema.applied.sha256"
+`, "bash", functions, fakeDocker, runtimeDir)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("stopped 容器 schema marker 回退失败: %v\n%s", err, output)
+	}
+}
+
+func TestLogicUpgrade_UsesLazyUnmountOnlyForUpgradeDiscard(t *testing.T) {
+	root := repoRoot(t)
+	handler, err := os.ReadFile(filepath.Join(root,
+		"internal/server/handlers_lifecycle.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"upgradeDiscard :=",
+		"s.cfg.ForceUmountFunc != nil",
+		"umountFunc = s.cfg.ForceUmountFunc",
+	} {
+		if !bytes.Contains(handler, []byte(required)) {
+			t.Errorf("升级卸载路径缺少 %q", required)
+		}
+	}
+}
+
+func TestEntrypoint_SupervisesLogicRestartWithoutStoppingPostgres(t *testing.T) {
+	root := repoRoot(t)
+	entrypoint, err := os.ReadFile(filepath.Join(root, "deploy/entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`printf '%s\n' "$PITRD_PID" >/run/pitr/pitrd.pid`,
+		`if [ -e /run/pitr/restart.request ]; then`,
+		"按升级请求重启 pitrd，PostgreSQL 保持运行",
+		`if [ -r /opt/pitr/upgrade-fallback ]; then`,
+		"自动切回",
+		`schema.applied.sha256`,
+		`apply_schema 0`,
+		`apply_schema 1`,
+	} {
+		if !bytes.Contains(entrypoint, []byte(required)) {
+			t.Errorf("entrypoint 缺少无容器重建升级片段 %q", required)
 		}
 	}
 }
@@ -143,7 +279,9 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 		"docker_args+=(-it)",
 		`docker_command=(docker)`,
 		`docker_command=(sudo docker)`,
-		`exec "\${docker_command[@]}" "\${docker_args[@]}" "$CONTAINER" pitr "\${pitr_args[@]}"`,
+		`[ ! -x /opt/pitr/current/pitr ] || cli=/opt/pitr/current/pitr`,
+		`exec "\$cli" "\$@"`,
+		`' sh "\${pitr_args[@]}"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh wrapper 缺少非 TTY 兼容片段 %q", required)
@@ -207,7 +345,8 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"<exec>", "<--workdir>", "<" + subdir + ">",
-		"<test-container>", "<pitr>", "<begin>", "<.>",
+		"<test-container>", "<sh>",
+		"/opt/pitr/current/pitr", "<begin>", "<.>",
 	} {
 		if !bytes.Contains(output, []byte(expected)) {
 			t.Errorf("wrapper 输出缺少 %q:\n%s", expected, output)

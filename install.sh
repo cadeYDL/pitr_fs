@@ -19,6 +19,8 @@ CACHE_VOLUME="${PITR_CACHE_VOLUME:-${SAVED_CACHE_VOLUME:-pitr_cache}}"
 JFS_CACHE_SIZE="${PITR_JFS_CACHE_SIZE:-${SAVED_JFS_CACHE_SIZE:-1024}}"
 CACHE_VOLUME_MANAGED="${SAVED_CACHE_VOLUME_MANAGED:-}"
 BLOCK_PATH="${PITR_BLOCK_PATH:-${SAVED_BLOCK_PATH:-}}"
+RUNTIME_DIR="${PITR_RUNTIME_DIR:-${SAVED_RUNTIME_DIR:-/var/lib/pitr-fs/runtime}}"
+HOST_UPGRADER="${PITR_HOST_UPGRADER:-${SAVED_HOST_UPGRADER:-/usr/local/lib/pitr-fs/pitr-host-upgrade}}"
 READY_TIMEOUT="${PITR_READY_TIMEOUT:-120}"
 DOCKER_COMMAND=(docker)
 
@@ -43,6 +45,7 @@ usage() {
   PITR_CACHE_VOLUME JuiceFS 临时缓存 Docker volume (默认 pitr_cache)
   PITR_JFS_CACHE_SIZE JuiceFS 本地缓存上限 MiB (默认 1024)
   PITR_BLOCK_PATH  用户已挂载的块存储目录；为空时使用本地 Docker volume
+  PITR_RUNTIME_DIR pitr/pitrd 版本化逻辑目录 (默认 /var/lib/pitr-fs/runtime)
   PITR_STORAGE     JuiceFS 存储后端 (默认 file); s3/minio/oss/cos/...
   PITR_BUCKET      存储 bucket URL / 本地路径 (默认容器内 /data)
   PITR_GC_INTERVAL 对象 GC 合并执行间隔 (默认 10m; 0 停用)
@@ -101,6 +104,18 @@ validate_mount_root() {
                 ;;
         esac
     fi
+    case "$RUNTIME_DIR" in
+        /*) ;;
+        *) echo "错误: PITR_RUNTIME_DIR 必须是绝对路径: $RUNTIME_DIR" >&2; exit 1 ;;
+    esac
+    [ "$RUNTIME_DIR" != "/" ] || {
+        echo "错误: PITR_RUNTIME_DIR 不能是根目录" >&2
+        exit 1
+    }
+    case "$HOST_UPGRADER" in
+        /*) ;;
+        *) echo "错误: PITR_HOST_UPGRADER 必须是绝对路径: $HOST_UPGRADER" >&2; exit 1 ;;
+    esac
 }
 
 sudo_if_needed() {
@@ -152,7 +167,7 @@ docker_cli_timeout() {
 
 need_host_tools() {
     local command_name
-    for command_name in findmnt fusermount3 realpath; do
+    for command_name in findmnt fusermount3 realpath tar sha256sum; do
         command -v "$command_name" >/dev/null 2>&1 || {
             echo "错误: 缺少 $command_name；请先运行 ./scripts/install-deps.sh" >&2
             exit 1
@@ -163,6 +178,51 @@ need_host_tools() {
         echo "错误: /dev/fuse 不存在；请加载 Linux fuse 模块" >&2
         exit 1
     }
+}
+
+prepare_runtime_dir() {
+    local sudo marker="$RUNTIME_DIR/.pitr-runtime"
+    if [ ! -d "$RUNTIME_DIR" ]; then
+        sudo=$(sudo_if_needed "$RUNTIME_DIR")
+        $sudo install -d -m 0755 "$RUNTIME_DIR"
+    fi
+    if [ ! -e "$marker" ]; then
+        if [ -n "$(find "$RUNTIME_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            echo "错误: PITR_RUNTIME_DIR 已存在且不是 pitr 运行目录: $RUNTIME_DIR" >&2
+            exit 1
+        fi
+        sudo=$(sudo_if_needed "$marker")
+        printf 'format=1\n' | $sudo tee "$marker" >/dev/null
+        $sudo chmod 0644 "$marker"
+    fi
+    sudo=$(sudo_if_needed "$RUNTIME_DIR/versions")
+    $sudo install -d -m 0755 "$RUNTIME_DIR/versions"
+}
+
+prepare_schema_marker() {
+    local marker="$RUNTIME_DIR/schema.applied.sha256" digest sudo temporary
+    [ ! -e "$marker" ] || return 0
+    docker_cli inspect "$CONTAINER" >/dev/null 2>&1 || return 0
+    digest=$(docker_cli exec "$CONTAINER" sh -c '
+        schema=/etc/pitr/init_pitr.sql
+        [ ! -r /opt/pitr/current/init_pitr.sql ] || schema=/opt/pitr/current/init_pitr.sql
+        sha256sum "$schema"
+    ' 2>/dev/null | awk '{print $1}' || true)
+    if [ -z "$digest" ] && [ -r "$RUNTIME_DIR/current/init_pitr.sql" ]; then
+        digest=$(sha256sum "$RUNTIME_DIR/current/init_pitr.sql" | awk '{print $1}')
+    fi
+    if [ -z "$digest" ]; then
+        temporary=$(mktemp)
+        if docker_cli cp "$CONTAINER:/etc/pitr/init_pitr.sql" "$temporary" \
+            >/dev/null 2>&1; then
+            digest=$(sha256sum "$temporary" | awk '{print $1}')
+        fi
+        rm -f "$temporary"
+    fi
+    [ -n "$digest" ] || return 0
+    sudo=$(sudo_if_needed "$marker")
+    printf '%s\n' "$digest" | $sudo tee "$marker" >/dev/null
+    $sudo chmod 0644 "$marker"
 }
 
 ensure_host_environment() {
@@ -251,14 +311,26 @@ wait_ready() {
 }
 
 install_wrapper() {
-    local sudo quoted_root
+    local sudo quoted_root quoted_upgrader quoted_config
     sudo=$(sudo_if_needed "$BIN_LINK")
     printf -v quoted_root '%q' "$MOUNT_ROOT"
+    printf -v quoted_upgrader '%q' "$HOST_UPGRADER"
+    printf -v quoted_config '%q' "$INSTALL_CONFIG"
     $sudo tee "$BIN_LINK" >/dev/null <<EOF2
 #!/usr/bin/env bash
 # pitr Linux 宿主机 wrapper：把 CLI 转发到服务容器
 set -euo pipefail
 host_mount_root=$quoted_root
+host_upgrader=$quoted_upgrader
+install_config=$quoted_config
+if [ "\${1:-}" = "upgrade" ]; then
+    [ -x "\$host_upgrader" ] || {
+        echo "错误: 宿主升级控制器不存在: \$host_upgrader" >&2
+        exit 1
+    }
+    shift
+    exec env PITR_INSTALL_CONFIG="\$install_config" "\$host_upgrader" "\$@"
+fi
 pitr_args=("\$@")
 if [ "\${1:-}" = "init" ] && [ -n "\${2:-}" ]; then
     pitr_args[1]="\$(realpath -m -- "\$2")"
@@ -282,9 +354,20 @@ if ! timeout 10 docker info >/dev/null 2>&1; then
         exit 1
     fi
 fi
-exec "\${docker_command[@]}" "\${docker_args[@]}" "$CONTAINER" pitr "\${pitr_args[@]}"
+exec "\${docker_command[@]}" "\${docker_args[@]}" "$CONTAINER" sh -c '
+cli=/usr/local/bin/pitr
+[ ! -x /opt/pitr/current/pitr ] || cli=/opt/pitr/current/pitr
+exec "\$cli" "\$@"
+' sh "\${pitr_args[@]}"
 EOF2
     $sudo chmod +x "$BIN_LINK"
+}
+
+install_host_upgrader() {
+    local sudo
+    sudo=$(sudo_if_needed "$HOST_UPGRADER")
+    $sudo install -d -m 0755 "$(dirname "$HOST_UPGRADER")"
+    $sudo install -m 0755 "$SCRIPT_DIR/scripts/pitr-host-upgrade.sh" "$HOST_UPGRADER"
 }
 
 write_install_config() {
@@ -303,6 +386,8 @@ write_install_config() {
         printf 'SAVED_JFS_CACHE_SIZE=%q\n' "$JFS_CACHE_SIZE"
         printf 'SAVED_CACHE_VOLUME_MANAGED=%q\n' "$CACHE_VOLUME_MANAGED"
         printf 'SAVED_BLOCK_PATH=%q\n' "$BLOCK_PATH"
+        printf 'SAVED_RUNTIME_DIR=%q\n' "$RUNTIME_DIR"
+        printf 'SAVED_HOST_UPGRADER=%q\n' "$HOST_UPGRADER"
     } | $sudo tee "$INSTALL_CONFIG" >/dev/null
     $sudo chmod 0644 "$INSTALL_CONFIG"
 }
@@ -344,6 +429,7 @@ run_container() {
         "${block_mount[@]}" \
         --mount "type=bind,source=/etc/passwd,target=/host/etc/passwd,readonly" \
         --mount "type=bind,source=$MOUNT_ROOT,target=$MOUNT_ROOT,bind-propagation=rshared" \
+        --mount "type=bind,source=$RUNTIME_DIR,target=/opt/pitr" \
         "$IMAGE" >/dev/null
 }
 
@@ -353,13 +439,24 @@ do_install() {
     prepare_mount_root
     prepare_block_storage
     prepare_cache_volume
+    prepare_runtime_dir
+    prepare_schema_marker
     bash "$SCRIPT_DIR/scripts/install-deps.sh" --docker-snapshot-before
     echo "==> 构建镜像 $IMAGE"
-    docker_cli build -t "$IMAGE" -f "$SCRIPT_DIR/deploy/Dockerfile" "$SCRIPT_DIR"
+    local build_commit build_date build_version
+    build_commit=$(git -C "$SCRIPT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+    build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    build_version=${PITR_VERSION:-dev-$build_commit}
+    docker_cli build -t "$IMAGE" -f "$SCRIPT_DIR/deploy/Dockerfile" \
+        --build-arg "PITR_VERSION=$build_version" \
+        --build-arg "PITR_COMMIT=$build_commit" \
+        --build-arg "PITR_BUILD_DATE=$build_date" \
+        "$SCRIPT_DIR"
     echo "==> 启动容器 $CONTAINER"
     run_container
     wait_ready
     echo "==> 安装命令 $BIN_LINK"
+    install_host_upgrader
     install_wrapper
     write_install_config
     bash "$SCRIPT_DIR/scripts/install-deps.sh" --docker-snapshot-after "$IMAGE"
@@ -396,6 +493,8 @@ do_recover() {
     prepare_mount_root
     prepare_block_storage
     prepare_cache_volume
+    prepare_runtime_dir
+    prepare_schema_marker
     if docker_cli inspect "$CONTAINER" >/dev/null 2>&1; then
         local state
         state=$(docker_cli inspect -f '{{.State.Status}}' "$CONTAINER")
@@ -411,7 +510,8 @@ do_recover() {
         run_container
     fi
     wait_ready
-    [ -x "$BIN_LINK" ] || install_wrapper
+    install_host_upgrader
+    install_wrapper
     if docker_cli exec "$CONTAINER" pitr status | grep -q 'fuse='; then
         docker_cli exec "$CONTAINER" pitr recover
         echo "  ✓ 服务与挂载恢复完成"

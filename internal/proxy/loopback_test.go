@@ -66,11 +66,44 @@ func TestDirectWritePolicy(t *testing.T) {
 	if !directWrite(syscall.O_WRONLY) {
 		t.Fatal("O_WRONLY 应启用 direct-I/O")
 	}
-	if directWrite(syscall.O_RDWR) {
-		t.Fatal("O_RDWR 必须保留缓存以支持可捕获的 writable mmap")
+	if !directWrite(syscall.O_RDWR) {
+		t.Fatal("O_RDWR 应启用支持 mmap 的 direct-I/O")
 	}
 	if directWrite(syscall.O_RDONLY) {
 		t.Fatal("O_RDONLY 不应启用 direct-I/O")
+	}
+}
+
+func TestLoopback_DirectWritableMmap(t *testing.T) {
+	backend, mount, _ := mountedLoopback(t, WithManager(new(mockManager)))
+	backendPath := filepath.Join(backend, "mapped")
+	if err := os.WriteFile(backendPath, []byte("baseline"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(mount, "mapped"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapping, err := unix.Mmap(
+		int(file.Fd()), 0, len("baseline"),
+		unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED,
+	)
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("direct-I/O writable mmap: %v", err)
+	}
+	copy(mapping, "changed!")
+	if err := unix.Msync(mapping, unix.MS_SYNC); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Munmap(mapping); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(backendPath); err != nil || string(got) != "changed!" {
+		t.Fatalf("direct mmap content=%q err=%v", got, err)
 	}
 }
 
@@ -439,6 +472,96 @@ func TestLoopback_MultipleWritableFDsKeepDirectoryResponsive(t *testing.T) {
 	}
 	if active != nil {
 		t.Fatalf("所有可写 fd 关闭后仍残留 active auto: %+v", active)
+	}
+}
+
+func TestLoopback_QuiescingRejectsWritesWithoutPartialData(t *testing.T) {
+	backend, mount, loopback := mountedLoopback(t, WithManager(new(mockManager)))
+	path := filepath.Join(mount, "file")
+	if err := os.WriteFile(filepath.Join(backend, "file"), []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopback.SetQuiescing(true)
+	if _, err := file.WriteAt([]byte("after"), 0); err == nil {
+		t.Fatal("冻结后已有可写 fd 的新写入应直接失败")
+	}
+	if err := file.Close(); err == nil {
+		t.Fatal("冻结后旧可写 fd 的 close/flush 应明确失败")
+	}
+	if err := os.WriteFile(filepath.Join(mount, "new"), []byte("x"), 0o644); err == nil {
+		t.Fatal("冻结后创建文件应直接失败")
+	}
+	if got, err := os.ReadFile(filepath.Join(backend, "file")); err != nil ||
+		string(got) != "before" {
+		t.Fatalf("冻结失败后出现中间态 content=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(backend, "new")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("冻结失败后不应创建底层文件: %v", err)
+	}
+	loopback.SetQuiescing(false)
+	if err := os.WriteFile(path, []byte("after"), 0o644); err != nil {
+		t.Fatalf("解除冻结后写入失败: %v", err)
+	}
+}
+
+type restoringManager struct {
+	*mockManager
+	path     string
+	baseline []byte
+}
+
+func (m *restoringManager) AbortAutoVersion(ctx context.Context, id int64) error {
+	if err := m.mockManager.AbortAutoVersion(ctx, id); err != nil {
+		return err
+	}
+	return os.WriteFile(m.path, m.baseline, 0o644)
+}
+
+func TestLoopback_DiscardOpenWritesRestoresPartialFile(t *testing.T) {
+	manager := &restoringManager{mockManager: new(mockManager)}
+	backend, mount, loopback := mountedLoopback(t, WithManager(manager))
+	manager.path = filepath.Join(backend, "large")
+	manager.baseline = []byte("baseline")
+	if err := os.WriteFile(manager.path, manager.baseline, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(mount, "large"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("partial!"), 0); err != nil {
+		t.Fatal(err)
+	}
+	discarded, err := loopback.DiscardOpenWrites(context.Background())
+	if err != nil || discarded != 1 {
+		t.Fatalf("discarded=%d err=%v", discarded, err)
+	}
+	if err := loopback.UnmountLazy(); err != nil {
+		t.Fatalf("开放 fd 存在时惰性卸载: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mount, "large")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("惰性卸载后旧路径仍可见: %v", err)
+	}
+	if err := file.Sync(); err == nil {
+		t.Fatal("丢弃后旧 fd 不应继续 fsync")
+	}
+	if _, err := file.WriteAt([]byte("later"), 0); err == nil {
+		t.Fatal("丢弃后旧 fd 不应继续写入")
+	}
+	_ = file.Close()
+	if got, err := os.ReadFile(manager.path); err != nil ||
+		string(got) != string(manager.baseline) {
+		t.Fatalf("丢弃后 content=%q err=%v", got, err)
+	}
+	manager.mu.Lock()
+	aborts := manager.abortCalls
+	manager.mu.Unlock()
+	if aborts != 1 {
+		t.Fatalf("abort calls=%d", aborts)
 	}
 }
 

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -89,8 +90,14 @@ func (n *Node) versionedHookWindow(
 	action func() syscall.Errno,
 ) (fdVersion, syscall.Errno) {
 	root := n.root
+	if root.Quiescing() {
+		return fdVersion{}, syscall.EBUSY
+	}
 	root.window.Lock()
 	defer root.window.Unlock()
+	if root.Quiescing() {
+		return fdVersion{}, syscall.EBUSY
+	}
 
 	if root.manager == nil {
 		return fdVersion{}, action()
@@ -163,6 +170,9 @@ func (n *Node) keepWritableWindow(
 
 	root.window.Lock()
 	defer root.window.Unlock()
+	if root.Quiescing() {
+		return syscall.EBUSY
+	}
 
 	before := root.captureContent(absPath)
 	if root.active == nil {
@@ -192,6 +202,12 @@ func (n *Node) closeWritableWindow(
 	file *trackedFile,
 ) syscall.Errno {
 	if file == nil {
+		return 0
+	}
+	if !file.released.CompareAndSwap(false, true) {
+		if file.discarded.Load() {
+			return syscall.EBUSY
+		}
 		return 0
 	}
 	root := n.root
@@ -243,4 +259,32 @@ func (n *Node) closeWritableWindow(
 		return syscall.EIO
 	}
 	return releaseErrno
+}
+
+// DiscardOpenWrites 在升级冻结后丢弃尚未关闭的完整写窗口。先关闭所有底层
+// fd，让已到达 JuiceFS 的元数据归入当前 auto，再用 undo 回放整个窗口。
+// 之后旧 FUSE fd 的 Write/Release 都不会再次触达底层文件。
+func (l *Loopback) DiscardOpenWrites(ctx context.Context) (int, error) {
+	l.SetQuiescing(true)
+	l.window.Lock()
+	defer l.window.Unlock()
+	if l.active == nil {
+		return 0, nil
+	}
+	window := l.active
+	count := len(window.files)
+	for _, file := range window.files {
+		file.discarded.Store(true)
+		if file.released.CompareAndSwap(false, true) {
+			if errno := file.LoopbackFile.Release(ctx); errno != 0 {
+				slog.Warn("丢弃写窗口时关闭底层 fd 失败",
+					"auto_id", window.autoID, "fd", file.id, "errno", errno)
+			}
+		}
+	}
+	if err := l.manager.AbortAutoVersion(ctx, window.autoID); err != nil {
+		return 0, fmt.Errorf("丢弃 writable auto %d: %w", window.autoID, err)
+	}
+	l.active = nil
+	return count, nil
 }

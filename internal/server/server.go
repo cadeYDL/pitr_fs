@@ -14,17 +14,21 @@ import (
 const DefaultDaemonVersion = "dev"
 
 type Config struct {
-	DaemonVersion string
-	Volume        string
-	JFSMount      string
-	FUSEMount     string
-	MountRoot     string
-	Retention     string
-	JFSMounted    bool
-	FUSEMounted   bool
-	Volumes       []VolumeConfig
-	MountFunc     func(context.Context, string) error
-	UmountFunc    func(context.Context) error
+	DaemonVersion           string
+	Volume                  string
+	JFSMount                string
+	FUSEMount               string
+	MountRoot               string
+	Retention               string
+	JFSMounted              bool
+	FUSEMounted             bool
+	Volumes                 []VolumeConfig
+	MountFunc               func(context.Context, string) error
+	UmountFunc              func(context.Context) error
+	ForceUmountFunc         func(context.Context) error
+	QuiesceFunc             func(bool)
+	DiscardWritesFunc       func(context.Context) (int, error)
+	UpgradeDiscardRequested func() bool
 }
 
 // VolumeConfig 描述 recover/status 可管理的一个卷。每卷可以使用独立的

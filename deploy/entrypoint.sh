@@ -5,6 +5,33 @@ set -euo pipefail
 
 log() { echo "[pitr] $*"; }
 
+runtime_file() {
+    local name=$1
+    if [ -e "/opt/pitr/current/$name" ]; then
+        printf '/opt/pitr/current/%s\n' "$name"
+    elif [ "$name" = init_pitr.sql ]; then
+        printf '/etc/pitr/init_pitr.sql\n'
+    else
+        printf '/usr/local/bin/%s\n' "$name"
+    fi
+}
+
+apply_schema() {
+    local force=${1:-0} digest applied temporary
+    digest=$(sha256sum "$SCHEMA_PATH" | awk '{print $1}')
+    applied=$(cat /opt/pitr/schema.applied.sha256 2>/dev/null || true)
+    if [ "$force" -eq 0 ] && [ "$digest" = "$applied" ]; then
+        log "MVCC schema 内容未变化,跳过重复校准"
+        return 0
+    fi
+    PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -v ON_ERROR_STOP=1 -f "$SCHEMA_PATH" >/dev/null
+    temporary=/opt/pitr/.schema.applied.$$
+    printf '%s\n' "$digest" >"$temporary"
+    mv -f "$temporary" /opt/pitr/schema.applied.sha256
+}
+
 # 1. 后台拉起 PG (复用官方 entrypoint, 它会处理 initdb + docker-entrypoint-initdb.d)
 log "启动 PostgreSQL 后台..."
 docker-entrypoint.sh postgres &
@@ -21,8 +48,8 @@ PG_DSN="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGR
 
 # 3. 幂等再跑一次建表 (补丁生效, 不依赖 initdb.d 是否执行过)
 log "校准 MVCC schema..."
-PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-    -v ON_ERROR_STOP=1 -f /etc/pitr/init_pitr.sql >/dev/null
+SCHEMA_PATH=$(runtime_file init_pitr.sql)
+apply_schema 0
 
 # 4. 格式化 JuiceFS 卷 (仅首次)
 if ! juicefs status "$PG_DSN" >/dev/null 2>&1; then
@@ -36,8 +63,7 @@ if ! juicefs status "$PG_DSN" >/dev/null 2>&1; then
         --trash-days 0 \
         "$PG_DSN" "$PITR_VOLUME" >/dev/null
     log "juicefs format 完成; 再跑一次 init SQL 装 jfs_* 触发器..."
-    PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-        -v ON_ERROR_STOP=1 -f /etc/pitr/init_pitr.sql >/dev/null
+    apply_schema 1
 else
     log "JuiceFS 卷已存在, 跳过 format (recover 场景)"
 fi
@@ -48,21 +74,11 @@ log "校准 JuiceFS 对象生命周期策略 (trash-days=0)..."
 juicefs config --yes --trash-days 0 "$PG_DSN" >/dev/null
 
 # 5. 建目录
-mkdir -p "$(dirname "$PITR_SOCKET")" "$PITR_MOUNT_ROOT" /var/lib/pitr/jfs
+mkdir -p "$(dirname "$PITR_SOCKET")" "$PITR_MOUNT_ROOT" /var/lib/pitr/jfs /run/pitr
 
 # 6. 启动 pitrd。entrypoint 保持为编排进程,确保容器停止时先让 gRPC 优雅退出,
 # 再关闭 PostgreSQL,避免下次启动触发 WAL crash recovery。
-log "启动 pitrd..."
-pitrd \
-    --pg-dsn "$PG_DSN" \
-    --volume "$PITR_VOLUME" \
-    --jfs-mount /var/lib/pitr/jfs \
-    --mount-root "$PITR_MOUNT_ROOT" \
-    --gc-interval "${PITR_GC_INTERVAL:-10m}" \
-    --gc-threads "${PITR_GC_THREADS:-4}" \
-    --jfs-cache-size "${PITR_JFS_CACHE_SIZE:-1024}" \
-    --socket   "$PITR_SOCKET" &
-PITRD_PID=$!
+PITRD_PID=""
 
 stop_postgres() {
     if kill -0 "$PG_PID" >/dev/null 2>&1; then
@@ -76,20 +92,70 @@ stop_postgres() {
 
 shutdown() {
     log "收到停止信号,关闭 pitrd..."
-    kill -TERM "$PITRD_PID" >/dev/null 2>&1 || true
-    wait "$PITRD_PID" 2>/dev/null || true
+    if [ -n "$PITRD_PID" ]; then
+        kill -TERM "$PITRD_PID" >/dev/null 2>&1 || true
+        wait "$PITRD_PID" 2>/dev/null || true
+    fi
     stop_postgres
     exit 0
 }
 
 trap shutdown TERM INT
 
-set +e
-wait "$PITRD_PID"
-PITRD_RC=$?
-set -e
-trap - TERM INT
+activate_runtime() {
+    local target=$1 temporary=/opt/pitr/.current.$$
+    if [ "$target" = builtin ]; then
+        rm -f /opt/pitr/current
+        return 0
+    fi
+    case "$target" in
+        ''|*[!A-Za-z0-9._+-]*) return 1 ;;
+    esac
+    [ -x "/opt/pitr/versions/$target/pitrd" ] || return 1
+    rm -f "$temporary"
+    ln -s "versions/$target" "$temporary"
+    mv -Tf "$temporary" /opt/pitr/current
+}
 
-# pitrd 非预期退出时也关闭 PG,并把 pitrd exit code 交给容器运行时。
-stop_postgres
-exit "$PITRD_RC"
+while true; do
+    PITRD_BIN=$(runtime_file pitrd)
+    log "启动 pitrd ($("$PITRD_BIN" --help 2>/dev/null | head -1 || basename "$PITRD_BIN"))..."
+    "$PITRD_BIN" \
+        --pg-dsn "$PG_DSN" \
+        --volume "$PITR_VOLUME" \
+        --jfs-mount /var/lib/pitr/jfs \
+        --mount-root "$PITR_MOUNT_ROOT" \
+        --gc-interval "${PITR_GC_INTERVAL:-10m}" \
+        --gc-threads "${PITR_GC_THREADS:-4}" \
+        --jfs-cache-size "${PITR_JFS_CACHE_SIZE:-1024}" \
+        --socket "$PITR_SOCKET" &
+    PITRD_PID=$!
+    printf '%s\n' "$PITRD_PID" >/run/pitr/pitrd.pid
+
+    set +e
+    wait "$PITRD_PID"
+    PITRD_RC=$?
+    set -e
+    PITRD_PID=""
+    rm -f /run/pitr/pitrd.pid
+
+    if [ -e /run/pitr/restart.request ]; then
+        rm -f /run/pitr/restart.request
+        log "按升级请求重启 pitrd，PostgreSQL 保持运行"
+        continue
+    fi
+    if [ -r /opt/pitr/upgrade-fallback ]; then
+        fallback=$(cat /opt/pitr/upgrade-fallback)
+        if activate_runtime "$fallback"; then
+            rm -f /opt/pitr/upgrade-fallback
+            log "新版 pitrd 异常退出，自动切回 $fallback"
+            continue
+        fi
+        log "自动回退目标无效: $fallback"
+    fi
+
+    # 非升级场景的异常退出仍传给容器运行时，保持原有故障可见性。
+    trap - TERM INT
+    stop_postgres
+    exit "$PITRD_RC"
+done

@@ -9,13 +9,21 @@
 FROM golang:1.25 AS builder
 WORKDIR /src
 
+ARG PITR_VERSION=dev
+ARG PITR_COMMIT=unknown
+ARG PITR_BUILD_DATE=unknown
+
 # 依赖单独一层, 让源码改动不打破 mod cache
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/pitrd ./cmd/pitrd \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/pitr  ./cmd/pitr
+RUN build_flags="-s -w \
+      -X pitr_fs/internal/buildinfo.Version=${PITR_VERSION} \
+      -X pitr_fs/internal/buildinfo.Commit=${PITR_COMMIT} \
+      -X pitr_fs/internal/buildinfo.BuildDate=${PITR_BUILD_DATE}" \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="$build_flags" -o /out/pitrd ./cmd/pitrd \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="$build_flags" -o /out/pitr  ./cmd/pitr
 
 # ---- 阶段 2: 运行镜像 ----
 FROM postgres:16
@@ -25,6 +33,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl fuse3 tini \
     && curl -sSL https://d.juicefs.com/install | sh - \
     && rm -rf /var/lib/apt/lists/*
+
+# 版本 label 放在重依赖层之后，逻辑版本变化不会触发重新 apt/juicefs 下载。
+ARG PITR_VERSION=dev
+ARG PITR_COMMIT=unknown
+ARG PITR_BUILD_DATE=unknown
+LABEL org.opencontainers.image.version="$PITR_VERSION" \
+      org.opencontainers.image.revision="$PITR_COMMIT" \
+      org.opencontainers.image.created="$PITR_BUILD_DATE"
 
 # 二进制
 COPY --from=builder /out/pitrd /usr/local/bin/pitrd

@@ -14,6 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 
 	"pitr_fs/internal/txn"
 )
@@ -61,10 +62,27 @@ type Loopback struct {
 	window sync.Mutex
 	active *writableWindow
 	nextFD atomic.Uint64
+	// quiescing 在升级/卸载屏障期间拒绝所有新写操作。读取继续工作；
+	// 已有可写 fd 的 Write/Flush/Fsync 直接失败，Release 只负责收口。
+	quiescing atomic.Bool
 
 	auditMu      sync.Mutex
 	processCache map[uint32]processCacheEntry
 	userCache    map[uint32]string
+}
+
+// SetQuiescing 原子关闭/开放写入口。启用时通过 window mutex 做一次屏障，
+// 返回后所有更早进入的单次写操作都已完整结束。
+func (l *Loopback) SetQuiescing(enabled bool) {
+	l.quiescing.Store(enabled)
+	if enabled {
+		l.window.Lock()
+		l.window.Unlock()
+	}
+}
+
+func (l *Loopback) Quiescing() bool {
+	return l.quiescing.Load()
 }
 
 func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
@@ -133,9 +151,10 @@ func (l *Loopback) Start() error {
 	zeroCache := time.Duration(0)
 	server, err := fs.Mount(l.Mount, l.rootNode, &fs.Options{
 		MountOptions: fuse.MountOptions{
-			FsName:     "pitrfs",
-			Name:       "pitrfs",
-			AllowOther: l.allowOther,
+			FsName:            "pitrfs",
+			Name:              "pitrfs",
+			AllowOther:        l.allowOther,
+			ExtraCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP,
 		},
 		EntryTimeout:    &zeroCache,
 		AttrTimeout:     &zeroCache,
@@ -143,6 +162,13 @@ func (l *Loopback) Start() error {
 	})
 	if err != nil {
 		return fmt.Errorf("挂载 FUSE %s: %w", l.Mount, err)
+	}
+	if server.KernelSettings().Flags64()&fuse.CAP_DIRECT_IO_ALLOW_MMAP == 0 {
+		_ = server.Unmount()
+		return errors.New(
+			"Linux 内核不支持 FUSE_CAP_DIRECT_IO_ALLOW_MMAP，" +
+				"无法同时保证可写 mmap 与升级写入原子性",
+		)
 	}
 	l.Server = server
 	return nil
@@ -184,6 +210,22 @@ func (l *Loopback) Unmount() error {
 	return nil
 }
 
+// UnmountLazy 用于升级已经丢弃开放写窗口后切断旧挂载。
+// MNT_DETACH 会立即从当前命名空间移除挂载；仍持有旧 fd 的进程
+// 只能看到已被冻结的旧 FUSE 实例，不会阻塞新版本重新挂载。
+func (l *Loopback) UnmountLazy() error {
+	l.mountMu.Lock()
+	defer l.mountMu.Unlock()
+	if l.Server == nil {
+		return nil
+	}
+	if err := unix.Unmount(l.Mount, unix.MNT_DETACH); err != nil {
+		return fmt.Errorf("惰性卸载 FUSE %s: %w", l.Mount, err)
+	}
+	l.Server = nil
+	return nil
+}
+
 func (l *Loopback) Mounted() bool {
 	l.mountMu.Lock()
 	defer l.mountMu.Unlock()
@@ -202,11 +244,12 @@ func (l *Loopback) newFile(base fs.FileHandle, flags uint32) *trackedFile {
 	}
 }
 
-// O_WRONLY 是普通写入的主路径,用 direct-I/O 保证每次 write 落在 fd 长窗口
-// 内。writable mmap 必须以 O_RDWR 打开;该路径保留页缓存,由同一个 fd 长窗口
-// 覆盖 msync/close。文件关闭后该自动版本立即可见、可 revert。
+// 所有可写 fd 使用 direct-I/O，保证应用的 write(2) 在返回前已进入
+// FUSE 版本窗口；这是升级冻结能让后续写立即失败、并完整丢弃半成品的
+// 前提。挂载时要求内核支持 DIRECT_IO_ALLOW_MMAP，因此 O_RDWR 的可写
+// mmap 仍由同一 fd 长窗口覆盖。
 func directWrite(flags uint32) bool {
-	return flags&syscall.O_ACCMODE == syscall.O_WRONLY
+	return flags&syscall.O_ACCMODE != syscall.O_RDONLY
 }
 
 func (l *Loopback) visiblePath(node *Node, names ...string) string {

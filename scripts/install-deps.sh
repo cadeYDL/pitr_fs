@@ -101,7 +101,7 @@ docker_snapshot_after() {
 
 check_dependencies() {
     local failed=0 command_name
-    for command_name in docker fusermount3 findmnt mountpoint realpath curl git python3 awk; do
+    for command_name in docker fusermount3 findmnt mountpoint realpath curl git python3 awk tar sha256sum; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             echo "缺少: $command_name" >&2
             failed=1
@@ -309,6 +309,8 @@ if command -v apt-get >/dev/null 2>&1; then
     command -v findmnt >/dev/null 2>&1 || add_package util-linux
     command -v mountpoint >/dev/null 2>&1 || add_package util-linux
     command -v realpath >/dev/null 2>&1 || add_package coreutils
+    command -v sha256sum >/dev/null 2>&1 || add_package coreutils
+    command -v tar >/dev/null 2>&1 || add_package tar
     command -v curl >/dev/null 2>&1 || add_package curl
     command -v git >/dev/null 2>&1 || add_package git
     command -v python3 >/dev/null 2>&1 || add_package python3
@@ -331,6 +333,8 @@ elif command -v dnf >/dev/null 2>&1; then
     command -v findmnt >/dev/null 2>&1 || add_package util-linux
     command -v mountpoint >/dev/null 2>&1 || add_package util-linux
     command -v realpath >/dev/null 2>&1 || add_package coreutils
+    command -v sha256sum >/dev/null 2>&1 || add_package coreutils
+    command -v tar >/dev/null 2>&1 || add_package tar
     command -v curl >/dev/null 2>&1 || add_package curl
     command -v git >/dev/null 2>&1 || add_package git
     command -v python3 >/dev/null 2>&1 || add_package python3
@@ -350,6 +354,8 @@ elif command -v yum >/dev/null 2>&1; then
     command -v findmnt >/dev/null 2>&1 || add_package util-linux
     command -v mountpoint >/dev/null 2>&1 || add_package util-linux
     command -v realpath >/dev/null 2>&1 || add_package coreutils
+    command -v sha256sum >/dev/null 2>&1 || add_package coreutils
+    command -v tar >/dev/null 2>&1 || add_package tar
     command -v curl >/dev/null 2>&1 || add_package curl
     command -v git >/dev/null 2>&1 || add_package git
     command -v python3 >/dev/null 2>&1 || add_package python3
@@ -369,6 +375,8 @@ elif command -v pacman >/dev/null 2>&1; then
     command -v findmnt >/dev/null 2>&1 || add_package util-linux
     command -v mountpoint >/dev/null 2>&1 || add_package util-linux
     command -v realpath >/dev/null 2>&1 || add_package coreutils
+    command -v sha256sum >/dev/null 2>&1 || add_package coreutils
+    command -v tar >/dev/null 2>&1 || add_package tar
     command -v curl >/dev/null 2>&1 || add_package curl
     command -v git >/dev/null 2>&1 || add_package git
     command -v python3 >/dev/null 2>&1 || add_package python
@@ -388,6 +396,8 @@ elif command -v zypper >/dev/null 2>&1; then
     command -v findmnt >/dev/null 2>&1 || add_package util-linux
     command -v mountpoint >/dev/null 2>&1 || add_package util-linux
     command -v realpath >/dev/null 2>&1 || add_package coreutils
+    command -v sha256sum >/dev/null 2>&1 || add_package coreutils
+    command -v tar >/dev/null 2>&1 || add_package tar
     command -v curl >/dev/null 2>&1 || add_package curl
     command -v git >/dev/null 2>&1 || add_package git
     command -v python3 >/dev/null 2>&1 || add_package python3

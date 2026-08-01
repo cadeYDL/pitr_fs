@@ -25,6 +25,8 @@ pitr-fs 是运行在 JuiceFS 之上的时间回溯文件系统。它透明拦截
 - 块数据默认保存在本地 Docker volume，也可直接使用用户已经挂载到 Linux
   主机的任意目录，或使用 JuiceFS 支持的远端对象存储。
 - 支持目录范围 `diff`、服务恢复以及 Go/Python SDK。
+- 支持带 SHA256 校验的本地逻辑升级包；升级只重启 `pitrd`/FUSE，不重建
+  容器、PostgreSQL 或数据卷，并可回退到上一个逻辑版本。
 
 内容摘要是有界诊断信息，不是完整 diff：每个文件最多读取前 4 KiB，一个
 写窗口最多保留 3 个 64 B 样本；二进制文件只显示类型和大小。进程命令从
@@ -116,7 +118,9 @@ pitr status
 
 若刚把当前用户加入 `docker` 组，安装程序会在重新登录前自动使用 `sudo`。可单独
 执行 `./scripts/install-deps.sh --check` 做只读环境检查。最小宿主机要求是可用的
-`/dev/fuse` 和支持 shared bind propagation 的 Linux 内核。
+`/dev/fuse`、shared bind propagation，以及内核 FUSE 的
+`DIRECT_IO_ALLOW_MMAP` 能力。`pitr init` 会在挂载协商时做权威检查；
+不支持的内核会收到明确错误，不会降级到无法保证升级写入原子性的缓存写模式。
 
 用户不需要单独安装、初始化或配置 JuiceFS 和 PostgreSQL：它们由 pitr-fs 镜像
 在内部管理。
@@ -210,6 +214,40 @@ pitr logs quickstart/test.txt -l -n 10
 pitr revert <版本号> --path quickstart
 cat quickstart/test.txt
 ```
+
+### 5. 查看版本与逻辑升级
+
+```bash
+pitr version
+```
+
+项目尚未发布稳定 Release，`pitr upgrade` 当前不会自动跟踪不稳定的 `main`。
+可在 Linux 构建并使用本地逻辑升级包：
+
+```bash
+mkdir -p dist
+PITR_VERSION=dev-test ./scripts/build-upgrade-bundle.sh dist/pitr-dev-test.tar.gz
+pitr upgrade --bundle dist/pitr-dev-test.tar.gz --check
+pitr upgrade --bundle dist/pitr-dev-test.tar.gz
+```
+
+实际升级前会提示：文件系统服务和挂载将短暂中断，请先确保没有写入。交互确认后，
+升级器先原子冻结写入口；冻结后的创建、覆盖、删除、重命名等操作会直接返回
+`EBUSY`，不会写入底层文件或产生中间版本。已经进入代理的当前单次写请求会先返回；
+随后升级器关闭仍开放的底层句柄，撤销该自动版本中已经写入的全部半成品。原进程继续使用旧 fd 会失败，
+升级不会等待无法估算剩余时间的大文件写完。之后只切换版本化的
+`pitr`、`pitrd` 和幂等 schema，容器、PostgreSQL、对象存储及数据卷保持运行；
+只有 schema SHA256 发生变化时才执行数据库校准，已应用的摘要会持久化；
+纯二进制升级和后续容器恢复不会重建 slice 索引。健康检查失败会自动恢复旧逻辑。
+非交互环境必须显式传 `--yes`。回退上一个逻辑版本：
+
+```bash
+pitr upgrade --rollback
+```
+
+老安装首次启用版本化逻辑目录时，需要先使用包含该能力的新版源码执行一次
+`./install.sh install`；此后普通逻辑升级不再重建容器。基础镜像、PostgreSQL 或
+JuiceFS 自身升级仍属于完整容器升级，不在 `pitr upgrade` 的范围内。
 
 恢复服务、卸载或彻底清理：
 

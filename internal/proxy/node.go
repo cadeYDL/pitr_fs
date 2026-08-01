@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -15,8 +16,10 @@ type Node struct {
 
 type trackedFile struct {
 	*fs.LoopbackFile
-	id       uint64
-	writable bool
+	id        uint64
+	writable  bool
+	released  atomic.Bool
+	discarded atomic.Bool
 
 	auditMu sync.Mutex
 	path    string

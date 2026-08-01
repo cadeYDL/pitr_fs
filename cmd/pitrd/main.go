@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	pb "pitr_fs/api/pitrd/v1"
+	"pitr_fs/internal/buildinfo"
 	pitrmount "pitr_fs/internal/mount"
 	"pitr_fs/internal/pg"
 	"pitr_fs/internal/proxy"
@@ -159,6 +160,12 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		}
 		return fuseProxy.Unmount()
 	}
+	forceUmountProxy := func(context.Context) error {
+		if fuseProxy == nil {
+			return nil
+		}
+		return fuseProxy.UnmountLazy()
+	}
 	fuseMount := ""
 	retention := flagRetention
 	if persisted != nil {
@@ -179,15 +186,32 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	}()
 
 	handler := pitrserver.New(db, mgr, pitrserver.Config{
-		Volume:      flagVolume,
-		JFSMount:    flagJFSMount,
-		FUSEMount:   fuseMount,
-		MountRoot:   flagMountRoot,
-		Retention:   retention,
-		JFSMounted:  true,
-		FUSEMounted: fuseProxy != nil && fuseProxy.Mounted(),
-		MountFunc:   mountProxy,
-		UmountFunc:  umountProxy,
+		DaemonVersion:   buildinfo.Full(),
+		Volume:          flagVolume,
+		JFSMount:        flagJFSMount,
+		FUSEMount:       fuseMount,
+		MountRoot:       flagMountRoot,
+		Retention:       retention,
+		JFSMounted:      true,
+		FUSEMounted:     fuseProxy != nil && fuseProxy.Mounted(),
+		MountFunc:       mountProxy,
+		UmountFunc:      umountProxy,
+		ForceUmountFunc: forceUmountProxy,
+		QuiesceFunc: func(enabled bool) {
+			if fuseProxy != nil {
+				fuseProxy.SetQuiescing(enabled)
+			}
+		},
+		DiscardWritesFunc: func(ctx context.Context) (int, error) {
+			if fuseProxy == nil {
+				return 0, nil
+			}
+			return fuseProxy.DiscardOpenWrites(ctx)
+		},
+		UpgradeDiscardRequested: func() bool {
+			_, err := os.Stat("/run/pitr/discard-open-writes")
+			return err == nil
+		},
 	})
 	grpcServer := grpc.NewServer()
 	pb.RegisterPitrdServer(grpcServer, handler)

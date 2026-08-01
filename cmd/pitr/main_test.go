@@ -30,11 +30,25 @@ func TestPitrCLI_Help(t *testing.T) {
 	got := buf.String()
 	for _, sub := range []string{
 		"daemon", "init", "recover", "mount", "umount", "status", "config",
-		"logs", "diff", "revert", "clear",
+		"logs", "diff", "revert", "clear", "version", "upgrade",
 	} {
 		if !bytes.Contains([]byte(got), []byte(sub)) {
 			t.Errorf("--help 输出未包含子命令 %q", sub)
 		}
+	}
+}
+
+func TestPitrCLI_VersionClientOnly(t *testing.T) {
+	root := newRoot()
+	buf := new(bytes.Buffer)
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"version", "--client-only"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "pitr dev (commit=unknown, built=unknown)") {
+		t.Fatalf("version 输出=%q", buf.String())
 	}
 }
 

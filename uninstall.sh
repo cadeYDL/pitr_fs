@@ -27,7 +27,7 @@ pitr_uninstall_main() (
         -h|--help)
             cat <<'EOF'
 用法: source ./uninstall.sh [--purge]
-  无参数    删除服务、挂载和 pitr 命令，保留数据、依赖和安装配置
+  无参数    删除服务、挂载、pitr 命令和逻辑版本，保留数据、依赖和安装配置
   --purge   永久删除数据，并清理由 pitr-fs 安装的宿主依赖
 
 必须使用 source，让卸载脚本在成功后自动清理当前 Bash 的命令缓存。
@@ -69,6 +69,15 @@ EOF
     local sudo
     sudo=$(sudo_if_needed "$BIN_LINK")
     $sudo rm -f "$BIN_LINK"
+    sudo=$(sudo_if_needed "$HOST_UPGRADER")
+    $sudo rm -f "$HOST_UPGRADER"
+    $sudo rmdir "$(dirname "$HOST_UPGRADER")" 2>/dev/null || true
+    if [ -f "$RUNTIME_DIR/.pitr-runtime" ]; then
+        sudo=$(sudo_if_needed "$RUNTIME_DIR")
+        $sudo rm -rf -- "$RUNTIME_DIR"
+    elif [ -e "$RUNTIME_DIR" ]; then
+        echo "  未识别的运行目录未删除: $RUNTIME_DIR"
+    fi
     if [ "$purge" -ne 0 ]; then
         bash "$SCRIPT_DIR/scripts/install-deps.sh" --uninstall
         sudo=$(sudo_if_needed "$INSTALL_CONFIG")

@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -62,6 +63,9 @@ func (s *Server) mountLocked(ctx context.Context, index int, requestedPath strin
 			"当前卷已初始化到 %q；当前版本仅支持一个挂载路径", volume.FUSEMount)
 	}
 	if volume.FUSEMounted {
+		if s.cfg.QuiesceFunc != nil {
+			s.cfg.QuiesceFunc(false)
+		}
 		if err := s.mgr.SaveVolumeMountConfig(ctx, txn.VolumeMountConfig{
 			VolumeName: volume.Name,
 			FUSEMount:  cleaned,
@@ -93,6 +97,9 @@ func (s *Server) mountLocked(ctx context.Context, index int, requestedPath strin
 		return status.Error(codes.Internal, fmt.Sprintf("持久化挂载配置: %v", err))
 	}
 	s.rev.SetMountPath(cleaned)
+	if s.cfg.QuiesceFunc != nil {
+		s.cfg.QuiesceFunc(false)
+	}
 	return nil
 }
 
@@ -203,12 +210,6 @@ func (s *Server) Umount(
 	if req.GetPath() == "" {
 		return nil, status.Error(codes.InvalidArgument, "path 不能为空")
 	}
-	if active, err := s.mgr.CountOpenWrites(ctx); err != nil {
-		return nil, rpcError(err)
-	} else if active != 0 {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"仍有 %d 个开放写窗口，拒绝卸载", active)
-	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	index, err := s.findVolumeLocked(req.GetPath(), "")
@@ -218,13 +219,69 @@ func (s *Server) Umount(
 	if !s.volumes[index].FUSEMounted {
 		return &emptypb.Empty{}, nil
 	}
-	if s.cfg.UmountFunc == nil {
+	if s.cfg.QuiesceFunc != nil {
+		s.cfg.QuiesceFunc(true)
+	}
+	upgradeDiscard := s.cfg.UpgradeDiscardRequested != nil &&
+		s.cfg.UpgradeDiscardRequested()
+	resumeWrites := true
+	defer func() {
+		if resumeWrites && s.cfg.QuiesceFunc != nil {
+			s.cfg.QuiesceFunc(false)
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	var active int64
+	for {
+		active, err = s.mgr.CountOpenWrites(ctx)
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		if active == 0 {
+			break
+		}
+		if upgradeDiscard {
+			if s.cfg.DiscardWritesFunc == nil {
+				return nil, status.Error(codes.FailedPrecondition,
+					"daemon 未配置升级写窗口丢弃能力")
+			}
+			discarded, discardErr := s.cfg.DiscardWritesFunc(ctx)
+			if discardErr != nil {
+				// 底层 fd 可能已经关闭，此时不能假装恢复可写。
+				// 保持冻结，由管理员恢复/重启后处理遗留窗口。
+				resumeWrites = false
+				return nil, status.Errorf(codes.Internal,
+					"丢弃 %d 个开放写窗口: %v；写入保持冻结，请恢复服务",
+					active, discardErr)
+			}
+			if discarded == 0 {
+				return nil, status.Error(codes.Internal,
+					"检测到开放写窗口但代理没有可丢弃窗口")
+			}
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"写入冻结后仍有 %d 个开放写窗口，已取消卸载", active)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	umountFunc := s.cfg.UmountFunc
+	if upgradeDiscard && s.cfg.ForceUmountFunc != nil {
+		umountFunc = s.cfg.ForceUmountFunc
+	}
+	if umountFunc == nil {
 		return nil, status.Error(codes.FailedPrecondition, "daemon 未配置动态 umount")
 	}
-	if err := s.cfg.UmountFunc(ctx); err != nil {
+	if err := umountFunc(ctx); err != nil {
 		return nil, status.Errorf(codes.Internal, "卸载 FUSE: %v", err)
 	}
 	s.volumes[index].FUSEMounted = false
+	resumeWrites = false
 	return &emptypb.Empty{}, nil
 }
 

@@ -143,6 +143,9 @@ func (n *Node) Open(
 	ctx context.Context,
 	flags uint32,
 ) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	if flags&syscall.O_ACCMODE != syscall.O_RDONLY && n.root.Quiescing() {
+		return nil, 0, syscall.EBUSY
+	}
 	path := n.root.visiblePath(n)
 	posixOp := fmt.Sprintf("open(%q, %s)", path, formatOpenFlags(flags))
 	open := func() syscall.Errno {
@@ -292,9 +295,45 @@ func (n *Node) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	if !file.writable {
 		return file.LoopbackFile.Flush(ctx)
 	}
+	if file.discarded.Load() || n.root.Quiescing() {
+		return syscall.EBUSY
+	}
+	n.root.window.Lock()
+	defer n.root.window.Unlock()
+	if file.discarded.Load() || n.root.Quiescing() {
+		return syscall.EBUSY
+	}
 	// auto 必须保留到 Release:JuiceFS 可能只在关闭原始底层 fd 时提交
 	// 大块写的 chunk 元数据。Commit/Rollback 会短暂等待异步 Release。
 	return file.LoopbackFile.Flush(ctx)
+}
+
+// Fsync 与 Flush 共用升级屏障，避免已经被丢弃的句柄在 undo
+// 之后又尝试把缓存数据下沉到底层文件。
+func (n *Node) Fsync(
+	ctx context.Context,
+	f fs.FileHandle,
+	flags uint32,
+) syscall.Errno {
+	file, ok := tracked(f)
+	if !ok {
+		if syncer, ok := f.(fs.FileFsyncer); ok {
+			return syncer.Fsync(ctx, flags)
+		}
+		return 0
+	}
+	if !file.writable {
+		return file.LoopbackFile.Fsync(ctx, flags)
+	}
+	if file.discarded.Load() || n.root.Quiescing() {
+		return syscall.EBUSY
+	}
+	n.root.window.Lock()
+	defer n.root.window.Unlock()
+	if file.discarded.Load() || n.root.Quiescing() {
+		return syscall.EBUSY
+	}
+	return file.LoopbackFile.Fsync(ctx, flags)
 }
 
 func (n *Node) CopyFileRange(
