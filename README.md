@@ -90,7 +90,36 @@ PITR_BLOCK_PATH=/mnt/pitr-blocks ./install.sh install
 卸载时即使指定 `--purge`，安装脚本也不会删除这个用户目录。S3、MinIO、OSS
 等后端仍可通过 `PITR_STORAGE`、`PITR_BUCKET` 和对应凭证配置。
 
+JuiceFS 本地缓存使用独立的 `pitr_cache` Docker volume，默认上限为
+1024 MiB，不会写入容器可写层。可在首次安装时调整：
+
+```bash
+PITR_JFS_CACHE_SIZE=2048 ./install.sh install
+```
+
+缓存卷名和上限会写入安装配置；普通卸载和彻底卸载都会删除这个临时缓存卷，
+不会影响 PostgreSQL 元数据卷和对象数据卷。
+
+使用已部署、且能从 pitr-fs 容器访问的 MinIO：
+
+```bash
+PITR_STORAGE=minio \
+PITR_BUCKET=http://minio.storage.example:9000/pitr-data \
+AWS_ACCESS_KEY_ID=pitr-access-key \
+AWS_SECRET_ACCESS_KEY='替换为实际密钥' \
+./install.sh install
+```
+
+`PITR_BUCKET` 必须包含 bucket 名，域名或 IP 必须能从容器内解析并访问；不要写
+`127.0.0.1` 代表宿主机。对象后端只在首次格式化卷时确定，已有元数据卷执行
+`recover` 不会切换后端。生产环境应通过受控的密钥注入方式提供凭证；安装器
+不会把上述凭证写入 `/etc/pitr-fs/install.conf`。
+
 ### 3. 初始化并挂载目录
+
+> **挂载前请确认目标是专用的新目录或空目录。** `pitr init` 会在目标路径上
+> 建立文件系统挂载；原目录中已经存在的文件会被挂载层遮蔽，也不会自动导入
+> pitr-fs。请先迁移已有数据，避免把“被遮蔽”误认为丢失或覆盖。
 
 绝对路径：
 
@@ -163,6 +192,9 @@ source ./uninstall.sh
 - pitr-fs 安装的宿主机依赖；
 - `/etc/pitr-fs/install.conf` 中的非敏感安装参数。
 
+JuiceFS 临时缓存卷会在普通卸载时删除；它不包含唯一数据，重新安装时会自动
+创建。
+
 因此之后可以直接恢复原来的数据和挂载：
 
 ```bash
@@ -233,10 +265,16 @@ pitr logs . -l -n 20
 设置持久化的全局历史上限，允许范围为 `1..100000`：
 
 ```bash
+pitr config
+pitr config list
 pitr config set history-limit 100
 pitr config set max-space 100GiB
 pitr config set space-reserve 20%
 ```
+
+`pitr config` 与 `pitr config list` 等价，会列出所有支持项、当前值、默认值、
+取值范围和说明。目前支持 `retention`、`history-limit`、`max-space` 和
+`space-reserve`；`pitr config --help` 也会显示这些键。
 
 查看当前空间水位，以及按最老优先顺序单独删除每个版本的预计释放量：
 
@@ -300,7 +338,8 @@ python3 ./bench/prod_aggregate.py /tmp/pitr-prod-median.csv \
 
 详细口径见 [`bench/README.md`](bench/README.md)、
 [`bench/BASELINE.md`](bench/BASELINE.md)、[`bench/PROD.md`](bench/PROD.md)
-以及 [`docs/性能瓶颈.md`](docs/性能瓶颈.md)。
+、[`bench/IO_RECOVERY.md`](bench/IO_RECOVERY.md) 以及
+[`docs/性能瓶颈.md`](docs/性能瓶颈.md)。
 
 ## 例子
 
@@ -361,6 +400,10 @@ compact 当前 chunk，减少对前台读取和写入的扰动。
 `PITR_GC_INTERVAL` 控制后台合并间隔（默认 `10m`，`0` 停用），
 `PITR_GC_THREADS` 控制对象删除并发（默认 `4`）。停用 GC 只会延后物理删除，
 不会破坏版本引用的正确性。
+
+JuiceFS 读缓存通过 `PITR_JFS_CACHE_SIZE` 限制，默认 1024 MiB，并存放在独立
+缓存卷。不能只依赖 JuiceFS 的宿主空闲比例判断：容器或虚拟机可能存在宿主
+`df` 不可见的配额，未限制的默认 100 GiB 缓存会先撞穿该配额并拖累 PostgreSQL。
 
 空间计数由 `jfs_chunk_ref` 的增量触发器维护，不在普通写入中遍历对象存储。
 当引用从正数降为零时，slice 从 `retained` 转入 `reclaimable`，并把预计字节

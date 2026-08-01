@@ -21,3 +21,7 @@ with Client("/var/run/pitrd.sock") as client:
 
 `begin()` 和 `transaction()` 只为兼容保留，调用会明确报错，因为系统
 已没有手工事务模式。
+
+已提交的 Python stub 由 `grpcio-tools==1.83.0` 生成。若修改 proto，请安装
+`.[generate]` 后运行 `./generate.sh`；运行时依赖下限必须与生成文件声明的
+gRPC 和 Protobuf 版本保持一致。
