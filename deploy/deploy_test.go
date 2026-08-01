@@ -437,6 +437,8 @@ func TestInstall_TracksAndRemovesOnlyManagedDependencies(t *testing.T) {
 		`docker_snapshot_after`,
 		`Docker 中存在非 pitr-fs 管理的镜像`,
 		`Docker 中存在非 pitr-fs 容器`,
+		`systemctl stop docker.service docker.socket`,
+		`run_root rm -f /run/docker.sock`,
 		`run_root rm -rf -- /var/lib/docker /var/lib/containerd`,
 	} {
 		if !bytes.Contains(deps, []byte(required)) {

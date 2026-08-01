@@ -179,6 +179,15 @@ uninstall_managed_dependencies() {
 
     if [ "${#owned_packages[@]}" -gt 0 ]; then
         echo "==> 卸载 pitr-fs 曾安装的软件包: ${owned_packages[*]}"
+        if [ "$docker_owned" -ne 0 ] && command -v systemctl >/dev/null 2>&1; then
+            # 先停止 socket unit，再卸载 Docker 包。否则 systemd 可能继续持有旧的
+            # /run/docker.sock；同机重新安装时 dockerd 会因没有有效 socket activation
+            # fd 而启动失败。
+            run_root systemctl stop docker.service docker.socket 2>/dev/null || true
+            if ! systemctl is-active --quiet docker.socket; then
+                run_root rm -f /run/docker.sock
+            fi
+        fi
         case "$manager" in
             apt-get)
                 simulated=$(run_root apt-get -s purge "${owned_packages[@]}")
@@ -421,6 +430,11 @@ if command -v docker >/dev/null 2>&1 && ! docker_daemon_available; then
     state_values package | grep -Eq '^(docker|docker\.io|docker-ce)$' && docker_managed=1
     if [ "$docker_missing_before" -ne 0 ] || [ "$docker_managed" -ne 0 ]; then
         if command -v systemctl >/dev/null 2>&1; then
+            # 修复中断安装或同机卸载重装留下的失效 socket activation 状态。
+            run_root systemctl stop docker.service docker.socket 2>/dev/null || true
+            if ! systemctl is-active --quiet docker.socket; then
+                run_root rm -f /run/docker.sock
+            fi
             run_root systemctl daemon-reload
             run_root systemctl reset-failed docker.service docker.socket 2>/dev/null || true
             run_root systemctl enable --now containerd.service
