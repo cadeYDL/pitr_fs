@@ -54,6 +54,30 @@ func TestJuiceFS_Validation(t *testing.T) {
 	if err := m.Start(context.Background()); err == nil {
 		t.Fatal("相对 mountpoint 应失败")
 	}
+	m = &JuiceFS{
+		MetaURL: "postgres://example", MountPoint: "/tmp/x", CacheSizeMiB: -1,
+	}
+	if err := m.Start(context.Background()); err == nil {
+		t.Fatal("负数 cache size 应失败")
+	}
+}
+
+func TestJuiceFS_MountArgsLimitCache(t *testing.T) {
+	m := &JuiceFS{
+		MetaURL: "postgres://example", MountPoint: "/tmp/jfs",
+	}
+	if err := m.validate(); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(m.mountArgs(), " ")
+	if !strings.Contains(args, "--cache-size 1024") {
+		t.Fatalf("默认挂载参数未限制缓存: %s", args)
+	}
+	m.CacheSizeMiB = 256
+	args = strings.Join(m.mountArgs(), " ")
+	if !strings.Contains(args, "--cache-size 256") {
+		t.Fatalf("自定义缓存未生效: %s", args)
+	}
 }
 
 func TestJuiceFS_StopBeforeStart(t *testing.T) {

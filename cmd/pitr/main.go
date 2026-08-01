@@ -536,9 +536,65 @@ func newSpaceCmd() *cobra.Command {
 }
 
 func newConfigCmd() *cobra.Command {
+	const configHelp = `查看或设置全局运行时配置。
+
+支持的配置项：
+  retention      verbose|compact|archive；archive 必须配合 --window
+  history-limit  1..100000，最多保留的版本数
+  max-space      unlimited、0 或容量值（如 100GiB）
+  space-reserve  1..99%，达到可用空间高水位后优先淘汰老版本`
+	listConfig := func(cmd *cobra.Command, _ []string) error {
+		client, err := dialDaemon(cmd)
+		if err != nil {
+			return err
+		}
+		defer client.close()
+		ctx, cancel := rpcContext(cmd)
+		defer cancel()
+		resp, err := client.rpc.Status(ctx, &pb.StatusRequest{})
+		if err != nil {
+			return friendlyRPCError(cmd, err)
+		}
+		retention, historyLimit, maxSpace, spaceReserve := "-", "-", "-", "-"
+		if len(resp.GetVolumes()) > 0 {
+			volume := resp.GetVolumes()[0]
+			retention = volume.GetRetention()
+			if retention == "" {
+				retention = "-"
+			}
+			historyLimit = fmt.Sprintf("%d", volume.GetHistoryLimit())
+			maxSpace = txn.FormatSpaceLimit(volume.GetMaxSpaceBytes())
+			spaceReserve = fmt.Sprintf("%d%%", volume.GetSpaceReservePercent())
+		}
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+			"配置项\t当前值\t默认值\t取值范围\t说明")
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"retention\t%s\tcompact\tverbose|compact|archive\t版本保留策略；archive 需 --window\n",
+			retention)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"history-limit\t%s\t100\t1..100000\t最多保留的版本数\n",
+			historyLimit)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"max-space\t%s\tunlimited\tunlimited|0|容量值\t允许用户实际占用的最大空间\n",
+			maxSpace)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"space-reserve\t%s\t20%%\t1..99%%\t临近空间比例，优先淘汰老版本\n",
+			spaceReserve)
+		return nil
+	}
 	c := &cobra.Command{
 		Use:   "config",
-		Short: "运行时配置(retention 等)",
+		Short: "查看或设置运行时配置",
+		Long:  configHelp,
+		Args:  cobra.NoArgs,
+		RunE:  listConfig,
+	}
+	list := &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "列出支持的配置项和当前值",
+		Args:    cobra.NoArgs,
+		RunE:    listConfig,
 	}
 	set := &cobra.Command{
 		Use:   "set <key> <value>",
@@ -569,7 +625,7 @@ func newConfigCmd() *cobra.Command {
 		},
 	}
 	set.Flags().String("window", "", "archive 策略的保留窗口,如 30d")
-	c.AddCommand(set)
+	c.AddCommand(list, set)
 	return c
 }
 

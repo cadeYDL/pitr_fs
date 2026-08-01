@@ -586,6 +586,8 @@ CREATE TRIGGER tg_pitr_release_version_pins
 CREATE OR REPLACE FUNCTION pitr_capture_node_change() RETURNS TRIGGER AS $$
 DECLARE
     v_txn bigint := pitr_current_txn();
+    v_chunk RECORD;
+    v_inserted integer;
 BEGIN
     IF v_txn IS NULL THEN
         RETURN COALESCE(NEW, OLD);
@@ -598,6 +600,26 @@ BEGIN
         CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END
     )
     ON CONFLICT (txn_id, inode) DO NOTHING;
+    -- JuiceFS 对 unlink 的 chunk 清理可能同步执行，也可能交给后台异步执行。
+    -- 不能依赖 jfs_chunk DELETE trigger：异步清理发生在 auto 窗口关闭后，
+    -- 已经没有可归属的版本。node DELETE 时主动快照仍存在的全部 chunk，
+    -- 同步路径已记录的行由唯一键去重；这样恢复文件长度时不会得到稀疏空洞。
+    IF TG_OP = 'DELETE' THEN
+        FOR v_chunk IN
+            SELECT c.inode,c.indx,c.slices,to_jsonb(c) AS snapshot
+              FROM jfs_chunk c
+             WHERE c.inode=OLD.inode
+             ORDER BY c.indx
+        LOOP
+            INSERT INTO pitr_chunk_history(txn_id,inode,indx,op,snapshot)
+            VALUES (v_txn,v_chunk.inode,v_chunk.indx,'D',v_chunk.snapshot)
+            ON CONFLICT (txn_id,inode,indx) DO NOTHING;
+            GET DIAGNOSTICS v_inserted = ROW_COUNT;
+            IF v_inserted = 1 AND v_chunk.slices IS NOT NULL THEN
+                PERFORM pitr_pin_chunk_slices(v_txn,v_chunk.slices);
+            END IF;
+        END LOOP;
+    END IF;
     RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;

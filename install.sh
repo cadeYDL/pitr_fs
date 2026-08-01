@@ -15,6 +15,9 @@ MOUNT_ROOT="${PITR_MOUNT_ROOT:-${SAVED_MOUNT_ROOT:-/pitr}}"
 BIN_LINK="${PITR_BIN:-${SAVED_BIN_LINK:-/usr/local/bin/pitr}}"
 PG_VOLUME="${PITR_PG_VOLUME:-${SAVED_PG_VOLUME:-pitr_pgdata}}"
 DATA_VOLUME="${PITR_DATA_VOLUME:-${SAVED_DATA_VOLUME:-pitr_data}}"
+CACHE_VOLUME="${PITR_CACHE_VOLUME:-${SAVED_CACHE_VOLUME:-pitr_cache}}"
+JFS_CACHE_SIZE="${PITR_JFS_CACHE_SIZE:-${SAVED_JFS_CACHE_SIZE:-1024}}"
+CACHE_VOLUME_MANAGED="${SAVED_CACHE_VOLUME_MANAGED:-}"
 BLOCK_PATH="${PITR_BLOCK_PATH:-${SAVED_BLOCK_PATH:-}}"
 READY_TIMEOUT="${PITR_READY_TIMEOUT:-120}"
 DOCKER_COMMAND=(docker)
@@ -37,6 +40,8 @@ usage() {
   PITR_IMAGE       镜像名 (默认 pitr-fs:latest)
   PITR_PG_VOLUME   PostgreSQL Docker volume (默认 pitr_pgdata)
   PITR_DATA_VOLUME 对象数据 Docker volume (默认 pitr_data)
+  PITR_CACHE_VOLUME JuiceFS 临时缓存 Docker volume (默认 pitr_cache)
+  PITR_JFS_CACHE_SIZE JuiceFS 本地缓存上限 MiB (默认 1024)
   PITR_BLOCK_PATH  用户已挂载的块存储目录；为空时使用本地 Docker volume
   PITR_STORAGE     JuiceFS 存储后端 (默认 file); s3/minio/oss/cos/...
   PITR_BUCKET      存储 bucket URL / 本地路径 (默认容器内 /data)
@@ -62,6 +67,16 @@ validate_mount_root() {
     esac
     [ "$MOUNT_ROOT" != "/" ] || {
         echo "错误: PITR_MOUNT_ROOT 不能是根目录" >&2
+        exit 1
+    }
+    case "$JFS_CACHE_SIZE" in
+        ''|*[!0-9]*)
+            echo "错误: PITR_JFS_CACHE_SIZE 必须是正整数 MiB: $JFS_CACHE_SIZE" >&2
+            exit 1
+            ;;
+    esac
+    [ "$JFS_CACHE_SIZE" -ge 1 ] || {
+        echo "错误: PITR_JFS_CACHE_SIZE 必须至少为 1 MiB" >&2
         exit 1
     }
     if [ -n "$BLOCK_PATH" ]; then
@@ -176,6 +191,15 @@ prepare_block_storage() {
     }
 }
 
+prepare_cache_volume() {
+    if docker_cli volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then
+        CACHE_VOLUME_MANAGED="${CACHE_VOLUME_MANAGED:-0}"
+        return 0
+    fi
+    docker_cli volume create "$CACHE_VOLUME" >/dev/null
+    CACHE_VOLUME_MANAGED=1
+}
+
 detach_stale_fuse() {
     local attempt target index
     local -a targets relevant
@@ -275,6 +299,9 @@ write_install_config() {
         printf 'SAVED_BIN_LINK=%q\n' "$BIN_LINK"
         printf 'SAVED_PG_VOLUME=%q\n' "$PG_VOLUME"
         printf 'SAVED_DATA_VOLUME=%q\n' "$DATA_VOLUME"
+        printf 'SAVED_CACHE_VOLUME=%q\n' "$CACHE_VOLUME"
+        printf 'SAVED_JFS_CACHE_SIZE=%q\n' "$JFS_CACHE_SIZE"
+        printf 'SAVED_CACHE_VOLUME_MANAGED=%q\n' "$CACHE_VOLUME_MANAGED"
         printf 'SAVED_BLOCK_PATH=%q\n' "$BLOCK_PATH"
     } | $sudo tee "$INSTALL_CONFIG" >/dev/null
     $sudo chmod 0644 "$INSTALL_CONFIG"
@@ -311,7 +338,9 @@ run_container() {
         ${AWS_SECRET_ACCESS_KEY:+-e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"} \
         ${PITR_GC_INTERVAL:+-e "PITR_GC_INTERVAL=$PITR_GC_INTERVAL"} \
         ${PITR_GC_THREADS:+-e "PITR_GC_THREADS=$PITR_GC_THREADS"} \
+        -e "PITR_JFS_CACHE_SIZE=$JFS_CACHE_SIZE" \
         -v "$PG_VOLUME:/var/lib/postgresql/data" \
+        -v "$CACHE_VOLUME:/var/jfsCache" \
         "${block_mount[@]}" \
         --mount "type=bind,source=/etc/passwd,target=/host/etc/passwd,readonly" \
         --mount "type=bind,source=$MOUNT_ROOT,target=$MOUNT_ROOT,bind-propagation=rshared" \
@@ -323,6 +352,7 @@ do_install() {
     need_host_tools
     prepare_mount_root
     prepare_block_storage
+    prepare_cache_volume
     bash "$SCRIPT_DIR/scripts/install-deps.sh" --docker-snapshot-before
     echo "==> 构建镜像 $IMAGE"
     docker_cli build -t "$IMAGE" -f "$SCRIPT_DIR/deploy/Dockerfile" "$SCRIPT_DIR"
@@ -333,33 +363,8 @@ do_install() {
     install_wrapper
     write_install_config
     bash "$SCRIPT_DIR/scripts/install-deps.sh" --docker-snapshot-after "$IMAGE"
-    local restored_mount
-    restored_mount=$(docker_cli exec "$CONTAINER" pitr status 2>/dev/null | awk -F '\t' '
-        NR > 1 { for (i=1; i<=NF; i++) if ($i ~ /^fuse=/) { sub(/^fuse=/, "", $i); print $i; exit } }
-    ')
-    if [ -n "$restored_mount" ] && mountpoint -q "$restored_mount"; then
-        cat <<EOF
-
-  ✓ 服务安装完成，已有挂载已恢复: $restored_mount
-  块存储: ${BLOCK_PATH:-本地 Docker volume $DATA_VOLUME}
-
-  可以直接进入挂载目录使用 pitr；运行 pitr status 查看配置。
-EOF
-    else
-        cat <<EOF
-
-  ✓ 服务安装完成，尚未挂载用户目录
-  允许的挂载根目录: $MOUNT_ROOT
-  块存储: ${BLOCK_PATH:-本地 Docker volume $DATA_VOLUME}
-
-  下一步:
-    mkdir -p $MOUNT_ROOT/data
-    pitr init $MOUNT_ROOT/data
-    cd $MOUNT_ROOT/data
-    echo hi > a.txt
-    pitr logs . -n 5
-EOF
-    fi
+    echo
+    echo "  ✓ 服务安装完成"
 }
 
 do_status() {
@@ -390,6 +395,7 @@ do_recover() {
     need_host_tools
     prepare_mount_root
     prepare_block_storage
+    prepare_cache_volume
     if docker_cli inspect "$CONTAINER" >/dev/null 2>&1; then
         local state
         state=$(docker_cli inspect -f '{{.State.Status}}' "$CONTAINER")

@@ -37,6 +37,7 @@ var (
 	flagLogLevel   string
 	flagGCInterval time.Duration
 	flagGCThreads  int
+	flagJFSCache   int
 )
 
 func main() {
@@ -59,6 +60,8 @@ gRPC 控制面 unix socket。`,
 	root.Flags().StringVar(&flagLogLevel, "log-level", "info", "日志级别:debug|info|warn|error")
 	root.Flags().DurationVar(&flagGCInterval, "gc-interval", 10*time.Minute, "对象 GC 批处理间隔；0 表示停用")
 	root.Flags().IntVar(&flagGCThreads, "gc-threads", 4, "JuiceFS GC 对象删除并发数")
+	root.Flags().IntVar(&flagJFSCache, "jfs-cache-size", 1024,
+		"JuiceFS 本地缓存上限(MiB)")
 	root.SetContext(ctx)
 
 	if err := root.Execute(); err != nil {
@@ -93,8 +96,9 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	defer db.Close()
 
 	jfs := &pitrmount.JuiceFS{
-		MetaURL:    dsn,
-		MountPoint: flagJFSMount,
+		MetaURL:      dsn,
+		MountPoint:   flagJFSMount,
+		CacheSizeMiB: flagJFSCache,
 	}
 	if err := jfs.Start(cmd.Context()); err != nil {
 		return fmt.Errorf("挂载 JuiceFS: %w", err)

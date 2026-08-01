@@ -60,6 +60,7 @@ pitrd \
     --mount-root "$PITR_MOUNT_ROOT" \
     --gc-interval "${PITR_GC_INTERVAL:-10m}" \
     --gc-threads "${PITR_GC_THREADS:-4}" \
+    --jfs-cache-size "${PITR_JFS_CACHE_SIZE:-1024}" \
     --socket   "$PITR_SOCKET" &
 PITRD_PID=$!
 

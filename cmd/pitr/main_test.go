@@ -288,6 +288,10 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "config", "set", "history-limit", "42"}, "set history-limit=42"},
 		{[]string{"--socket", socket, "config", "set", "max-space", "100GiB"}, "set max-space=100GiB"},
 		{[]string{"--socket", socket, "config", "set", "space-reserve", "15%"}, "set space-reserve=15%"},
+		{[]string{"--socket", socket, "config"}, "配置项\t当前值\t默认值\t取值范围\t说明"},
+		{[]string{"--socket", socket, "config"}, "history-limit\t100\t100\t1..100000"},
+		{[]string{"--socket", socket, "config", "list"}, "max-space\t100.00 GiB\tunlimited"},
+		{[]string{"config", "--help"}, "space-reserve  1..99%"},
 		{[]string{"--socket", socket, "clear", "--global", "--yes"}, "cleared 8 versions and 21 history rows"},
 	}
 	for _, tc := range cases {

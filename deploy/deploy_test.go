@@ -77,6 +77,22 @@ func TestInstall_UsageCoversAllSubcommands(t *testing.T) {
 	}
 }
 
+func TestInstall_SuccessOutputDoesNotSuggestInitOrWrites(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"下一步:", "echo hi > a.txt", "已有挂载已恢复"} {
+		if bytes.Contains(content, []byte(forbidden)) {
+			t.Errorf("install.sh 安装成功输出不应包含 %q", forbidden)
+		}
+	}
+	if !bytes.Contains(content, []byte(`echo "  ✓ 服务安装完成"`)) {
+		t.Error("install.sh 缺少唯一的安装成功提示")
+	}
+}
+
 func TestUninstall_HelpRequiresSourceAndDocumentsPurge(t *testing.T) {
 	root := repoRoot(t)
 	sh := filepath.Join(root, "uninstall.sh")
@@ -251,6 +267,43 @@ func TestInstall_AuditCanResolveHostProcessAndUser(t *testing.T) {
 	if !bytes.Contains(dockerfile,
 		[]byte(`ENTRYPOINT ["/usr/bin/tini", "-s", "--"`)) {
 		t.Error("共享 PID namespace 后 tini 必须注册为 child subreaper")
+	}
+}
+
+func TestInstall_UsesBoundedDedicatedJuiceFSCache(t *testing.T) {
+	root := repoRoot(t)
+	installContent, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`CACHE_VOLUME="${PITR_CACHE_VOLUME:-${SAVED_CACHE_VOLUME:-pitr_cache}}"`,
+		`JFS_CACHE_SIZE="${PITR_JFS_CACHE_SIZE:-${SAVED_JFS_CACHE_SIZE:-1024}}"`,
+		`CACHE_VOLUME_MANAGED="${SAVED_CACHE_VOLUME_MANAGED:-}"`,
+		`docker_cli volume create "$CACHE_VOLUME"`,
+		`SAVED_CACHE_VOLUME_MANAGED=%q`,
+		`-e "PITR_JFS_CACHE_SIZE=$JFS_CACHE_SIZE"`,
+		`-v "$CACHE_VOLUME:/var/jfsCache"`,
+	} {
+		if !bytes.Contains(installContent, []byte(required)) {
+			t.Errorf("install.sh 缺少有界 JuiceFS 缓存配置 %q", required)
+		}
+	}
+	entrypoint, err := os.ReadFile(filepath.Join(root, "deploy", "entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(entrypoint,
+		[]byte(`--jfs-cache-size "${PITR_JFS_CACHE_SIZE:-1024}"`)) {
+		t.Error("entrypoint 未把缓存上限传给 pitrd")
+	}
+	uninstall, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(uninstall, []byte(`if [ "$CACHE_VOLUME_MANAGED" = "1" ]`)) ||
+		!bytes.Contains(uninstall, []byte(`docker_cli volume rm "$CACHE_VOLUME"`)) {
+		t.Error("卸载脚本未清理临时缓存卷")
 	}
 }
 

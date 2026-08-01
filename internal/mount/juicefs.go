@@ -17,16 +17,19 @@ import (
 )
 
 type JuiceFS struct {
-	Binary     string
-	MetaURL    string
-	MountPoint string
-	LogOutput  io.Writer
+	Binary       string
+	MetaURL      string
+	MountPoint   string
+	CacheSizeMiB int
+	LogOutput    io.Writer
 
 	mu      sync.Mutex
 	cmd     *exec.Cmd
 	done    chan error
 	managed bool
 }
+
+const defaultCacheSizeMiB = 1024
 
 // GC 使用 JuiceFS 原生对象适配层做 mark/delete，因此 file、S3、OSS 等
 // 后端共享同一套安全语义。例行生命周期回收不主动 compact 仍在使用的 chunk，
@@ -63,10 +66,34 @@ func (m *JuiceFS) validate() error {
 	if m.MountPoint == "" || !filepath.IsAbs(m.MountPoint) {
 		return fmt.Errorf("JuiceFS mountpoint 必须是绝对路径:%q", m.MountPoint)
 	}
+	if m.CacheSizeMiB < 0 {
+		return fmt.Errorf("JuiceFS cache size 不能为负数:%d", m.CacheSizeMiB)
+	}
+	if m.CacheSizeMiB == 0 {
+		m.CacheSizeMiB = defaultCacheSizeMiB
+	}
 	if m.LogOutput == nil {
 		m.LogOutput = os.Stderr
 	}
 	return nil
+}
+
+func (m *JuiceFS) mountArgs() []string {
+	return []string{
+		"mount",
+		"--no-bgjob",
+		"--no-usage-report",
+		"--backup-meta", "0",
+		"--cache-size", strconv.Itoa(m.CacheSizeMiB),
+		// pitr_revert 直接原子更新 JuiceFS 元数据表。关闭元数据缓存,
+		// 保证存储过程提交后下一次 lookup/getattr 立即读到回放结果。
+		"--attr-cache", "0",
+		"--entry-cache", "0",
+		"--dir-entry-cache", "0",
+		"--negative-entry-cache", "0",
+		m.MetaURL,
+		m.MountPoint,
+	}
 }
 
 func (m *JuiceFS) Start(ctx context.Context) error {
@@ -90,21 +117,7 @@ func (m *JuiceFS) Start(ctx context.Context) error {
 		return nil
 	}
 
-	cmd := exec.Command(
-		m.Binary,
-		"mount",
-		"--no-bgjob",
-		"--no-usage-report",
-		"--backup-meta", "0",
-		// pitr_revert 直接原子更新 JuiceFS 元数据表。关闭元数据缓存,
-		// 保证存储过程提交后下一次 lookup/getattr 立即读到回放结果。
-		"--attr-cache", "0",
-		"--entry-cache", "0",
-		"--dir-entry-cache", "0",
-		"--negative-entry-cache", "0",
-		m.MetaURL,
-		m.MountPoint,
-	)
+	cmd := exec.Command(m.Binary, m.mountArgs()...)
 	cmd.Stdout = m.LogOutput
 	cmd.Stderr = m.LogOutput
 	if err := cmd.Start(); err != nil {

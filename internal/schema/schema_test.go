@@ -419,6 +419,51 @@ func TestTrigger_CapturesChunkRef(t *testing.T) {
 	}
 }
 
+func TestTrigger_NodeDeleteCapturesChunkBeforeAsyncCleanup(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, `
+		INSERT INTO jfs_node(inode,mode,nlink,length)
+		VALUES (220,33188,1,4)`)
+	mustExec(t, conn, `
+		INSERT INTO jfs_chunk(inode,indx,slices)
+		VALUES (220,0,decode('000000000000000000000384000000040000000000000004','hex'))`)
+	mustExec(t, conn,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (900,4,1)")
+	_ = mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn(version_hash,scope_path,state,command,closed_at)
+		VALUES ('unlinkbase01','/','committed','baseline',now()) RETURNING id`)
+	unlinkID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('unlinkafter1',1,'/','auto','unlink:/a',now()) RETURNING id`)
+
+	// node 先删、chunk 由 JuiceFS 后台稍后删除，复现真实 unlink 竞态。
+	execUnderTxn(t, conn, unlinkID, "DELETE FROM jfs_node WHERE inode=220")
+	got := mustScalarInt(t, conn, `
+		SELECT count(*) FROM pitr_chunk_history
+		 WHERE txn_id=$1 AND inode=220 AND indx=0 AND op='D'
+		   AND snapshot IS NOT NULL`, unlinkID)
+	if got != 1 {
+		t.Fatalf("node DELETE 应主动捕获 chunk 快照,实际 %d", got)
+	}
+	refs := mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=900")
+	if refs != 2 {
+		t.Fatalf("历史 chunk 应增加一个物理 pin,refs=%d", refs)
+	}
+	mustExec(t, conn, "DELETE FROM jfs_chunk WHERE inode=220")
+	mustExec(t, conn, "CALL pitr_revert($1,$2)", "unlinkbase01", "/")
+	if got = mustScalarInt(t, conn,
+		"SELECT count(*) FROM jfs_chunk WHERE inode=220 AND indx=0"); got != 1 {
+		t.Fatalf("异步清理后 revert 应恢复 chunk,实际 %d", got)
+	}
+}
+
 // ============================================================================
 // TestCollapse_KeepsEarliestSnapshot — 模拟 auto v1/v2/v3,坍缩后每个 inode 只留
 // 最早那次改动的 snapshot,commit 版本自身持有全部 history

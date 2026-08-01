@@ -44,6 +44,7 @@ ENV PITR_VOLUME=default \
     PITR_MOUNT_ROOT=/pitr \
     PITR_GC_INTERVAL=10m \
     PITR_GC_THREADS=4 \
+    PITR_JFS_CACHE_SIZE=1024 \
     PITR_SOCKET=/var/run/pitrd.sock \
     PITR_DATA_DIR=/data
 

@@ -61,6 +61,11 @@ EOF
             echo "  用户块存储目录未删除: $BLOCK_PATH"
         fi
     fi
+    if [ "$CACHE_VOLUME_MANAGED" = "1" ]; then
+        docker_cli volume rm "$CACHE_VOLUME" >/dev/null 2>&1 || true
+    else
+        echo "  用户已有缓存卷未删除: $CACHE_VOLUME"
+    fi
     local sudo
     sudo=$(sudo_if_needed "$BIN_LINK")
     $sudo rm -f "$BIN_LINK"
