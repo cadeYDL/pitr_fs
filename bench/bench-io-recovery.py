@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -23,6 +24,7 @@ SCALES = {
 SCALE_CN = {"small": "小", "medium": "中", "large": "大", "xlarge": "超大"}
 FS_CN = {"native": "普通文件系统", "pitr": "pitrfs"}
 PITR_CLI = "pitr"
+DOCKER_COMMAND = ["docker"]
 OP_CN = {
     "seq_write": "顺序写",
     "rand_write": "随机写",
@@ -98,7 +100,7 @@ def fio_one(
         "rand_read": "randread",
     }[operation]
     command = [
-        "docker", "exec", container, "fio",
+        *DOCKER_COMMAND, "exec", container, "fio",
         f"--name={fs_name}-{scale}-{operation}",
         f"--filename={filename}",
         f"--size={size}",
@@ -359,7 +361,12 @@ def sha256_file(path: Path) -> str:
 
 
 def build_report(
-    io_rows: list[dict], recovery_rows: list[dict], rounds: int, pitr_mount: str
+    io_rows: list[dict],
+    recovery_rows: list[dict],
+    rounds: int,
+    pitr_mount: str,
+    native_path: str,
+    native_filesystem: str,
 ) -> str:
     by_key = {(r["filesystem"], r["scale"], r["operation"]): r for r in io_rows}
     lines = [
@@ -370,9 +377,9 @@ def build_report(
         f"- I/O 独立 {rounds} 轮取中位数；fio psync、iodepth=1、direct=1。",
         "- 顺序写每轮只完整写入一次文件；随机写使用固定 I/O 数，避免版本化文件系统被无限循环覆盖。",
         "- 小/中/大/超大随机写分别为 100/256/4096/8192 次 4 KiB I/O。",
-        f"- 普通文件系统为宿主 `/var/tmp` 的 Btrfs；pitrfs 为 `{pitr_mount}`。",
+        f"- 普通文件系统为宿主 `{native_path}`（`{native_filesystem}`）；pitrfs 为 `{pitr_mount}`。",
         "- 顺序 block 最大 1 MiB，随机 block 4 KiB；p99 为完成延迟。",
-        "- 恢复耗时包含 `pitr` CLI、Docker exec 与 RPC 开销，并逐文件校验结果。",
+        "- 恢复耗时包含 `pitr` CLI 与 RPC 开销，并逐文件校验结果。",
         "",
         "## I/O 中位数",
         "",
@@ -419,17 +426,76 @@ def build_report(
     return "\n".join(lines) + "\n"
 
 
+def current_history_limit() -> int:
+    """读取 config 的稳定制表符输出，避免覆盖用户原有配置。"""
+    output = run([PITR_CLI, "config"])
+    for line in output.splitlines():
+        columns = line.split("\t")
+        if columns and columns[0] == "history-limit" and len(columns) >= 2:
+            return int(columns[1])
+    raise RuntimeError("无法从 pitr config 读取 history-limit")
+
+
+def set_history_limit(value: int) -> None:
+    run([PITR_CLI, "config", "set", "history-limit", str(value)])
+
+
+def restore_history_limit(current: int, target: int, step: int = 1000) -> None:
+    """分批淘汰版本，避免一次清理过多历史超过 CLI RPC 超时。"""
+    if current <= target:
+        if current != target:
+            set_history_limit(target)
+        return
+    while current > target:
+        next_limit = max(target, current - step)
+        try:
+            set_history_limit(next_limit)
+        except RuntimeError:
+            # RPC 响应丢失时配置可能已经提交，先查询再决定是否重试。
+            observed = current_history_limit()
+            if observed > next_limit:
+                raise
+            next_limit = observed
+        current = next_limit
+
+
+def cleanup_benchmark_root(cleanup_root: Path, pitr_mount: Path) -> None:
+    """只允许删除本入口创建的挂载点直属测试目录。"""
+    resolved_root = cleanup_root.resolve()
+    resolved_mount = pitr_mount.resolve()
+    if resolved_root.parent != resolved_mount:
+        raise RuntimeError(f"拒绝清理非挂载点直属目录: {resolved_root}")
+    if not resolved_root.name.startswith("__pitr_bench_"):
+        raise RuntimeError(f"拒绝清理非基准目录: {resolved_root}")
+    if resolved_root.exists():
+        shutil.rmtree(resolved_root)
+
+
 def main() -> None:
-    global PITR_CLI
+    global PITR_CLI, DOCKER_COMMAND
     parser = argparse.ArgumentParser()
-    parser.add_argument("--container", default="pitrfs-fio-bench")
+    parser.add_argument("--container", required=True, help="由运行入口创建的 fio 容器名")
+    parser.add_argument(
+        "--docker-command",
+        default="docker",
+        help="Docker 命令；当前用户无权限时可传 'sudo docker'",
+    )
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--output", default="/tmp/pitrfs-io-recovery-bench")
-    parser.add_argument("--recovery-root", default="/pitr_fs/data/__io_recovery_bench/recovery")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--recovery-root", required=True)
+    parser.add_argument(
+        "--cleanup-root",
+        help="恢复历史上限前删除入口创建的测试目录",
+    )
+    parser.add_argument("--native-path", required=True)
     parser.add_argument("--pitr-cli", default="pitr")
-    parser.add_argument("--pitr-mount", default="/pitr_fs/data")
-    parser.add_argument("--benchmark-history-limit", type=int, default=100000)
-    parser.add_argument("--restore-history-limit", type=int, default=100)
+    parser.add_argument("--pitr-mount", required=True)
+    parser.add_argument("--benchmark-history-limit", type=int, default=5000)
+    parser.add_argument(
+        "--restore-history-limit",
+        type=int,
+        help="结束时恢复到指定值；默认自动读取运行前的值",
+    )
     parser.add_argument("--keep-history-limit", action="store_true")
     parser.add_argument(
         "--skip-io",
@@ -438,9 +504,25 @@ def main() -> None:
     )
     args = parser.parse_args()
     PITR_CLI = args.pitr_cli
+    DOCKER_COMMAND = shlex.split(args.docker_command)
+    if not DOCKER_COMMAND:
+        parser.error("--docker-command 不能为空")
+    if args.rounds < 1:
+        parser.error("--rounds 必须大于 0")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    run([PITR_CLI, "config", "set", "history-limit", str(args.benchmark_history_limit)])
+    original_history_limit = current_history_limit()
+    target_history_limit = (
+        args.restore_history_limit
+        if args.restore_history_limit is not None
+        else original_history_limit
+    )
+    benchmark_history_limit = max(
+        original_history_limit, args.benchmark_history_limit
+    )
+    if benchmark_history_limit != original_history_limit:
+        set_history_limit(benchmark_history_limit)
+    cleanup_error: Exception | None = None
     try:
         if args.skip_io:
             io_rows = json.loads((output / "io-median.json").read_text(encoding="utf-8"))
@@ -452,16 +534,43 @@ def main() -> None:
             Path(args.recovery_root), args.rounds, output / "recovery-raw.json"
         )
     finally:
-        if not args.keep_history_limit:
-            run([PITR_CLI, "config", "set", "history-limit", str(args.restore_history_limit)])
+        try:
+            if args.cleanup_root:
+                cleanup_benchmark_root(
+                    Path(args.cleanup_root),
+                    Path(args.pitr_mount),
+                )
+        except Exception as error:  # 恢复配置优先，清理错误稍后再抛出。
+            cleanup_error = error
+        finally:
+            if not args.keep_history_limit:
+                restore_history_limit(
+                    benchmark_history_limit,
+                    target_history_limit,
+                )
+    if cleanup_error is not None:
+        raise RuntimeError(f"测试数据清理失败: {cleanup_error}") from cleanup_error
     write_json(output / "recovery-raw.json", recovery_rows)
-    report = build_report(io_rows, recovery_rows, args.rounds, args.pitr_mount)
+    native_filesystem = run(
+        ["findmnt", "-T", args.native_path, "-n", "-o", "SOURCE,FSTYPE"]
+    )
+    report = build_report(
+        io_rows,
+        recovery_rows,
+        args.rounds,
+        args.pitr_mount,
+        args.native_path,
+        native_filesystem,
+    )
     (output / "REPORT.md").write_text(report, encoding="utf-8")
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "rounds": args.rounds,
-        "native_mount": run(["findmnt", "-T", "/var/tmp", "-n", "-o", "SOURCE,FSTYPE"]),
+        "native_path": args.native_path,
+        "native_mount": native_filesystem,
         "pitr_mount": run(["findmnt", "-T", args.pitr_mount, "-n", "-o", "SOURCE,FSTYPE"]),
+        "docker_command": DOCKER_COMMAND,
+        "fio_container": args.container,
         "kernel": run(["uname", "-sr"]),
         "script_sha256": sha256_file(Path(__file__)),
     }
