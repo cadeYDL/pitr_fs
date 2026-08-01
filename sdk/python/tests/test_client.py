@@ -79,6 +79,21 @@ class FakePitrd(rpc.PitrdServicer):
     def Clear(self, request, context):  # noqa: N802
         return pb.ClearResponse(versions_deleted=4, history_deleted=12)
 
+    def Space(self, request, context):  # noqa: N802
+        return pb.SpaceResponse(
+            max_space_bytes=100 << 30,
+            reserve_percent=20,
+            high_watermark_bytes=80 << 30,
+            retained_bytes=60 << 30,
+            versions=[
+                pb.SpaceVersion(
+                    version_hash="012345abcdef",
+                    pinned_bytes=2 << 30,
+                    estimated_release_bytes=1 << 30,
+                )
+            ],
+        )
+
 
 @pytest.fixture
 def pitrd(tmp_path: Path):
@@ -164,6 +179,11 @@ def test_config_and_clear(pitrd):
     socket, _ = pitrd
     with Client(socket) as client:
         client.set_history_limit(12)
+        client.set_max_space_bytes(100 << 30)
+        client.set_space_reserve(20)
+        space = client.space("/workspace", 10)
+        assert space.high_watermark_bytes == 80 << 30
+        assert space.versions[0].releasable_bytes == 1 << 30
         with pytest.raises(ValueError, match="confirm=True"):
             client.clear()
         assert client.clear(confirm=True) == (4, 12)

@@ -421,15 +421,22 @@ func TestServer_RecoverMultiVolume_OneFailureDoesNotHideSuccess(t *testing.T) {
 func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
+	initialHistory := int32(9)
+	initialMax := int64(100 << 20)
+	initialReserve := int32(20)
 
 	initialized, err := f.client.Init(ctx, &pb.InitRequest{
 		Path: "/workspace", Volume: "test-volume", Retention: "verbose",
+		HistoryLimit: &initialHistory, MaxSpaceBytes: &initialMax,
+		SpaceReservePercent: &initialReserve,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !initialized.GetVolume().GetFuseMounted() ||
-		initialized.GetVolume().GetRetention() != "verbose" {
+		initialized.GetVolume().GetRetention() != "verbose" ||
+		initialized.GetVolume().GetHistoryLimit() != initialHistory ||
+		initialized.GetVolume().GetMaxSpaceBytes() != initialMax {
 		t.Fatalf("init=%+v", initialized)
 	}
 	if _, err := f.client.Umount(ctx,
@@ -470,12 +477,42 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	if historyConfig.GetValue() != "7" {
 		t.Fatalf("history config=%+v", historyConfig)
 	}
+	spaceConfig, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "max-space", Value: "200MiB",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spaceConfig.GetValue() != "200.00 MiB" {
+		t.Fatalf("space config=%+v", spaceConfig)
+	}
+	reserveConfig, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "space-reserve", Value: "25%",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserveConfig.GetValue() != "25%" {
+		t.Fatalf("reserve config=%+v", reserveConfig)
+	}
 	statusResponse, err = f.client.Status(ctx, &pb.StatusRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := statusResponse.GetVolumes()[0].GetHistoryLimit(); got != 7 {
 		t.Fatalf("persisted history limit=%d", got)
+	}
+	volume := statusResponse.GetVolumes()[0]
+	if volume.GetMaxSpaceBytes() != 200<<20 || volume.GetSpaceReservePercent() != 25 {
+		t.Fatalf("persisted space policy=%+v", volume)
+	}
+	space, err := f.client.Space(ctx, &pb.SpaceRequest{Path: "/workspace", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if space.GetMaxSpaceBytes() != 200<<20 ||
+		space.GetHighWatermarkBytes() != 150<<20 {
+		t.Fatalf("space response=%+v", space)
 	}
 }
 

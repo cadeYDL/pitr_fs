@@ -504,3 +504,92 @@ func TestSliceIndexUpgradeRebuildsLegacyAndCleanupState(t *testing.T) {
 			refs, indexedAt, cleanupAt)
 	}
 }
+
+func TestSpacePolicyPrunesOldestByMarginalSliceBytes(t *testing.T) {
+	_, db := setupManager(t)
+	mgr := NewManager(db)
+	ctx := context.Background()
+	var rootID, oldestID, newestID int64
+	if err := db.QueryRow(ctx,
+		"SELECT id FROM pitr_txn WHERE state='root'").Scan(&rootID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `
+		INSERT INTO pitr_txn(
+			version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('spaceold001', $1, '/workspace/file', 'auto', 'write', now())
+		RETURNING id`, rootID).Scan(&oldestID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `
+		INSERT INTO pitr_txn(
+			version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('spacenew001', $1, '/workspace/file', 'auto', 'write', now())
+		RETURNING id`, oldestID).Scan(&newestID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+		VALUES (301,60,0),(302,30,0)`); err != nil {
+		t.Fatal(err)
+	}
+	oldSlices := append(encodedSlice(301, 60), encodedSlice(302, 30)...)
+	if _, err := db.Exec(ctx,
+		"SELECT pitr_pin_chunk_slices($1,$2)", oldestID, oldSlices); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx,
+		"SELECT pitr_pin_chunk_slices($1,$2)", newestID,
+		encodedSlice(301, 60)); err != nil {
+		t.Fatal(err)
+	}
+
+	policy, err := mgr.SpacePolicy(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.RetainedBytes != 90 || policy.ReclaimableBytes != 0 {
+		t.Fatalf("pin 后空间 retained=%d reclaimable=%d",
+			policy.RetainedBytes, policy.ReclaimableBytes)
+	}
+	pruned, err := mgr.SetSpacePolicy(ctx, "/", 100, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned=%d，期望只删除最老版本", pruned)
+	}
+	var oldestRows, newestRows, sharedRefs, exclusiveRefs int64
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_txn WHERE id=$1", oldestID).Scan(&oldestRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_txn WHERE id=$1", newestID).Scan(&newestRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=301").Scan(&sharedRefs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=302").Scan(&exclusiveRefs); err != nil {
+		t.Fatal(err)
+	}
+	policy, err = mgr.SpacePolicy(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queuedBytes int64
+	if err := db.QueryRow(ctx,
+		"SELECT estimated_bytes FROM pitr_gc_queue WHERE singleton").
+		Scan(&queuedBytes); err != nil {
+		t.Fatal(err)
+	}
+	if oldestRows != 0 || newestRows != 1 || sharedRefs != 1 || exclusiveRefs != 0 ||
+		policy.RetainedBytes != 60 || policy.ReclaimableBytes != 30 || queuedBytes != 30 {
+		t.Fatalf("old=%d new=%d shared=%d exclusive=%d retained=%d reclaimable=%d queued=%d",
+			oldestRows, newestRows, sharedRefs, exclusiveRefs,
+			policy.RetainedBytes, policy.ReclaimableBytes, queuedBytes)
+	}
+}

@@ -139,6 +139,8 @@ func (fakePitrd) Status(context.Context, *pb.StatusRequest) (*pb.StatusResponse,
 		Volumes: []*pb.VolumeStatus{{
 			Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
 			Retention: "compact", HistoryLimit: 100,
+			MaxSpaceBytes: 100 << 30, SpaceReservePercent: 20,
+			RetainedSpaceBytes: 60 << 30, ReclaimableSpaceBytes: 4 << 30,
 		}},
 	}, nil
 }
@@ -182,6 +184,18 @@ func (fakePitrd) Revert(context.Context, *pb.RevertRequest) (*pb.RevertResponse,
 
 func (fakePitrd) Clear(context.Context, *pb.ClearRequest) (*pb.ClearResponse, error) {
 	return &pb.ClearResponse{VersionsDeleted: 8, HistoryDeleted: 21}, nil
+}
+
+func (fakePitrd) Space(context.Context, *pb.SpaceRequest) (*pb.SpaceResponse, error) {
+	return &pb.SpaceResponse{
+		MaxSpaceBytes: 100 << 30, ReservePercent: 20,
+		HighWatermarkBytes: 80 << 30, RetainedBytes: 60 << 30,
+		ReclaimableBytes: 4 << 30,
+		Versions: []*pb.SpaceVersion{{
+			VersionHash: "012345abcdef", ClosedAt: "2026-08-01T10:00:00Z",
+			PinnedBytes: 2 << 30, EstimatedReleaseBytes: 1 << 30,
+		}},
+	}, nil
 }
 
 func (fakePitrd) Recover(context.Context, *pb.RecoverRequest) (*pb.RecoverResponse, error) {
@@ -257,6 +271,8 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 	}{
 		{[]string{"--socket", socket, "status"}, "connected to pitrd test, 1 volumes"},
 		{[]string{"--socket", socket, "status"}, "history-limit=100"},
+		{[]string{"--socket", socket, "space", "/workspace"}, "max=100.00 GiB reserve=20% high=80.00 GiB"},
+		{[]string{"--socket", socket, "space", "/workspace"}, "012345abcdef\t1.00 GiB\t2.00 GiB"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef   commit   # done"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-l", "-n", "1"},
 			"012345abcdef\twrite(\"/workspace/proj/a\", offset=0, total=2, calls=1)\techo 12345..."},
@@ -270,6 +286,8 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "mount", "/workspace"}, "mounted default @ /workspace"},
 		{[]string{"--socket", socket, "config", "set", "retention", "archive", "--window", "30d"}, "set retention=archive window=30d"},
 		{[]string{"--socket", socket, "config", "set", "history-limit", "42"}, "set history-limit=42"},
+		{[]string{"--socket", socket, "config", "set", "max-space", "100GiB"}, "set max-space=100GiB"},
+		{[]string{"--socket", socket, "config", "set", "space-reserve", "15%"}, "set space-reserve=15%"},
 		{[]string{"--socket", socket, "clear", "--global", "--yes"}, "cleared 8 versions and 21 history rows"},
 	}
 	for _, tc := range cases {

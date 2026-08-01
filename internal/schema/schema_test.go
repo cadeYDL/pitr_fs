@@ -227,7 +227,7 @@ func TestSQL_TablesExist(t *testing.T) {
 		"pitr_txn", "pitr_node_history", "pitr_edge_history",
 		"pitr_chunk_history", "pitr_chunk_ref_history", "pitr_blob_retention",
 		"pitr_slice_pin", "pitr_slice_ref", "pitr_gc_queue",
-		"pitr_internal_state", "pitr_slice_index_state",
+		"pitr_internal_state", "pitr_slice_index_state", "pitr_space_state",
 		"pitr_config", "pitr_volume_config",
 	} {
 		n := mustScalarInt(t, conn,
@@ -265,7 +265,8 @@ func TestSQL_TablesExist(t *testing.T) {
 	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert", "pitr_rollback",
 		"pitr_capture_node_change", "pitr_capture_edge_change",
 		"pitr_capture_chunk_change", "pitr_capture_chunk_ref_change",
-		"pitr_scopes_overlap", "pitr_rebuild_slice_index"} {
+		"pitr_scopes_overlap", "pitr_rebuild_slice_index",
+		"pitr_rebuild_space_state", "pitr_track_chunk_ref_space"} {
 		n := mustScalarInt(t, conn,
 			"SELECT count(*) FROM pg_proc WHERE proname = $1", proc)
 		if n < 1 {

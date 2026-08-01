@@ -307,27 +307,110 @@ func (c *Client) Diff(
 }
 
 type Volume struct {
-	Name         string
-	JFSMount     string
-	FUSEMount    string
-	JFSMounted   bool
-	FUSEMounted  bool
-	Retention    string
-	HistoryLimit int
-	Error        string
+	Name                  string
+	JFSMount              string
+	FUSEMount             string
+	JFSMounted            bool
+	FUSEMounted           bool
+	Retention             string
+	HistoryLimit          int
+	MaxSpaceBytes         int64
+	SpaceReservePercent   int
+	RetainedSpaceBytes    int64
+	ReclaimableSpaceBytes int64
+	Error                 string
 }
 
 func volumeFromPB(value *pb.VolumeStatus) Volume {
 	return Volume{
-		Name:         value.GetName(),
-		JFSMount:     value.GetJfsMount(),
-		FUSEMount:    value.GetFuseMount(),
-		JFSMounted:   value.GetJfsMounted(),
-		FUSEMounted:  value.GetFuseMounted(),
-		Retention:    value.GetRetention(),
-		HistoryLimit: int(value.GetHistoryLimit()),
-		Error:        value.GetError(),
+		Name:                  value.GetName(),
+		JFSMount:              value.GetJfsMount(),
+		FUSEMount:             value.GetFuseMount(),
+		JFSMounted:            value.GetJfsMounted(),
+		FUSEMounted:           value.GetFuseMounted(),
+		Retention:             value.GetRetention(),
+		HistoryLimit:          int(value.GetHistoryLimit()),
+		MaxSpaceBytes:         value.GetMaxSpaceBytes(),
+		SpaceReservePercent:   int(value.GetSpaceReservePercent()),
+		RetainedSpaceBytes:    value.GetRetainedSpaceBytes(),
+		ReclaimableSpaceBytes: value.GetReclaimableSpaceBytes(),
+		Error:                 value.GetError(),
 	}
+}
+
+func (c *Client) SetMaxSpaceBytes(ctx context.Context, maxBytes int64) error {
+	if maxBytes < 0 {
+		return fmt.Errorf("max space 不能为负数: %d", maxBytes)
+	}
+	_, err := c.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "max-space", Value: fmt.Sprint(maxBytes) + "B",
+	})
+	if err != nil {
+		return fmt.Errorf("设置 max space: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) SetSpaceReserve(ctx context.Context, percent int) error {
+	if percent < 1 || percent > 99 {
+		return fmt.Errorf("space reserve 必须在 1..99 之间: %d", percent)
+	}
+	_, err := c.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "space-reserve", Value: fmt.Sprintf("%d%%", percent),
+	})
+	if err != nil {
+		return fmt.Errorf("设置 space reserve: %w", err)
+	}
+	return nil
+}
+
+type VersionSpace struct {
+	VersionHash     string
+	ClosedAt        string
+	PinnedBytes     int64
+	ReleasableBytes int64
+}
+
+type SpaceInfo struct {
+	MaxBytes           int64
+	ReservePercent     int
+	HighWatermarkBytes int64
+	RetainedBytes      int64
+	ReclaimableBytes   int64
+	Versions           []VersionSpace
+}
+
+func (c *Client) Space(
+	ctx context.Context,
+	path string,
+	limit int,
+) (SpaceInfo, error) {
+	resolved, err := resolvePath(path)
+	if err != nil {
+		return SpaceInfo{}, err
+	}
+	response, err := c.rpc.Space(ctx, &pb.SpaceRequest{
+		Path: resolved, Limit: int32(limit),
+	})
+	if err != nil {
+		return SpaceInfo{}, fmt.Errorf("查询空间: %w", err)
+	}
+	result := SpaceInfo{
+		MaxBytes:           response.GetMaxSpaceBytes(),
+		ReservePercent:     int(response.GetReservePercent()),
+		HighWatermarkBytes: response.GetHighWatermarkBytes(),
+		RetainedBytes:      response.GetRetainedBytes(),
+		ReclaimableBytes:   response.GetReclaimableBytes(),
+	}
+	for _, version := range response.GetVersions() {
+		result.Versions = append(result.Versions, VersionSpace{
+			VersionHash:     version.GetVersionHash(),
+			ClosedAt:        version.GetClosedAt(),
+			PinnedBytes:     version.GetPinnedBytes(),
+			ReleasableBytes: version.GetEstimatedReleaseBytes(),
+		})
+	}
+	return result, nil
 }
 
 func (c *Client) SetHistoryLimit(ctx context.Context, limit int) error {

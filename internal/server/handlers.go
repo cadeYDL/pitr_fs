@@ -79,8 +79,16 @@ func (s *Server) Status(
 	if err != nil {
 		return nil, rpcError(err)
 	}
+	spacePolicy, err := s.mgr.SpacePolicy(ctx, "/")
+	if err != nil {
+		return nil, rpcError(err)
+	}
 	for _, volume := range volumes {
 		volume.HistoryLimit = int32(historyLimit)
+		volume.MaxSpaceBytes = spacePolicy.MaxBytes
+		volume.SpaceReservePercent = int32(spacePolicy.ReservePercent)
+		volume.RetainedSpaceBytes = spacePolicy.RetainedBytes
+		volume.ReclaimableSpaceBytes = spacePolicy.ReclaimableBytes
 	}
 	return &pb.StatusResponse{
 		DaemonVersion:   s.cfg.DaemonVersion,
@@ -88,6 +96,40 @@ func (s *Server) Status(
 		Volumes:         volumes,
 		OpenWrites:      openWrites,
 	}, nil
+}
+
+func (s *Server) Space(
+	ctx context.Context,
+	req *pb.SpaceRequest,
+) (*pb.SpaceResponse, error) {
+	scope := req.GetPath()
+	if scope == "" {
+		scope = "/"
+	}
+	policy, err := s.mgr.SpacePolicy(ctx, scope)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	estimates, err := s.mgr.SpaceVersions(ctx, scope, int(req.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	response := &pb.SpaceResponse{
+		MaxSpaceBytes:      policy.MaxBytes,
+		ReservePercent:     int32(policy.ReservePercent),
+		HighWatermarkBytes: policy.HighWatermarkBytes(),
+		RetainedBytes:      policy.RetainedBytes,
+		ReclaimableBytes:   policy.ReclaimableBytes,
+	}
+	for _, estimate := range estimates {
+		response.Versions = append(response.Versions, &pb.SpaceVersion{
+			VersionHash:           estimate.VersionHash,
+			ClosedAt:              estimate.ClosedAt.Format(time.RFC3339Nano),
+			PinnedBytes:           estimate.PinnedBytes,
+			EstimatedReleaseBytes: estimate.ReleasableBytes,
+		})
+	}
+	return response, nil
 }
 
 func (s *Server) Begin(

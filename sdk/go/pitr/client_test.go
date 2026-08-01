@@ -104,6 +104,20 @@ func (*fakeServer) Clear(
 	}, nil
 }
 
+func (*fakeServer) Space(
+	context.Context,
+	*pb.SpaceRequest,
+) (*pb.SpaceResponse, error) {
+	return &pb.SpaceResponse{
+		MaxSpaceBytes: 100 << 30, ReservePercent: 20,
+		HighWatermarkBytes: 80 << 30, RetainedBytes: 60 << 30,
+		Versions: []*pb.SpaceVersion{{
+			VersionHash: "012345abcdef", PinnedBytes: 2 << 30,
+			EstimatedReleaseBytes: 1 << 30,
+		}},
+	}, nil
+}
+
 func startUnixServer(t *testing.T, server pb.PitrdServer) string {
 	t.Helper()
 	socket := filepath.Join(t.TempDir(), "pitrd.sock")
@@ -216,6 +230,20 @@ func TestGoSDK_ConfigAndClear(t *testing.T) {
 	defer client.Close()
 	if err := client.SetHistoryLimit(context.Background(), 12); err != nil {
 		t.Fatal(err)
+	}
+	if err := client.SetMaxSpaceBytes(context.Background(), 100<<30); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetSpaceReserve(context.Background(), 20); err != nil {
+		t.Fatal(err)
+	}
+	space, err := client.Space(context.Background(), "/workspace", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if space.HighWatermarkBytes != 80<<30 || len(space.Versions) != 1 ||
+		space.Versions[0].ReleasableBytes != 1<<30 {
+		t.Fatalf("space=%+v", space)
 	}
 	if _, err := client.Clear(context.Background(), false); err == nil {
 		t.Fatal("clear without confirmation should fail")

@@ -18,9 +18,13 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "pitr_fs/api/pitrd/v1"
+	"pitr_fs/internal/txn"
 )
 
-const rpcTimeout = 5 * time.Second
+const (
+	rpcTimeout             = 5 * time.Second
+	defaultHistoryLimitCLI = 100
+)
 
 type daemonClient struct {
 	conn *grpc.ClientConn
@@ -92,6 +96,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newMountCmd())
 	root.AddCommand(newUmountCmd())
 	root.AddCommand(newStatusCmd())
+	root.AddCommand(newSpaceCmd())
 	root.AddCommand(newConfigCmd())
 
 	// 事务与时间旅行 (§8.2)
@@ -265,6 +270,8 @@ func newDaemonCmd() *cobra.Command {
 
 func newInitCmd() *cobra.Command {
 	var volume, storage, bucket, accessKey, secretKey, retention, dataDir string
+	var historyLimit, spaceReserve int
+	var maxSpace string
 	c := &cobra.Command{
 		Use:   "init <path>",
 		Short: "幂等校准已部署卷并恢复 FUSE 挂载",
@@ -290,18 +297,36 @@ func newInitCmd() *cobra.Command {
 			}
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
-			resp, err := client.rpc.Init(ctx, &pb.InitRequest{
+			request := &pb.InitRequest{
 				Path: resolved, Volume: volume,
 				Retention: retention, StorageArgs: storageArgs,
-			})
+			}
+			if cmd.Flags().Changed("history-limit") {
+				value := int32(historyLimit)
+				request.HistoryLimit = &value
+			}
+			if cmd.Flags().Changed("max-space") {
+				value, parseErr := txn.ParseSpaceBytes(maxSpace)
+				if parseErr != nil {
+					return parseErr
+				}
+				request.MaxSpaceBytes = &value
+			}
+			if cmd.Flags().Changed("space-reserve") {
+				value := int32(spaceReserve)
+				request.SpaceReservePercent = &value
+			}
+			resp, err := client.rpc.Init(ctx, request)
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
 			item := resp.GetVolume()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"initialized %s @ %s (jfs=%s retention=%s)\n",
+				"initialized %s @ %s (jfs=%s retention=%s history-limit=%d max-space=%s reserve=%d%%)\n",
 				item.GetName(), item.GetFuseMount(),
-				item.GetJfsMount(), item.GetRetention())
+				item.GetJfsMount(), item.GetRetention(), item.GetHistoryLimit(),
+				txn.FormatSpaceLimit(item.GetMaxSpaceBytes()),
+				item.GetSpaceReservePercent())
 			return nil
 		},
 	}
@@ -312,6 +337,12 @@ func newInitCmd() *cobra.Command {
 	c.Flags().StringVar(&secretKey, "secret-key", "", "兼容参数；凭证在 install 时确定")
 	c.Flags().StringVar(&retention, "retention", "compact", "保留策略: verbose|compact|archive")
 	c.Flags().StringVar(&dataDir, "data-dir", "", "兼容参数；file 数据目录在 install 时确定")
+	c.Flags().IntVar(&historyLimit, "history-limit", defaultHistoryLimitCLI,
+		"最多保留的版本数")
+	c.Flags().StringVar(&maxSpace, "max-space", "unlimited",
+		"文件数据空间上限，例如 100GiB；unlimited 表示不限")
+	c.Flags().IntVar(&spaceReserve, "space-reserve", 20,
+		"预留空间百分比；20 表示使用达到 80% 时淘汰最老版本")
 	return c
 }
 
@@ -439,14 +470,69 @@ func newStatusCmd() *cobra.Command {
 				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetOpenWrites())
 			for _, volume := range resp.GetVolumes() {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"%s\tjfs=%s\tfuse=%s\tretention=%s\thistory-limit=%d\n",
+					"%s\tjfs=%s\tfuse=%s\tretention=%s\thistory-limit=%d\tmax-space=%s\treserve=%d%%\tretained=%s\treclaimable=%s\n",
 					volume.GetName(), volume.GetJfsMount(),
 					volume.GetFuseMount(), volume.GetRetention(),
-					volume.GetHistoryLimit())
+					volume.GetHistoryLimit(),
+					txn.FormatSpaceLimit(volume.GetMaxSpaceBytes()),
+					volume.GetSpaceReservePercent(),
+					txn.FormatSpaceBytes(volume.GetRetainedSpaceBytes()),
+					txn.FormatSpaceBytes(volume.GetReclaimableSpaceBytes()))
 			}
 			return nil
 		},
 	}
+}
+
+func newSpaceCmd() *cobra.Command {
+	var limit int
+	c := &cobra.Command{
+		Use:   "space [path]",
+		Short: "查看空间水位和按最老优先裁剪时的版本释放估算",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requested := "."
+			if len(args) == 1 {
+				requested = args[0]
+			}
+			resolved, err := resolveCLIPath(requested)
+			if err != nil {
+				return err
+			}
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := rpcContext(cmd)
+			defer cancel()
+			response, err := client.rpc.Space(ctx, &pb.SpaceRequest{
+				Path: resolved, Limit: int32(limit),
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"max=%s reserve=%d%% high=%s retained=%s reclaimable=%s\n",
+				txn.FormatSpaceLimit(response.GetMaxSpaceBytes()),
+				response.GetReservePercent(),
+				txn.FormatSpaceBytes(response.GetHighWatermarkBytes()),
+				txn.FormatSpaceBytes(response.GetRetainedBytes()),
+				txn.FormatSpaceBytes(response.GetReclaimableBytes()))
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+				"VERSION\tRELEASE_IF_DELETED\tPINNED\tCLOSED_AT")
+			for _, version := range response.GetVersions() {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n",
+					version.GetVersionHash(),
+					txn.FormatSpaceBytes(version.GetEstimatedReleaseBytes()),
+					txn.FormatSpaceBytes(version.GetPinnedBytes()),
+					version.GetClosedAt())
+			}
+			return nil
+		},
+	}
+	c.Flags().IntVarP(&limit, "limit", "n", 20, "最多显示的最老版本数")
+	return c
 }
 
 func newConfigCmd() *cobra.Command {
@@ -456,7 +542,7 @@ func newConfigCmd() *cobra.Command {
 	}
 	set := &cobra.Command{
 		Use:   "set <key> <value>",
-		Short: "设置配置，例如: pitr config set history-limit 100",
+		Short: "设置配置，例如 history-limit、max-space、space-reserve",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client, err := dialDaemon(cmd)

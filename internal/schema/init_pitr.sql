@@ -139,8 +139,11 @@ CREATE TABLE IF NOT EXISTS pitr_gc_queue (
     singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     requested_at timestamptz NOT NULL DEFAULT now(),
     attempts     bigint NOT NULL DEFAULT 0,
+    estimated_bytes bigint NOT NULL DEFAULT 0 CHECK (estimated_bytes >= 0),
     last_error   text
 );
+ALTER TABLE pitr_gc_queue
+    ADD COLUMN IF NOT EXISTS estimated_bytes bigint NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS pitr_internal_state (
     key          text PRIMARY KEY,
@@ -157,13 +160,29 @@ CREATE TABLE IF NOT EXISTS pitr_slice_index_state (
     last_version_cleanup_at timestamptz
 );
 
+-- 用户视角的近似空间计数。retained 是当前文件和可恢复版本仍需保留的
+-- 唯一 slice 字节，reclaimable 是 refs 已归零、等待原生 GC 的 slice 字节。
+CREATE TABLE IF NOT EXISTS pitr_space_state (
+    singleton        boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    retained_bytes   bigint NOT NULL DEFAULT 0 CHECK (retained_bytes >= 0),
+    reclaimable_bytes bigint NOT NULL DEFAULT 0 CHECK (reclaimable_bytes >= 0),
+    accounted_at     timestamptz NOT NULL DEFAULT now()
+);
+
 -- 持久化分层配置。当前控制面只允许写全局 '/'，查询按最长路径前缀解析，
 -- 为后续“子目录继承父目录、就近配置优先”预留数据模型。
 CREATE TABLE IF NOT EXISTS pitr_config (
     scope_path      text PRIMARY KEY,
     history_limit   integer NOT NULL CHECK (history_limit > 0),
+    max_space_bytes bigint NOT NULL DEFAULT 0 CHECK (max_space_bytes >= 0),
+    space_reserve_percent integer NOT NULL DEFAULT 20
+        CHECK (space_reserve_percent BETWEEN 1 AND 99),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE pitr_config
+    ADD COLUMN IF NOT EXISTS max_space_bytes bigint NOT NULL DEFAULT 0;
+ALTER TABLE pitr_config
+    ADD COLUMN IF NOT EXISTS space_reserve_percent integer NOT NULL DEFAULT 20;
 
 -- 卷挂载配置。当前服务只管理一个全局卷；单独建表可让 daemon 在重启后
 -- 恢复由 `pitr init <path>` 选定的用户挂载点。
@@ -424,6 +443,69 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$ LANGUAGE plpgsql;
 
+-- jfs_chunk_ref 是空间估算的权威增量源。refs>0 表示当前状态或某个历史
+-- 版本仍然需要该 slice；refs<=0 表示可由 JuiceFS GC 回收。
+CREATE OR REPLACE FUNCTION pitr_track_chunk_ref_space() RETURNS TRIGGER AS $$
+DECLARE
+    v_inserted integer;
+    v_retained_delta bigint := 0;
+    v_reclaimable_delta bigint := 0;
+BEGIN
+    INSERT INTO pitr_space_state(
+        singleton,retained_bytes,reclaimable_bytes,accounted_at
+    )
+    SELECT true,
+           COALESCE(sum(size) FILTER (WHERE refs>0),0)::bigint,
+           COALESCE(sum(size) FILTER (WHERE refs<=0),0)::bigint,
+           clock_timestamp()
+      FROM jfs_chunk_ref
+    ON CONFLICT (singleton) DO NOTHING;
+    GET DIAGNOSTICS v_inserted = ROW_COUNT;
+    -- AFTER trigger 第一次初始化时，聚合已经包含本次变更，无需再加 delta。
+    IF v_inserted = 1 THEN
+        RETURN COALESCE(NEW,OLD);
+    END IF;
+
+    IF TG_OP <> 'INSERT' THEN
+        IF OLD.refs > 0 THEN
+            v_retained_delta := v_retained_delta-OLD.size;
+        ELSE
+            v_reclaimable_delta := v_reclaimable_delta-OLD.size;
+        END IF;
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+        IF NEW.refs > 0 THEN
+            v_retained_delta := v_retained_delta+NEW.size;
+        ELSE
+            v_reclaimable_delta := v_reclaimable_delta+NEW.size;
+        END IF;
+    END IF;
+    UPDATE pitr_space_state
+       SET retained_bytes=retained_bytes+v_retained_delta,
+           reclaimable_bytes=reclaimable_bytes+v_reclaimable_delta,
+           accounted_at=clock_timestamp()
+     WHERE singleton;
+    RETURN COALESCE(NEW,OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION pitr_rebuild_space_state() RETURNS void AS $$
+BEGIN
+    INSERT INTO pitr_space_state(
+        singleton,retained_bytes,reclaimable_bytes,accounted_at
+    )
+    SELECT true,
+           COALESCE(sum(size) FILTER (WHERE refs>0),0)::bigint,
+           COALESCE(sum(size) FILTER (WHERE refs<=0),0)::bigint,
+           clock_timestamp()
+      FROM jfs_chunk_ref
+    ON CONFLICT (singleton) DO UPDATE
+       SET retained_bytes=EXCLUDED.retained_bytes,
+           reclaimable_bytes=EXCLUDED.reclaimable_bytes,
+           accounted_at=EXCLUDED.accounted_at;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION pitr_release_version_pins() RETURNS TRIGGER AS $$
 DECLARE
     v_pin          RECORD;
@@ -431,6 +513,8 @@ DECLARE
     v_piece        bytea;
     v_chunkid      bigint;
     v_size         integer;
+    v_refs_after   integer;
+    v_release_bytes bigint := 0;
     v_old_suppress text := current_setting('pitr.suppress_capture', true);
 BEGIN
     INSERT INTO pitr_slice_index_state(
@@ -452,10 +536,14 @@ BEGIN
         v_chunkid := pitr_decode_u64(substring(v_piece FROM 1 FOR 8));
         v_size := pitr_decode_u32(substring(v_piece FROM 9 FOR 4));
         UPDATE jfs_chunk_ref SET refs=refs-1
-         WHERE chunkid=v_chunkid AND size=v_size;
+         WHERE chunkid=v_chunkid AND size=v_size AND refs>0
+         RETURNING refs INTO v_refs_after;
         IF NOT FOUND THEN
             RAISE EXCEPTION '释放 txn % 时 slice %/% 引用行丢失',
                 OLD.id, v_chunkid, v_size;
+        END IF;
+        IF v_refs_after = 0 THEN
+            v_release_bytes := v_release_bytes+v_size;
         END IF;
         DELETE FROM pitr_slice_ref
          WHERE chunkid=v_chunkid AND pins=1;
@@ -470,9 +558,11 @@ BEGIN
     END LOOP;
     DELETE FROM jfs_delslices WHERE chunkid=v_pin.delayed_id;
     PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
-    INSERT INTO pitr_gc_queue(singleton,requested_at)
-    VALUES (true,now())
-    ON CONFLICT (singleton) DO UPDATE SET requested_at=EXCLUDED.requested_at;
+    INSERT INTO pitr_gc_queue(singleton,requested_at,estimated_bytes)
+    VALUES (true,now(),v_release_bytes)
+    ON CONFLICT (singleton) DO UPDATE
+       SET requested_at=EXCLUDED.requested_at,
+           estimated_bytes=pitr_gc_queue.estimated_bytes+EXCLUDED.estimated_bytes;
     RETURN OLD;
 EXCEPTION WHEN OTHERS THEN
     PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
@@ -605,6 +695,10 @@ BEGIN
         CREATE TRIGGER tg_pitr_chunk_ref_capture
             AFTER INSERT OR UPDATE OR DELETE ON jfs_chunk_ref
             FOR EACH ROW EXECUTE FUNCTION pitr_capture_chunk_ref_change();
+        DROP TRIGGER IF EXISTS tg_pitr_chunk_ref_space ON jfs_chunk_ref;
+        CREATE TRIGGER tg_pitr_chunk_ref_space
+            AFTER INSERT OR UPDATE OR DELETE ON jfs_chunk_ref
+            FOR EACH ROW EXECUTE FUNCTION pitr_track_chunk_ref_space();
     END IF;
 END $$;
 
@@ -637,6 +731,15 @@ BEGIN
         IF v_rebuild THEN
             PERFORM pitr_rebuild_slice_index();
         END IF;
+    END IF;
+END $$;
+
+-- 初始化/升级后做一次全量校准；正常运行期间由 jfs_chunk_ref trigger 增量维护，
+-- 不扫描对象存储，也不在每次 write 上聚合整表。
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='jfs_chunk_ref') THEN
+        PERFORM pitr_rebuild_space_state();
     END IF;
 END $$;
 

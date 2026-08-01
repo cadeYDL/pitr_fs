@@ -10,7 +10,26 @@ import (
 	"pitr_fs/internal/pg"
 )
 
-const defaultHistoryLimit = 100
+const (
+	defaultHistoryLimit        = 100
+	defaultSpaceReservePercent = 20
+)
+
+type SpacePolicy struct {
+	MaxBytes         int64
+	ReservePercent   int
+	RetainedBytes    int64
+	ReclaimableBytes int64
+}
+
+func (p SpacePolicy) HighWatermarkBytes() int64 {
+	if p.MaxBytes <= 0 {
+		return 0
+	}
+	usablePercent := int64(100 - p.ReservePercent)
+	return (p.MaxBytes/100)*usablePercent +
+		(p.MaxBytes%100)*usablePercent/100
+}
 
 type ClearStats struct {
 	VersionsDeleted int64
@@ -56,6 +75,106 @@ func historyLimitTx(ctx context.Context, tx pg.Tx, scope string) (int, error) {
 		return defaultHistoryLimit, nil
 	}
 	return limit, err
+}
+
+func (m *Manager) SpacePolicy(ctx context.Context, scope string) (SpacePolicy, error) {
+	normalized, err := NormalizeScope(scope)
+	if err != nil {
+		return SpacePolicy{}, err
+	}
+	var policy SpacePolicy
+	err = m.db.QueryRow(ctx, `
+		SELECT c.max_space_bytes,c.space_reserve_percent,
+		       COALESCE(s.retained_bytes,0),COALESCE(s.reclaimable_bytes,0)
+		  FROM LATERAL (
+		        SELECT max_space_bytes,space_reserve_percent
+		          FROM pitr_config
+		         WHERE scope_path='/' OR scope_path=$1
+		            OR $1 LIKE rtrim(scope_path,'/') || '/%'
+		         ORDER BY length(scope_path) DESC LIMIT 1
+		       ) c
+		  LEFT JOIN pitr_space_state s ON s.singleton`, normalized).Scan(
+		&policy.MaxBytes, &policy.ReservePercent,
+		&policy.RetainedBytes, &policy.ReclaimableBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		policy.ReservePercent = defaultSpaceReservePercent
+		return policy, nil
+	}
+	if err != nil {
+		return SpacePolicy{}, fmt.Errorf("读取空间策略(%s): %w", normalized, err)
+	}
+	return policy, nil
+}
+
+func spacePolicyTx(ctx context.Context, tx pg.Tx, scope string) (SpacePolicy, error) {
+	var policy SpacePolicy
+	err := tx.QueryRow(ctx, `
+		SELECT c.max_space_bytes,c.space_reserve_percent,
+		       COALESCE(s.retained_bytes,0),COALESCE(s.reclaimable_bytes,0)
+		  FROM LATERAL (
+		        SELECT max_space_bytes,space_reserve_percent
+		          FROM pitr_config
+		         WHERE scope_path='/' OR scope_path=$1
+		            OR $1 LIKE rtrim(scope_path,'/') || '/%'
+		         ORDER BY length(scope_path) DESC LIMIT 1
+		       ) c
+		  LEFT JOIN pitr_space_state s ON s.singleton`, scope).Scan(
+		&policy.MaxBytes, &policy.ReservePercent,
+		&policy.RetainedBytes, &policy.ReclaimableBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		policy.ReservePercent = defaultSpaceReservePercent
+		return policy, nil
+	}
+	return policy, err
+}
+
+// SetSpacePolicy 设置用户视角的文件数据额度。maxBytes=0 表示不按空间裁剪；
+// reservePercent=20 表示预计保留数据达到额度的 80% 时淘汰最老版本。
+func (m *Manager) SetSpacePolicy(
+	ctx context.Context,
+	scope string,
+	maxBytes int64,
+	reservePercent int,
+) (int64, error) {
+	normalized, err := NormalizeScope(scope)
+	if err != nil {
+		return 0, err
+	}
+	if maxBytes < 0 {
+		return 0, fmt.Errorf("max space 不能为负数: %d", maxBytes)
+	}
+	if reservePercent < 1 || reservePercent > 99 {
+		return 0, fmt.Errorf("space reserve 必须是 1..99: %d", reservePercent)
+	}
+	var pruned int64
+	err = m.db.InTx(ctx, func(tx pg.Tx) error {
+		if _, err := tx.Exec(ctx,
+			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:versions'))"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pitr_config(
+				scope_path,history_limit,max_space_bytes,
+				space_reserve_percent,updated_at)
+			VALUES ($1,$2,$3,$4,now())
+			ON CONFLICT (scope_path) DO UPDATE
+			   SET max_space_bytes=EXCLUDED.max_space_bytes,
+			       space_reserve_percent=EXCLUDED.space_reserve_percent,
+			       updated_at=now()`, normalized, defaultHistoryLimit,
+			maxBytes, reservePercent); err != nil {
+			return err
+		}
+		limit, err := historyLimitTx(ctx, tx, normalized)
+		if err != nil {
+			return err
+		}
+		pruned, err = pruneClosedVersions(ctx, tx, normalized, limit)
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("设置空间策略(%s): %w", normalized, err)
+	}
+	return pruned, nil
 }
 
 // SetHistoryLimit 持久化指定 scope 的版本上限并立即裁剪。服务层当前只允许
@@ -224,26 +343,68 @@ func pruneClosedVersions(
 		return 0, err
 	}
 	rows.Close()
-	if len(doomed) == 0 {
-		return 0, nil
-	}
 	var rootID int64
 	if err := tx.QueryRow(ctx,
 		"SELECT id FROM pitr_txn WHERE state='root' ORDER BY id LIMIT 1").
 		Scan(&rootID); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE pitr_txn SET parent_id=$1 WHERE parent_id=ANY($2)`,
-		rootID, doomed); err != nil {
-		return 0, err
+	var pruned int64
+	if len(doomed) != 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE pitr_txn SET parent_id=$1 WHERE parent_id=ANY($2)`,
+			rootID, doomed); err != nil {
+			return 0, err
+		}
+		affected, err := tx.Exec(ctx,
+			"DELETE FROM pitr_txn WHERE id=ANY($1)", doomed)
+		if err != nil {
+			return 0, err
+		}
+		pruned += affected
 	}
-	affected, err := tx.Exec(ctx,
-		"DELETE FROM pitr_txn WHERE id=ANY($1)", doomed)
+
+	policy, err := spacePolicyTx(ctx, tx, scope)
 	if err != nil {
 		return 0, err
 	}
-	return affected, nil
+	highWatermark := policy.HighWatermarkBytes()
+	if policy.MaxBytes == 0 || policy.RetainedBytes <= highWatermark {
+		return pruned, nil
+	}
+
+	// 空间压力下逐个删除最老版本。每次 DELETE trigger 都会同步释放该版本
+	// 的 pin 并更新 retained_bytes，因此共享 slice 的边际价值会自然重算。
+	for policy.RetainedBytes > highWatermark {
+		var oldestID int64
+		err := tx.QueryRow(ctx, `
+			SELECT id FROM pitr_txn
+			 WHERE state<>'root' AND closed_at IS NOT NULL
+			 ORDER BY id ASC LIMIT 1`).Scan(&oldestID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(ctx,
+			"UPDATE pitr_txn SET parent_id=$1 WHERE parent_id=$2",
+			rootID, oldestID); err != nil {
+			return 0, err
+		}
+		affected, err := tx.Exec(ctx,
+			"DELETE FROM pitr_txn WHERE id=$1", oldestID)
+		if err != nil {
+			return 0, err
+		}
+		pruned += affected
+		if err := tx.QueryRow(ctx, `
+			SELECT retained_bytes FROM pitr_space_state WHERE singleton`).
+			Scan(&policy.RetainedBytes); err != nil {
+			return 0, err
+		}
+	}
+	return pruned, nil
 }
 
 func PruneClosedVersions(

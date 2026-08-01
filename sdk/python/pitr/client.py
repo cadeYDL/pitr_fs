@@ -64,6 +64,28 @@ class Volume:
     retention: str
     history_limit: int
     error: str
+    max_space_bytes: int = 0
+    space_reserve_percent: int = 20
+    retained_space_bytes: int = 0
+    reclaimable_space_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class VersionSpace:
+    version_hash: str
+    closed_at: str
+    pinned_bytes: int
+    releasable_bytes: int
+
+
+@dataclass(frozen=True)
+class SpaceInfo:
+    max_bytes: int
+    reserve_percent: int
+    high_watermark_bytes: int
+    retained_bytes: int
+    reclaimable_bytes: int
+    versions: tuple[VersionSpace, ...]
 
 
 class Transaction:
@@ -284,14 +306,18 @@ class Client:
         )
         return [
             Volume(
-                value.name,
-                value.jfs_mount,
-                value.fuse_mount,
-                value.jfs_mounted,
-                value.fuse_mounted,
-                value.retention,
-                value.history_limit,
-                value.error,
+                name=value.name,
+                jfs_mount=value.jfs_mount,
+                fuse_mount=value.fuse_mount,
+                jfs_mounted=value.jfs_mounted,
+                fuse_mounted=value.fuse_mounted,
+                retention=value.retention,
+                history_limit=value.history_limit,
+                error=value.error,
+                max_space_bytes=value.max_space_bytes,
+                space_reserve_percent=value.space_reserve_percent,
+                retained_space_bytes=value.retained_space_bytes,
+                reclaimable_space_bytes=value.reclaimable_space_bytes,
             )
             for value in response.volumes
         ]
@@ -306,6 +332,57 @@ class Client:
         self._stub.ConfigSet(
             pb.ConfigSetRequest(key="history-limit", value=str(limit)),
             timeout=timeout,
+        )
+
+    def set_max_space_bytes(
+        self,
+        max_bytes: int,
+        timeout: float | None = None,
+    ) -> None:
+        if max_bytes < 0:
+            raise ValueError(f"max space 不能为负数: {max_bytes}")
+        self._stub.ConfigSet(
+            pb.ConfigSetRequest(key="max-space", value=f"{max_bytes}B"),
+            timeout=timeout,
+        )
+
+    def set_space_reserve(
+        self,
+        percent: int,
+        timeout: float | None = None,
+    ) -> None:
+        if not 1 <= percent <= 99:
+            raise ValueError(f"space reserve 必须在 1..99 之间: {percent}")
+        self._stub.ConfigSet(
+            pb.ConfigSetRequest(key="space-reserve", value=f"{percent}%"),
+            timeout=timeout,
+        )
+
+    def space(
+        self,
+        path: str = ".",
+        limit: int = 20,
+        timeout: float | None = None,
+    ) -> SpaceInfo:
+        response = self._stub.Space(
+            pb.SpaceRequest(path=_resolve_path(path), limit=limit),
+            timeout=timeout,
+        )
+        return SpaceInfo(
+            max_bytes=response.max_space_bytes,
+            reserve_percent=response.reserve_percent,
+            high_watermark_bytes=response.high_watermark_bytes,
+            retained_bytes=response.retained_bytes,
+            reclaimable_bytes=response.reclaimable_bytes,
+            versions=tuple(
+                VersionSpace(
+                    version_hash=value.version_hash,
+                    closed_at=value.closed_at,
+                    pinned_bytes=value.pinned_bytes,
+                    releasable_bytes=value.estimated_release_bytes,
+                )
+                for value in response.versions
+            ),
         )
 
     def clear(

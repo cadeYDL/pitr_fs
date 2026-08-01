@@ -111,6 +111,19 @@ func (s *Server) Init(
 		return nil, status.Errorf(codes.InvalidArgument,
 			"非法 retention %q", req.GetRetention())
 	}
+	if req.HistoryLimit != nil &&
+		(req.GetHistoryLimit() < 1 || req.GetHistoryLimit() > 100000) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"history-limit 必须是 1..100000: %d", req.GetHistoryLimit())
+	}
+	if req.MaxSpaceBytes != nil && req.GetMaxSpaceBytes() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "max-space 不能为负数")
+	}
+	if req.SpaceReservePercent != nil &&
+		(req.GetSpaceReservePercent() < 1 || req.GetSpaceReservePercent() > 99) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"space-reserve 必须是 1..99%%: %d", req.GetSpaceReservePercent())
+	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	index, err := s.findVolumeLocked("", req.GetVolume())
@@ -120,13 +133,48 @@ func (s *Server) Init(
 	if req.GetRetention() != "" {
 		s.volumes[index].Retention = req.GetRetention()
 	}
+	if req.HistoryLimit != nil {
+		if _, err := s.mgr.SetHistoryLimit(ctx, "/", int(req.GetHistoryLimit())); err != nil {
+			return nil, rpcError(err)
+		}
+	}
+	if req.MaxSpaceBytes != nil || req.SpaceReservePercent != nil {
+		policy, err := s.mgr.SpacePolicy(ctx, "/")
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		if req.MaxSpaceBytes != nil {
+			policy.MaxBytes = req.GetMaxSpaceBytes()
+		}
+		if req.SpaceReservePercent != nil {
+			policy.ReservePercent = int(req.GetSpaceReservePercent())
+		}
+		if _, err := s.mgr.SetSpacePolicy(
+			ctx, "/", policy.MaxBytes, policy.ReservePercent); err != nil {
+			return nil, rpcError(err)
+		}
+	}
 	if err := s.mountLocked(ctx, index, req.GetPath()); err != nil {
 		return nil, err
 	}
 	if err := recoverVolume(ctx, s.volumes[index]); err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
-	return &pb.InitResponse{Volume: volumeStatusPB(s.volumes[index])}, nil
+	result := volumeStatusPB(s.volumes[index])
+	historyLimit, err := s.mgr.HistoryLimit(ctx, "/")
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	policy, err := s.mgr.SpacePolicy(ctx, "/")
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	result.HistoryLimit = int32(historyLimit)
+	result.MaxSpaceBytes = policy.MaxBytes
+	result.SpaceReservePercent = int32(policy.ReservePercent)
+	result.RetainedSpaceBytes = policy.RetainedBytes
+	result.ReclaimableSpaceBytes = policy.ReclaimableBytes
+	return &pb.InitResponse{Volume: result}, nil
 }
 
 func (s *Server) Mount(
@@ -200,6 +248,48 @@ func (s *Server) ConfigSet(
 			return nil, rpcError(err)
 		}
 		return &pb.ConfigSetResponse{Key: key, Value: strconv.Itoa(limit)}, nil
+	}
+	if key == "max-space" {
+		if req.GetWindow() != "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"max-space 不接受 --window")
+		}
+		maxBytes, err := txn.ParseSpaceBytes(value)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		policy, err := s.mgr.SpacePolicy(ctx, "/")
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		if _, err := s.mgr.SetSpacePolicy(
+			ctx, "/", maxBytes, policy.ReservePercent); err != nil {
+			return nil, rpcError(err)
+		}
+		return &pb.ConfigSetResponse{
+			Key: key, Value: txn.FormatSpaceLimit(maxBytes)}, nil
+	}
+	if key == "space-reserve" {
+		if req.GetWindow() != "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"space-reserve 不接受 --window")
+		}
+		percentText := strings.TrimSuffix(value, "%")
+		percent, err := strconv.Atoi(percentText)
+		if err != nil || percent < 1 || percent > 99 {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"space-reserve 必须是 1..99%%: %q", value)
+		}
+		policy, err := s.mgr.SpacePolicy(ctx, "/")
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		if _, err := s.mgr.SetSpacePolicy(
+			ctx, "/", policy.MaxBytes, percent); err != nil {
+			return nil, rpcError(err)
+		}
+		return &pb.ConfigSetResponse{
+			Key: key, Value: fmt.Sprintf("%d%%", percent)}, nil
 	}
 	if key != "retention" {
 		return nil, status.Errorf(codes.InvalidArgument, "不支持配置项 %q", key)

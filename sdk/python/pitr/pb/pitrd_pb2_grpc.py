@@ -6,7 +6,7 @@ import warnings
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 from . import pitrd_pb2 as pitrd__pb2
 
-GRPC_GENERATED_VERSION = '1.76.0'
+GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,7 +26,7 @@ if _version_not_supported:
     )
 
 
-class PitrdStub(object):
+class PitrdStub:
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -100,9 +100,14 @@ class PitrdStub(object):
                 request_serializer=pitrd__pb2.ClearRequest.SerializeToString,
                 response_deserializer=pitrd__pb2.ClearResponse.FromString,
                 _registered_method=True)
+        self.Space = channel.unary_unary(
+                '/pitrd.v1.Pitrd/Space',
+                request_serializer=pitrd__pb2.SpaceRequest.SerializeToString,
+                response_deserializer=pitrd__pb2.SpaceResponse.FromString,
+                _registered_method=True)
 
 
-class PitrdServicer(object):
+class PitrdServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Init(self, request, context):
@@ -183,6 +188,12 @@ class PitrdServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Space(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PitrdServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -251,6 +262,11 @@ def add_PitrdServicer_to_server(servicer, server):
                     request_deserializer=pitrd__pb2.ClearRequest.FromString,
                     response_serializer=pitrd__pb2.ClearResponse.SerializeToString,
             ),
+            'Space': grpc.unary_unary_rpc_method_handler(
+                    servicer.Space,
+                    request_deserializer=pitrd__pb2.SpaceRequest.FromString,
+                    response_serializer=pitrd__pb2.SpaceResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'pitrd.v1.Pitrd', rpc_method_handlers)
@@ -259,7 +275,7 @@ def add_PitrdServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Pitrd(object):
+class Pitrd:
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -603,6 +619,33 @@ class Pitrd(object):
             '/pitrd.v1.Pitrd/Clear',
             pitrd__pb2.ClearRequest.SerializeToString,
             pitrd__pb2.ClearResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Space(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pitrd.v1.Pitrd/Space',
+            pitrd__pb2.SpaceRequest.SerializeToString,
+            pitrd__pb2.SpaceResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -23,6 +23,7 @@ service Pitrd {
   rpc Recover(RecoverRequest) returns (RecoverResponse);
   rpc ConfigSet(ConfigSetRequest) returns (ConfigSetResponse);
   rpc Clear(ClearRequest) returns (ClearResponse);
+  rpc Space(SpaceRequest) returns (SpaceResponse);
 }
 
 message InitRequest {
@@ -30,6 +31,9 @@ message InitRequest {
   string volume = 2;
   string retention = 3;
   repeated string storage_args = 4;
+  optional int32 history_limit = 5;
+  optional int64 max_space_bytes = 6;
+  optional int32 space_reserve_percent = 7;
 }
 
 message InitResponse {
@@ -60,6 +64,10 @@ message VolumeStatus {
   string retention = 6;
   string error = 7;
   int32 history_limit = 8;
+  int64 max_space_bytes = 9;
+  int32 space_reserve_percent = 10;
+  int64 retained_space_bytes = 11;
+  int64 reclaimable_space_bytes = 12;
 }
 
 message StatusResponse {
@@ -196,4 +204,25 @@ message ClearRequest {
 message ClearResponse {
   int64 versions_deleted = 1;
   int64 history_deleted = 2;
+}
+
+message SpaceRequest {
+  string path = 1;
+  int32 limit = 2;
+}
+
+message SpaceVersion {
+  string version_hash = 1;
+  string closed_at = 2;
+  int64 pinned_bytes = 3;
+  int64 estimated_release_bytes = 4;
+}
+
+message SpaceResponse {
+  int64 max_space_bytes = 1;
+  int32 reserve_percent = 2;
+  int64 high_watermark_bytes = 3;
+  int64 retained_bytes = 4;
+  int64 reclaimable_bytes = 5;
+  repeated SpaceVersion versions = 6;
 }
