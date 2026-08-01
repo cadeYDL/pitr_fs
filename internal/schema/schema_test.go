@@ -49,8 +49,7 @@ func TestMain(m *testing.M) {
 
 func runWithDocker(m *testing.M) (int, error) {
 	name := fmt.Sprintf("pitr-schema-test-%d", time.Now().UnixNano())
-	// 不做端口映射:macOS 侧 OrbStack 不把 -p 转发到宿主 127.0.0.1,
-	// 改用 <container>.orb.local(macOS)或容器 IP(Linux/calw)
+	// 测试仅支持 Linux，直接通过 Docker bridge 地址连接隔离 PostgreSQL。
 	out, err := exec.Command("docker", "run", "-d", "--name", name,
 		"-e", "POSTGRES_PASSWORD=x", "-e", "POSTGRES_DB=postgres",
 		"postgres:16").CombinedOutput()
@@ -72,11 +71,11 @@ func runWithDocker(m *testing.M) (int, error) {
 func waitReadyDSN(name string) (string, error) {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		hosts := []string{name + ".orb.local"}
-		if ip := containerIP(name); ip != "" {
-			hosts = append(hosts, ip)
-		}
+		hosts := []string{containerIP(name)}
 		for _, h := range hosts {
+			if h == "" {
+				continue
+			}
 			dsn := fmt.Sprintf("postgres://postgres:x@%s:5432/postgres?sslmode=disable", h)
 			if ping(dsn) == nil {
 				return dsn, nil
@@ -84,7 +83,7 @@ func waitReadyDSN(name string) (string, error) {
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return "", errors.New("PG 60 秒内未就绪(尝试了 orb.local 与容器 IP)")
+	return "", errors.New("PG 60 秒内未通过 Docker bridge 地址就绪")
 }
 
 func containerIP(name string) string {

@@ -35,8 +35,20 @@ func (m *Manager) RunPendingGC(
 		if err := run(ctx); err != nil {
 			return err
 		}
-		_, err = m.db.Exec(ctx,
-			"DELETE FROM pitr_gc_queue WHERE singleton")
+		// 原生 GC 成功后，删除已释放版本留下的合成 delslices 索引，并与
+		// 队列确认合成一个 SQL 原子动作。仍有 pitr_slice_pin 的远期记录
+		// 不匹配 deleted 条件，也通过 NOT EXISTS 双重保护。
+		_, err = m.db.Exec(ctx, `
+			WITH cleaned AS (
+			    DELETE FROM jfs_delslices d
+			     WHERE d.chunkid>=8000000000000000000
+			       AND d.chunkid<=9000000000000000000
+			       AND d.deleted<253402300799
+			       AND NOT EXISTS (
+			           SELECT 1 FROM pitr_slice_pin p
+			            WHERE p.delayed_id=d.chunkid)
+			)
+			DELETE FROM pitr_gc_queue WHERE singleton`)
 		return err
 	})
 	if err == nil {

@@ -40,7 +40,7 @@ func TestJuiceFS_GCUsesNativeCompactDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.TrimSpace(output.String())
-	if got != "gc --compact --delete --threads 7 postgres://example" {
+	if got != "gc --delete --threads 7 postgres://example" {
 		t.Fatalf("gc args=%q", got)
 	}
 }

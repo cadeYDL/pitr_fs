@@ -28,8 +28,9 @@ type JuiceFS struct {
 	managed bool
 }
 
-// GC 使用 JuiceFS 原生对象适配层做 mark/compact/delete，因此 file、S3、
-// OSS 等后端共享同一套安全语义。调用方负责与写窗口串行化。
+// GC 使用 JuiceFS 原生对象适配层做 mark/delete，因此 file、S3、OSS 等
+// 后端共享同一套安全语义。例行生命周期回收不主动 compact 仍在使用的 chunk，
+// 避免额外前台读写扰动；调用方负责与写窗口串行化。
 func (m *JuiceFS) GC(ctx context.Context, threads int) error {
 	m.mu.Lock()
 	if err := m.validate(); err != nil {
@@ -42,7 +43,7 @@ func (m *JuiceFS) GC(ctx context.Context, threads int) error {
 		threads = 4
 	}
 	cmd := exec.CommandContext(ctx, binary,
-		"gc", "--compact", "--delete", "--threads", strconv.Itoa(threads),
+		"gc", "--delete", "--threads", strconv.Itoa(threads),
 		metaURL)
 	cmd.Stdout = output
 	cmd.Stderr = output

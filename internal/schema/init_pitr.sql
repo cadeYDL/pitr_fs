@@ -556,7 +556,15 @@ BEGIN
             END IF;
         END IF;
     END LOOP;
-    DELETE FROM jfs_delslices WHERE chunkid=v_pin.delayed_id;
+    -- pin 释放后不能直接丢掉 delslices 索引，否则 refs=0 的 slice 可能不再
+    -- 出现在 JuiceFS delete 扫描中。把远期 pin 改成立即到期的待删记录；
+    -- 仍被当前数据或其他版本引用的 slice 会由 JuiceFS 引用检查跳过。
+    UPDATE jfs_delslices
+       SET deleted=extract(epoch FROM clock_timestamp())::bigint
+     WHERE chunkid=v_pin.delayed_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '释放 txn % 时 JuiceFS pin 行丢失', OLD.id;
+    END IF;
     PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
     INSERT INTO pitr_gc_queue(singleton,requested_at,estimated_bytes)
     VALUES (true,now(),v_release_bytes)

@@ -343,7 +343,7 @@ func TestSlicePinsReleasedAndGCQueueIsDurable(t *testing.T) {
 		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=101").Scan(&refs); err != nil {
 		t.Fatal(err)
 	}
-	var pinRows, queueRows int64
+	var pinRows, queueRows, dueRows int64
 	if err := db.QueryRow(ctx,
 		"SELECT count(*) FROM pitr_slice_ref").Scan(&pinRows); err != nil {
 		t.Fatal(err)
@@ -352,8 +352,15 @@ func TestSlicePinsReleasedAndGCQueueIsDurable(t *testing.T) {
 		"SELECT count(*) FROM pitr_gc_queue").Scan(&queueRows); err != nil {
 		t.Fatal(err)
 	}
-	if refs != 0 || pinRows != 0 || queueRows != 1 {
-		t.Fatalf("released refs=%d pins=%d queue=%d", refs, pinRows, queueRows)
+	if err := db.QueryRow(ctx, `
+		SELECT count(*) FROM jfs_delslices
+		 WHERE chunkid>=8000000000000000000
+		   AND deleted<253402300799`).Scan(&dueRows); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 0 || pinRows != 0 || queueRows != 1 || dueRows != 1 {
+		t.Fatalf("released refs=%d pins=%d queue=%d due=%d",
+			refs, pinRows, queueRows, dueRows)
 	}
 
 	called := 0
@@ -370,6 +377,14 @@ func TestSlicePinsReleasedAndGCQueueIsDurable(t *testing.T) {
 	}
 	if queueRows != 0 {
 		t.Fatalf("成功 GC 后 queue=%d", queueRows)
+	}
+	if err := db.QueryRow(ctx, `
+		SELECT count(*) FROM jfs_delslices
+		 WHERE chunkid>=8000000000000000000`).Scan(&dueRows); err != nil {
+		t.Fatal(err)
+	}
+	if dueRows != 0 {
+		t.Fatalf("成功 GC 后合成 delslices=%d", dueRows)
 	}
 }
 

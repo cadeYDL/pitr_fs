@@ -260,8 +260,11 @@ pitr revert --at "$target_time" --path .
 每份首次捕获的旧 `jfs_chunk` 状态都会把其中 slice 以紧凑二进制列表挂到
 对应版本，并增加 JuiceFS 物理引用计数。版本因 `history-limit` 淘汰或被
 `clear` 删除时，同一数据库事务会逐 slice 减少引用并写入持久化 GC 请求。
-daemon 低频合并请求，在没有开放写窗口时执行 JuiceFS 原生
-`gc --compact --delete`；进程崩溃不会丢请求，GC 失败也不会影响当前数据。
+原来的远期 pin 会被转换为 JuiceFS 立即到期的待删记录，而不是直接丢弃，确保
+零引用 slice 仍能被原生 delete 扫描发现。
+daemon 低频合并请求，在没有开放写窗口时执行 JuiceFS 原生 `gc --delete`；
+进程崩溃不会丢请求，GC 失败也不会影响当前数据。例行生命周期 GC 不主动
+compact 当前 chunk，减少对前台读取和写入的扰动。
 这使“最多 100 个版本”同时约束元数据历史和这些历史独占的块对象，不过当前
 版本本身、JuiceFS 合并过程的临时对象以及异步 GC 尚未运行时的对象仍会占用
 空间，因此它不是严格的字节配额。
