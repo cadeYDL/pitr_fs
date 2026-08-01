@@ -147,11 +147,65 @@ cat quickstart/test.txt
 ./install.sh uninstall --purge  # 永久删除数据，并清理由本项目安装的宿主依赖
 ```
 
-普通 `uninstall` 保留数据卷和宿主依赖，便于稍后 `recover`。彻底卸载只处理安装
-清单中由 pitr-fs 新增的内容，安装前已有的软件不动；如果某个受管依赖后来被其他
-软件使用，安全检查会停止依赖清理并保留清单，不会级联误删外部软件。若 Docker
-本身由 pitr-fs 安装，检测到后来新增的容器、镜像、数据卷或自定义网络时也会保留
-Docker；只有确认不存在外部 Docker 对象后，才会清理其运行数据。
+普通卸载和不可恢复的彻底清理有不同语义，详见下方“卸载与彻底清理”。
+
+## 卸载与彻底清理
+
+### 普通卸载：保留数据以便恢复
+
+```bash
+./install.sh uninstall
+```
+
+普通卸载会解除 pitr-fs 挂载、删除服务容器和 `/usr/local/bin/pitr`，但保留：
+
+- PostgreSQL 元数据卷和对象数据卷；
+- pitr-fs 安装的宿主机依赖；
+- `/etc/pitr-fs/install.conf` 中的非敏感安装参数。
+
+因此之后可以直接恢复原来的数据和挂载：
+
+```bash
+./install.sh recover
+```
+
+### 彻底卸载：永久删除数据和受管依赖
+
+> **警告：以下操作不可恢复。执行前请确认不再需要任何历史版本和当前文件。**
+
+```bash
+./install.sh uninstall --purge
+```
+
+彻底卸载会删除：
+
+- pitr-fs 服务容器、FUSE 挂载和 `/usr/local/bin/pitr`；
+- `pitr_pgdata` 中的 PostgreSQL 元数据和 `pitr_data` 中的对象数据；
+- `/etc/pitr-fs/install.conf`；
+- `/var/lib/pitr-fs/host-install.state` 记录的、由 pitr-fs 实际新增的软件包、
+  Docker 镜像、用户组和运行数据。
+
+以下内容不会删除：
+
+- 安装前已经存在的软件包、Docker、镜像和系统配置；
+- 用户通过 `PITR_BLOCK_PATH` 指定的外部存储目录及其内容；
+- pitr-fs 源码目录。
+
+如果 Docker 是由 pitr-fs 安装的，但后来出现了其他容器、镜像、数据卷或自定义
+网络，安全检查会拒绝卸载 Docker，并保留安装清单。确认并自行迁移这些外部对象后，
+再次运行同一条命令即可继续清理：
+
+```bash
+./install.sh uninstall --purge
+```
+
+可用以下命令确认 pitr-fs 已彻底清理；第一条不应输出路径，后两条应输出确认信息：
+
+```bash
+findmnt -rn -t fuse.pitrfs -o TARGET
+test ! -e /usr/local/bin/pitr && echo 'pitr 命令已删除'
+test ! -e /var/lib/pitr-fs/host-install.state && echo '安装清单已删除'
+```
 
 ## 使用指南
 
