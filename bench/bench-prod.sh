@@ -157,7 +157,14 @@ SELECT 'history_bytes=' ||
  (pg_total_relation_size('pitr_node_history') +
   pg_total_relation_size('pitr_edge_history') +
   pg_total_relation_size('pitr_chunk_history') +
-  pg_total_relation_size('pitr_chunk_ref_history'));" >"$RESULTS/space.txt"
+  pg_total_relation_size('pitr_chunk_ref_history'));
+SELECT 'slice_pin_rows=' || count(*) FROM pitr_slice_pin;
+SELECT 'slice_pin_bytes=' || COALESCE(sum(length(slices)),0) FROM pitr_slice_pin;
+SELECT 'slice_ref_rows=' || count(*) FROM pitr_slice_ref;
+SELECT 'retained_bytes=' || retained_bytes FROM pitr_space_state WHERE singleton;
+SELECT 'reclaimable_bytes=' || reclaimable_bytes FROM pitr_space_state WHERE singleton;
+SELECT 'gc_estimated_bytes=' || COALESCE(
+  (SELECT estimated_bytes FROM pitr_gc_queue WHERE singleton),0);" >"$RESULTS/space.txt"
 
 {
     echo "date=$(date -Iseconds)"

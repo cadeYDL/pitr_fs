@@ -12,12 +12,18 @@ pitr-fs 是运行在 JuiceFS 之上的时间回溯文件系统。它透明拦截
 - 默认自动版本模式，无需 `begin` 或 `commit`。创建、写入、截断、删除、
   重命名、链接和扩展属性变更都会自动形成版本。
 - 默认全局保留最近 100 个版本；`history-limit` 可配置并持久化。
+- 可按用户熟悉的文件容量设置空间上限和预留比例；默认在预计占用达到上限的
+  80% 时从最老版本开始裁剪，共享 slice 只在最后一个引用释放时计入空间。
 - CLI 支持绝对路径和相对路径，相对路径按调用命令时的工作目录解析。
 - 支持按 12 位版本号回滚，也支持按带时区的 RFC3339 时间回滚；后者选择
   完成时间不晚于目标时间的最近版本。
 - `logs -l` 展示版本号、POSIX 操作、调用进程命令、操作时间、操作人和
   内容变化摘要。
 - `clear --global --yes` 永久清空历史，同时保留当前文件作为新基线。
+- 历史版本在 slice 维度持有对象引用；版本淘汰或 `clear` 后自动释放引用，
+  后台批量调用 JuiceFS 原生 GC 回收不再可达的对象。
+- 块数据默认保存在本地 Docker volume，也可直接使用用户已经挂载到 Linux
+  主机的任意目录，或使用 JuiceFS 支持的远端对象存储。
 - 支持目录范围 `diff`、服务恢复以及 Go/Python SDK。
 
 内容摘要是有界诊断信息，不是完整 diff：每个文件最多读取前 4 KiB，一个
@@ -53,6 +59,17 @@ pitr status
 安装只启动服务，不会擅自占用用户目录。默认允许挂载到 `/pitr` 的子目录；
 可在首次安装时通过 `PITR_MOUNT_ROOT=/自定义根目录` 修改。挂载根不能是 `/`。
 
+默认块数据写入本地 Docker volume。若块存储已经由用户挂载到 Linux 主机，
+可将其目录绑定给 pitr-fs：
+
+```bash
+PITR_BLOCK_PATH=/mnt/pitr-blocks ./install.sh install
+```
+
+`PITR_BLOCK_PATH` 必须是可写的绝对路径，且不能与 `PITR_MOUNT_ROOT` 重叠。
+卸载时即使指定 `--purge`，安装脚本也不会删除这个用户目录。S3、MinIO、OSS
+等后端仍可通过 `PITR_STORAGE`、`PITR_BUCKET` 和对应凭证配置。
+
 ### 3. 初始化并挂载目录
 
 绝对路径：
@@ -69,6 +86,16 @@ cd /pitr
 mkdir -p data
 pitr init ./data
 ```
+
+初始化时同时设置版本数和空间水位：
+
+```bash
+pitr init ./data --history-limit 100 --max-space 100GiB --space-reserve 20
+```
+
+这里的 `100GiB` 表示当前文件和可恢复历史预计可占用的文件数据额度；预留
+`20%` 表示达到约 `80GiB` 时开始淘汰最老版本。估算按去重 slice 大小计算，
+不包含对象存储协议开销、压缩差异和异步 GC 尚未删除的临时占用。
 
 当前版本一个服务只管理一个全局卷和一个挂载路径。`init` 幂等执行，并把路径
 与保留策略写入 PostgreSQL；容器重启后会自动恢复这个挂载。
@@ -118,7 +145,20 @@ pitr logs . -l -n 20
 
 ```bash
 pitr config set history-limit 100
+pitr config set max-space 100GiB
+pitr config set space-reserve 20%
 ```
+
+查看当前空间水位，以及按最老优先顺序单独删除每个版本的预计释放量：
+
+```bash
+pitr space . -n 20
+```
+
+输出中的 `retained` 是当前文件和可恢复版本仍需保留的 slice；`reclaimable`
+是引用已经归零、等待后台 GC 物理删除的空间。`RELEASE_IF_DELETED` 是以查询
+时引用关系计算的边际值，前一个版本删除后，共享 slice 的释放量可能转移到
+后续版本，因此裁剪器每删除一个版本都会重新判断。
 
 按版本或时间回滚：
 
@@ -170,7 +210,8 @@ python3 ./bench/prod_aggregate.py /tmp/pitr-prod-median.csv \
 ```
 
 详细口径见 [`bench/README.md`](bench/README.md)、
-[`bench/BASELINE.md`](bench/BASELINE.md) 和 [`bench/PROD.md`](bench/PROD.md)。
+[`bench/BASELINE.md`](bench/BASELINE.md)、[`bench/PROD.md`](bench/PROD.md)
+以及 [`docs/性能瓶颈.md`](docs/性能瓶颈.md)。
 
 ## 例子
 
@@ -216,14 +257,30 @@ pitr revert --at "$target_time" --path .
 回滚结合当前目录图与历史 edge 计算 inode 闭包，因此目录被改名或删除后
 仍可定位。
 
-历史上限会裁剪版本和对应 history，但对象块的实际回收仍由 JuiceFS 的
-trash/retention 策略负责；版本数量与底层对象空间上限不是同一个概念。
+每份首次捕获的旧 `jfs_chunk` 状态都会把其中 slice 以紧凑二进制列表挂到
+对应版本，并增加 JuiceFS 物理引用计数。版本因 `history-limit` 淘汰或被
+`clear` 删除时，同一数据库事务会逐 slice 减少引用并写入持久化 GC 请求。
+daemon 低频合并请求，在没有开放写窗口时执行 JuiceFS 原生
+`gc --compact --delete`；进程崩溃不会丢请求，GC 失败也不会影响当前数据。
+这使“最多 100 个版本”同时约束元数据历史和这些历史独占的块对象，不过当前
+版本本身、JuiceFS 合并过程的临时对象以及异步 GC 尚未运行时的对象仍会占用
+空间，因此它不是严格的字节配额。
+
+`PITR_GC_INTERVAL` 控制后台合并间隔（默认 `10m`，`0` 停用），
+`PITR_GC_THREADS` 控制对象删除并发（默认 `4`）。停用 GC 只会延后物理删除，
+不会破坏版本引用的正确性。
+
+空间计数由 `jfs_chunk_ref` 的增量触发器维护，不在普通写入中遍历对象存储。
+当引用从正数降为零时，slice 从 `retained` 转入 `reclaimable`，并把预计字节
+累计到 GC 请求。空间水位与版本数上限同时生效，任何一项超限都会触发裁剪；
+空间策略允许最终删除全部用户版本，但永远不会为了配额删除当前文件内容。
+如果当前文件本身已经超过高水位，系统会报告超限，删除历史也无法继续降低。
 
 ## 后续演进设想
 
 1. 开放目录级 `history-limit`：子目录继承父目录，子目录显式配置优先。
-2. 增加按时间和空间预算管理 JuiceFS trash/blob 的可观测 GC，给出明确的
-   最早可恢复时间，而不只限制版本条数。
+2. 在现有版本数与空间高水位上增加时间预算、严格物理字节采样、回收进度指标
+   和明确的最早可恢复时间，并支持人工触发和限速。
 3. 在明确授权和安全边界下增强原始 Shell 命令追踪；当前 `/proc` 方案无法
    保证还原所有 Shell 内建、管道和重定向原文。
 4. 为高频元数据写入增加具备原子性证明的批量自动版本，减少数据库往返。
