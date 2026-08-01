@@ -63,7 +63,7 @@ EOF
     fi
     if [ "$CACHE_VOLUME_MANAGED" = "1" ]; then
         docker_cli volume rm "$CACHE_VOLUME" >/dev/null 2>&1 || true
-    else
+    elif docker_cli volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then
         echo "  用户已有缓存卷未删除: $CACHE_VOLUME"
     fi
     local sudo

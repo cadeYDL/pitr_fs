@@ -302,6 +302,7 @@ func TestInstall_UsesBoundedDedicatedJuiceFSCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Contains(uninstall, []byte(`if [ "$CACHE_VOLUME_MANAGED" = "1" ]`)) ||
+		!bytes.Contains(uninstall, []byte(`elif docker_cli volume inspect "$CACHE_VOLUME"`)) ||
 		!bytes.Contains(uninstall, []byte(`docker_cli volume rm "$CACHE_VOLUME"`)) {
 		t.Error("卸载脚本未清理临时缓存卷")
 	}
