@@ -31,6 +31,51 @@ pitr-fs 是运行在 JuiceFS 之上的时间回溯文件系统。它透明拦截
 Linux `/proc/<pid>/cmdline` 尽力获取，用户名按 UID 从宿主机只读
 `/etc/passwd` 解析。命令超过 10 个 Unicode 字符后会缩略。
 
+## 性能表现与基线
+
+Linux 虚拟机、本地 JuiceFS file 后端、Btrfs 对照盘，独立三轮取中位数。以下是
+最重要的结果，不作为不同硬件或对象存储的统一 SLA。
+
+| 关键指标 | 实测结果 | 结论 |
+|---|---:|---|
+| 256 MiB 顺序写 | pitrfs 保留普通盘 86.47% 吞吐 | 大文件表现较好 |
+| 2 GiB 顺序写 | pitrfs 保留普通盘 73.92% 吞吐 | 存在约 26% 损失 |
+| 256 MiB 顺序读的 pitr 层增量损失 | 3.85% | 达到 ≤10% 目标 |
+| 创建 2000 文件 | 10.13 ms/op，底层 JuiceFS 为 2.07 ms/op | 元数据是主要瓶颈 |
+| 4 KiB 随机写 | 256 MiB–2 GiB 文件内约 1.3–1.5 MiB/s | 当前最弱场景 |
+| 单个 256 MiB 文件恢复 | 31.57 ms | 只回放 5 行 history |
+| 1000 文件全部修改后恢复 | 2503.41 ms | 回放 3000 行 history |
+| 100,000 目录项恢复 | 367–725 ms | 三轮正确性通过 |
+
+总体上，当前版本更适合顺序大文件和恢复型负载；高频小文件元数据操作、随机覆写
+仍需优化。
+
+顺序 I/O 随文件规模的吞吐保留率如下。柱为顺序写，折线为顺序读；数值是完整
+pitrfs 相对普通文件系统的百分比。
+
+```mermaid
+xychart-beta
+    title "顺序 I/O 吞吐保留率"
+    x-axis ["4KiB", "1MiB", "256MiB", "2GiB"]
+    y-axis "pitrfs / 普通文件系统 (%)" 0 --> 100
+    bar [35.71, 35.71, 86.47, 73.92]
+    line [0.28, 2.65, 17.76, 15.74]
+```
+
+恢复耗时主要随回放的元数据历史和目录结构复杂度增长，而不是按文件体积复制：
+
+```mermaid
+xychart-beta
+    title "恢复场景中位数"
+    x-axis ["单文件", "混合600", "目录树1000", "全改1000"]
+    y-axis "耗时 (ms)" 0 --> 2800
+    bar [31.57, 524.12, 1299.93, 2503.41]
+```
+
+完整数据与口径见：[I/O 与恢复](bench/IO_RECOVERY.md)、
+[生产路径增量开销](bench/PROD.md)、[四维基线](bench/BASELINE.md)、
+[复现说明](bench/README.md)和[性能瓶颈分析](docs/性能瓶颈.md)。
+
 ## QuickStart
 
 以下命令都应在 **Linux 主机**中执行。
@@ -311,20 +356,25 @@ pitr mount /pitr/data
 
 ### 性能测试
 
-对已经 `init` 的真实生产路径执行基准：
+对专门用于测试且已经 `init` 的空挂载执行完整 I/O 与恢复基准：
 
 ```bash
-PITR_BENCH_MOUNT=/pitr/data ./bench/bench-prod.sh
+./bench/run-io-recovery.sh /pitr/bench
 ```
 
 快速小样本：
 
 ```bash
-PITR_BENCH_META_COUNT=200 PITR_BENCH_IO_MIB=64 \
-PITR_BENCH_MOUNT=/pitr/data ./bench/bench-prod.sh
+PITR_BENCH_ROUNDS=1 \
+PITR_BENCH_OUTPUT="$HOME/pitr-bench-result" \
+./bench/run-io-recovery.sh /pitr/bench
 ```
 
-正式报告建议执行三轮并取中位数：
+默认执行三轮并自动取中位数。脚本会自动准备 fio 容器、保存并恢复配置、校验
+恢复结果以及清理当前测试文件；详细空间要求和参数见
+[`bench/README.md`](bench/README.md)。
+
+开发者若要单独测量 pitr 层相对同一 JuiceFS 卷的增量开销，可运行：
 
 ```bash
 for run in 1 2 3; do
@@ -335,11 +385,6 @@ done
 python3 ./bench/prod_aggregate.py /tmp/pitr-prod-median.csv \
   /tmp/pitr-prod-{1,2,3}/prod.csv
 ```
-
-详细口径见 [`bench/README.md`](bench/README.md)、
-[`bench/BASELINE.md`](bench/BASELINE.md)、[`bench/PROD.md`](bench/PROD.md)
-、[`bench/IO_RECOVERY.md`](bench/IO_RECOVERY.md) 以及
-[`docs/性能瓶颈.md`](docs/性能瓶颈.md)。
 
 ## 例子
 

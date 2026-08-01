@@ -2,8 +2,8 @@
 
 ## 口径
 
-本报告在 2026-07-30 于 OrbStack `calw`（Linux
-7.0.11-orbstack-00360-gc9bc4d96ac70）补录。由于 Phase 0 文档证据晚于生产
+本报告在 2026-07-30 于 Linux 虚拟机
+（内核 `7.0.11-orbstack-00360-gc9bc4d96ac70`）补录。由于 Phase 0 文档证据晚于生产
 实现收口，未把早期 demo 触发器数据冒充“开发前基线”，而是使用更严格的
 最终生产路径：
 
@@ -13,9 +13,8 @@
 - 规模项来自真实 100,000 目录项完整生成、revert、计数和清理；
 - 空间项来自第三轮结束后的数据库快照。
 
-原始三轮 CSV 位于 calw 的
-`/tmp/pitr-prod-bench-run{1,2,3}/prod.csv`，聚合结果位于
-`/tmp/pitr-prod-median.csv`；确定性报告见 `bench/PROD.md`。
+原始三轮 CSV 由 `PITR_PROD_RESULTS` 指定的运行目录保存；确定性报告见
+`bench/PROD.md`。
 
 ## 四个维度
 
