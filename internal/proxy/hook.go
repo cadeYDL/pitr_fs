@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -12,45 +14,63 @@ type fdVersion struct {
 	long   bool
 }
 
-func (l *Loopback) loadFD(fd uint64) (fdVersion, bool) {
-	l.fdMu.Lock()
-	defer l.fdMu.Unlock()
-	value, ok := l.fds[fd]
-	return value, ok
+// writableWindow 表示当前唯一开放的自动版本。多个同时存活的可写 fd
+// 共享该窗口，避免编辑器持有 swap fd 时再次 open 导致自锁。
+type writableWindow struct {
+	autoID    int64
+	scope     string
+	files     map[uint64]*trackedFile
+	posixOps  []string
+	summaries []string
 }
 
-func (l *Loopback) storeFD(fd uint64, value fdVersion) {
-	if fd == 0 || value.autoID == 0 {
-		return
+func commonScope(left, right string) string {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	for {
+		if right == left || strings.HasPrefix(right, left+string(filepath.Separator)) {
+			return left
+		}
+		parent := filepath.Dir(left)
+		if parent == left {
+			return left
+		}
+		left = parent
 	}
-	l.fdMu.Lock()
-	l.fds[fd] = value
-	l.fdMu.Unlock()
 }
 
-func (l *Loopback) deleteFD(fd uint64) {
-	if fd == 0 {
-		return
+func appendNonEmpty(values []string, value string) []string {
+	if value != "" {
+		return append(values, value)
 	}
-	l.fdMu.Lock()
-	delete(l.fds, fd)
-	l.fdMu.Unlock()
+	return values
 }
 
-// takeFD 原子转移窗口的终结权。Flush 与 Release 可被 FUSE 并发调度,
-// 只有成功 take 的一方允许 CloseAuto/Unlock。
-func (l *Loopback) takeFD(fd uint64) (fdVersion, bool) {
-	l.fdMu.Lock()
-	defer l.fdMu.Unlock()
-	value, ok := l.fds[fd]
-	if ok {
-		delete(l.fds, fd)
+func joinAudit(values []string) string {
+	return strings.Join(values, "; ")
+}
+
+func (l *Loopback) ensureWindowScopeLocked(
+	ctx context.Context,
+	absPath string,
+) error {
+	if l.active == nil {
+		return nil
 	}
-	return value, ok
+	scope := commonScope(l.active.scope, absPath)
+	if scope == l.active.scope {
+		return nil
+	}
+	if err := l.manager.UpdateStandaloneVersionScope(
+		ctx, l.active.autoID, scope); err != nil {
+		return err
+	}
+	l.active.scope = scope
+	return nil
 }
 
-// versionedHook 为每个元数据写操作创建独立自动版本。window 覆盖全部写类
-// 操作，确保 JuiceFS 独立连接的 trigger 能把变化归属到唯一开放版本。
+// versionedHook 为元数据写创建独立自动版本；存在可写 fd 窗口时，写操作
+// 加入该唯一窗口。window mutex 只覆盖本次调用，不跨 fd 生命周期持有。
 func (n *Node) versionedHook(
 	ctx context.Context,
 	absPath, command, posixOp string,
@@ -69,21 +89,35 @@ func (n *Node) versionedHookWindow(
 	action func() syscall.Errno,
 ) (fdVersion, syscall.Errno) {
 	root := n.root
-	// O_RDWR/writable-mmap 句柄在 Open 到 Release 之间持有唯一全局窗口。
-	// 同一 fd 的操作已经处在该窗口内,不能再次获取 window mutex。
-	if fd != 0 {
-		if existing, ok := root.loadFD(fd); ok && existing.long {
-			return existing, action()
-		}
-	}
-	if root.isLongPath(absPath) {
-		return fdVersion{long: true}, action()
-	}
 	root.window.Lock()
 	defer root.window.Unlock()
 
 	if root.manager == nil {
 		return fdVersion{}, action()
+	}
+
+	if root.active != nil {
+		if err := root.ensureWindowScopeLocked(ctx, absPath); err != nil {
+			slog.Error("扩展 writable auto 范围",
+				"auto_id", root.active.autoID, "path", absPath, "error", err)
+			return fdVersion{}, syscall.EIO
+		}
+		current := fdVersion{autoID: root.active.autoID, long: true}
+		if _, ok := root.active.files[fd]; fd != 0 && ok {
+			return current, action()
+		}
+
+		before := root.captureContent(absPath)
+		errno := action()
+		if errno == 0 {
+			after := root.captureContent(absPath)
+			root.active.posixOps = appendNonEmpty(root.active.posixOps, posixOp)
+			root.active.summaries = appendNonEmpty(
+				root.active.summaries,
+				summarizeContent(before, after, nil),
+			)
+		}
+		return current, errno
 	}
 
 	before := root.captureContent(absPath)
@@ -100,9 +134,6 @@ func (n *Node) versionedHookWindow(
 		if abortErr := root.manager.AbortAutoVersion(ctx, window.autoID); abortErr != nil {
 			slog.Error("补偿失败的 auto", "auto_id", window.autoID, "error", abortErr)
 		}
-		if fd != 0 {
-			root.deleteFD(fd)
-		}
 		return fdVersion{}, errno
 	}
 	after := root.captureContent(absPath)
@@ -113,17 +144,13 @@ func (n *Node) versionedHookWindow(
 		if abortErr := root.manager.AbortAutoVersion(ctx, window.autoID); abortErr != nil {
 			slog.Error("关闭失败后的 auto 补偿", "auto_id", window.autoID, "error", abortErr)
 		}
-		if fd != 0 {
-			root.deleteFD(fd)
-		}
 		return fdVersion{}, syscall.EIO
 	}
 	return window, 0
 }
 
-// keepWritableWindow 为可写句柄保留一个跨完整 fd 生命周期的自动版本。这样
-// 顺序 Write 不再为每个 FUSE request 往返 PostgreSQL;同时覆盖 Linux 可能
-// 不把 writable mmap 脏页作为单独 Write 通知的情况。
+// keepWritableWindow 将可写句柄加入当前唯一自动版本。这里不再把 mutex
+// 留给 Release 解锁，因此 Vim 等同时持有多个 swap fd 的程序可以继续 open。
 func (n *Node) keepWritableWindow(
 	ctx context.Context,
 	absPath, command, posixOp string,
@@ -133,24 +160,30 @@ func (n *Node) keepWritableWindow(
 	if root.manager == nil || file == nil || !file.writable {
 		return 0
 	}
+
 	root.window.Lock()
+	defer root.window.Unlock()
+
 	before := root.captureContent(absPath)
-	autoID, err := root.manager.OpenStandaloneVersion(
-		ctx, absPath, command, root.versionMetadata(ctx, posixOp))
-	if err != nil {
-		root.window.Unlock()
-		slog.Error("打开 buffered auto 窗口", "path", absPath, "error", err)
+	if root.active == nil {
+		autoID, err := root.manager.OpenStandaloneVersion(
+			ctx, absPath, command, root.versionMetadata(ctx, posixOp))
+		if err != nil {
+			slog.Error("打开 buffered auto 窗口", "path", absPath, "error", err)
+			return syscall.EIO
+		}
+		root.active = &writableWindow{
+			autoID: autoID,
+			scope:  absPath,
+			files:  make(map[uint64]*trackedFile),
+		}
+	} else if err := root.ensureWindowScopeLocked(ctx, absPath); err != nil {
+		slog.Error("扩展 buffered auto 范围",
+			"auto_id", root.active.autoID, "path", absPath, "error", err)
 		return syscall.EIO
 	}
-	root.storeFD(file.id, fdVersion{
-		autoID: autoID, long: true,
-	})
-	file.auditMu.Lock()
-	file.path = absPath
-	file.posixOp = posixOp
-	file.before = before
-	file.auditMu.Unlock()
-	root.setLongPath(absPath)
+	root.active.files[file.id] = file
+	file.setAuditState(absPath, posixOp, before)
 	return 0
 }
 
@@ -161,24 +194,52 @@ func (n *Node) closeWritableWindow(
 	if file == nil {
 		return 0
 	}
-	window, ok := n.root.takeFD(file.id)
-	if !ok {
+	root := n.root
+	if root.manager == nil {
 		return file.LoopbackFile.Release(ctx)
 	}
+
+	root.window.Lock()
+	defer root.window.Unlock()
+
+	window := root.active
+	if window == nil || window.files[file.id] != file {
+		return file.LoopbackFile.Release(ctx)
+	}
+
 	path, posixOp, before, samples := file.auditState()
 	releaseErrno := file.LoopbackFile.Release(ctx)
+	after := root.captureContent(path)
+	window.posixOps = appendNonEmpty(
+		window.posixOps,
+		summarizeWriteOp(path, posixOp, samples),
+	)
+	window.summaries = appendNonEmpty(
+		window.summaries,
+		summarizeContent(before, after, samples),
+	)
+	delete(window.files, file.id)
+	if len(window.files) != 0 {
+		return releaseErrno
+	}
+
 	finalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	after := n.root.captureContent(path)
-	changeSummary := summarizeContent(before, after, samples)
-	posixOp = summarizeWriteOp(path, posixOp, samples)
-	closeErr := n.root.manager.CloseStandaloneVersion(
-		finalCtx, window.autoID, posixOp, changeSummary)
+	closeErr := root.manager.CloseStandaloneVersion(
+		finalCtx,
+		window.autoID,
+		joinAudit(window.posixOps),
+		joinAudit(window.summaries),
+	)
 	cancel()
-	n.root.setLongPath("")
-	n.root.window.Unlock()
+	root.active = nil
 	if closeErr != nil {
 		slog.Error("关闭 writable auto 窗口",
 			"auto_id", window.autoID, "error", closeErr)
+		if abortErr := root.manager.AbortAutoVersion(
+			context.Background(), window.autoID); abortErr != nil {
+			slog.Error("关闭失败后的 writable auto 补偿",
+				"auto_id", window.autoID, "error", abortErr)
+		}
 		return syscall.EIO
 	}
 	return releaseErrno

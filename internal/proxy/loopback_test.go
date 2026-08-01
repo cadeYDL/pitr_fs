@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -358,6 +359,86 @@ func TestLoopback_WriteSequential_FdDedup(t *testing.T) {
 	if manager.openCalls != 1 {
 		t.Fatalf("100 次顺序 write 应只创建 1 个 auto,实际 %d; commands=%v",
 			manager.openCalls, manager.commands)
+	}
+}
+
+func TestLoopback_MultipleWritableFDsKeepDirectoryResponsive(t *testing.T) {
+	manager := new(mockManager)
+	_, mount, loopback := mountedLoopback(t, WithManager(manager))
+	firstPath := filepath.Join(mount, ".file.swp")
+	first, err := os.OpenFile(
+		firstPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type openResult struct {
+		file *os.File
+		err  error
+	}
+	secondResult := make(chan openResult, 1)
+	go func() {
+		file, err := os.OpenFile(
+			filepath.Join(mount, ".file.swpx"),
+			os.O_CREATE|os.O_EXCL|os.O_RDWR,
+			0o600,
+		)
+		secondResult <- openResult{file: file, err: err}
+	}()
+
+	var second *os.File
+	select {
+	case result := <-secondResult:
+		if result.err != nil {
+			_ = first.Close()
+			t.Fatal(result.err)
+		}
+		second = result.file
+	case <-time.After(2 * time.Second):
+		_ = first.Close()
+		select {
+		case result := <-secondResult:
+			if result.file != nil {
+				_ = result.file.Close()
+			}
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("第二个 Vim swap fd open 超时")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := os.ReadDir(mount)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("可写 fd 存活期间目录读取超时")
+	}
+
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var active *writableWindow
+	for {
+		loopback.window.Lock()
+		active = loopback.active
+		loopback.window.Unlock()
+		if active == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if active != nil {
+		t.Fatalf("所有可写 fd 关闭后仍残留 active auto: %+v", active)
 	}
 }
 

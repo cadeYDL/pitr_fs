@@ -273,6 +273,48 @@ func (m *Manager) OpenStandaloneVersion(
 	return versionID, nil
 }
 
+// UpdateStandaloneVersionScope 只允许把开放自动版本扩展到祖先目录。
+// 同一时刻的多个可写 fd 共用唯一版本时，所有变更路径都必须落在 scope 内。
+func (m *Manager) UpdateStandaloneVersionScope(
+	ctx context.Context,
+	versionID int64,
+	scope string,
+) error {
+	normalized, err := NormalizeScope(scope)
+	if err != nil {
+		return err
+	}
+	err = m.db.InTx(ctx, func(tx pg.Tx) error {
+		if _, err := tx.Exec(ctx,
+			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:versions'))"); err != nil {
+			return err
+		}
+		var updated string
+		err := tx.QueryRow(ctx, `
+			UPDATE pitr_txn
+			   SET scope_path=$2
+			 WHERE id=$1
+			   AND state='auto'
+			   AND closed_at IS NULL
+			   AND (scope_path=$2
+			        OR scope_path LIKE
+			           CASE WHEN $2='/' THEN '/%'
+			                ELSE rtrim($2, '/') || '/%' END)
+			 RETURNING scope_path`,
+			versionID, normalized).Scan(&updated)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w:auto %d 不存在、已关闭或 scope 不是祖先",
+				ErrIllegalTransit, versionID)
+		}
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("扩展自动版本 %d scope 到 %s: %w",
+			versionID, normalized, err)
+	}
+	return nil
+}
+
 func (m *Manager) CloseStandaloneVersion(
 	ctx context.Context,
 	versionID int64,

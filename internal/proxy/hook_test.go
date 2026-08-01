@@ -6,6 +6,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"pitr_fs/internal/txn"
 )
@@ -13,18 +14,19 @@ import (
 type mockManager struct {
 	mu sync.Mutex
 
-	openErr    error
-	closeErr   error
-	abortErr   error
-	nextAuto   int64
-	openCalls  int
-	closeCalls int
-	abortCalls int
-	commands   []string
-	scopes     []string
-	metadata   []txn.VersionMetadata
-	posixOps   []string
-	summaries  []string
+	openErr      error
+	closeErr     error
+	abortErr     error
+	nextAuto     int64
+	openCalls    int
+	closeCalls   int
+	abortCalls   int
+	commands     []string
+	scopes       []string
+	metadata     []txn.VersionMetadata
+	posixOps     []string
+	summaries    []string
+	scopeUpdates []string
 }
 
 func (m *mockManager) OpenStandaloneVersion(
@@ -60,6 +62,17 @@ func (m *mockManager) CloseStandaloneVersion(
 	return m.closeErr
 }
 
+func (m *mockManager) UpdateStandaloneVersionScope(
+	_ context.Context,
+	_ int64,
+	scope string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.scopeUpdates = append(m.scopeUpdates, scope)
+	return nil
+}
+
 func (m *mockManager) AbortAutoVersion(context.Context, int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -68,10 +81,7 @@ func (m *mockManager) AbortAutoVersion(context.Context, int64) error {
 }
 
 func newHookNode(manager VersionManager) *Node {
-	return &Node{root: &Loopback{
-		manager: manager,
-		fds:     make(map[uint64]fdVersion),
-	}}
+	return &Node{root: &Loopback{manager: manager}}
 }
 
 func TestHook_EveryMutationCreatesVersion(t *testing.T) {
@@ -160,25 +170,39 @@ func TestHook_CloseFail_CompensatesAndReturnsEIO(t *testing.T) {
 	}
 }
 
-func TestTakeFD_ConcurrentSingleOwner(t *testing.T) {
-	loopback := &Loopback{fds: make(map[uint64]fdVersion)}
-	loopback.storeFD(7, fdVersion{autoID: 42, long: true})
-	var owners int
-	var mu sync.Mutex
-	var wait sync.WaitGroup
-	for index := 0; index < 100; index++ {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			if _, ok := loopback.takeFD(7); ok {
-				mu.Lock()
-				owners++
-				mu.Unlock()
-			}
-		}()
+func TestKeepWritableWindow_MultipleFDsDoNotHoldLifetimeLock(t *testing.T) {
+	manager := new(mockManager)
+	node := newHookNode(manager)
+	first := &trackedFile{id: 1, writable: true}
+	second := &trackedFile{id: 2, writable: true}
+	if errno := node.keepWritableWindow(
+		context.Background(), "/workspace/.file.swp", "open-write",
+		"open-swp", first); errno != 0 {
+		t.Fatalf("first errno=%v", errno)
 	}
-	wait.Wait()
-	if owners != 1 {
-		t.Fatalf("Flush/Release 窗口终结权=%d,期望 1", owners)
+
+	done := make(chan syscall.Errno, 1)
+	go func() {
+		done <- node.keepWritableWindow(
+			context.Background(), "/workspace/.file.swpx", "open-write",
+			"open-swpx", second)
+	}()
+	select {
+	case errno := <-done:
+		if errno != 0 {
+			t.Fatalf("second errno=%v", errno)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("第二个可写 fd 被第一个 fd 生命周期锁阻塞")
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.openCalls != 1 {
+		t.Fatalf("并发可写 fd 应共享唯一 auto, open=%d", manager.openCalls)
+	}
+	if len(manager.scopeUpdates) != 1 ||
+		manager.scopeUpdates[0] != "/workspace" {
+		t.Fatalf("共享窗口应扩展到共同父目录: %v", manager.scopeUpdates)
 	}
 }

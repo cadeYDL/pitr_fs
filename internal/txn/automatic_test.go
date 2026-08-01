@@ -65,6 +65,41 @@ func TestStandaloneVersionPersistsAuditMetadata(t *testing.T) {
 	}
 }
 
+func TestUpdateStandaloneVersionScopeOnlyWidens(t *testing.T) {
+	mgr, _ := setupManager(t)
+	ctx := context.Background()
+	id, err := mgr.OpenStandaloneVersion(
+		ctx, "/workspace/project/.file.swp", "open-write", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateStandaloneVersionScope(
+		ctx, id, "/workspace/project"); err != nil {
+		t.Fatal(err)
+	}
+	found, err := mgr.FindByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.ScopePath != "/workspace/project" {
+		t.Fatalf("scope=%q", found.ScopePath)
+	}
+	if err := mgr.UpdateStandaloneVersionScope(
+		ctx, id, "/workspace/project/narrow"); !errors.Is(err, ErrIllegalTransit) {
+		t.Fatalf("缩小 scope 应失败,实际 %v", err)
+	}
+	if err := mgr.UpdateStandaloneVersionScope(ctx, id, "/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CloseStandaloneVersion(ctx, id, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateStandaloneVersionScope(
+		ctx, id, "/"); !errors.Is(err, ErrIllegalTransit) {
+		t.Fatalf("关闭后更新 scope 应失败,实际 %v", err)
+	}
+}
+
 func TestFindClosedAtOrBeforeUsesNearestCompleteVersion(t *testing.T) {
 	mgr, db := setupManager(t)
 	ctx := context.Background()

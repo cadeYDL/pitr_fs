@@ -227,6 +227,19 @@ func (l *Loopback) sampleWrite(
 	return sample
 }
 
+func (f *trackedFile) setAuditState(
+	path string,
+	posixOp string,
+	before contentPreview,
+) {
+	f.auditMu.Lock()
+	f.path = path
+	f.posixOp = posixOp
+	f.before = before
+	f.samples = nil
+	f.auditMu.Unlock()
+}
+
 func (f *trackedFile) addWriteSample(sample writeSample) {
 	f.auditMu.Lock()
 	defer f.auditMu.Unlock()

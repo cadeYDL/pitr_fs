@@ -24,6 +24,7 @@ type VersionManager interface {
 		context.Context, string, string, txn.VersionMetadata,
 	) (int64, error)
 	CloseStandaloneVersion(context.Context, int64, string, string) error
+	UpdateStandaloneVersionScope(context.Context, int64, string) error
 	AbortAutoVersion(context.Context, int64) error
 }
 
@@ -53,28 +54,17 @@ type Loopback struct {
 	rootData   *fs.LoopbackRoot
 	rootNode   fs.InodeEmbedder
 
-	mountMu  sync.Mutex
-	window   sync.Mutex
-	fdMu     sync.Mutex
-	fds      map[uint64]fdVersion
-	longPath string
-	nextFD   atomic.Uint64
+	mountMu sync.Mutex
+	// window 只保护一次 FUSE 写操作或窗口成员变更，绝不能跨 fd 生命周期持有。
+	// active 允许同一时刻打开的多个可写 fd 共用唯一 auto，适配 JuiceFS trigger
+	// 只能归属到唯一开放版本的约束。
+	window sync.Mutex
+	active *writableWindow
+	nextFD atomic.Uint64
 
 	auditMu      sync.Mutex
 	processCache map[uint32]processCacheEntry
 	userCache    map[uint32]string
-}
-
-func (l *Loopback) setLongPath(value string) {
-	l.fdMu.Lock()
-	l.longPath = value
-	l.fdMu.Unlock()
-}
-
-func (l *Loopback) isLongPath(value string) bool {
-	l.fdMu.Lock()
-	defer l.fdMu.Unlock()
-	return l.longPath != "" && l.longPath == value
 }
 
 func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
@@ -101,7 +91,6 @@ func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
 	loopback := &Loopback{
 		Backend:      backend,
 		Mount:        mount,
-		fds:          make(map[uint64]fdVersion),
 		processCache: make(map[uint32]processCacheEntry),
 		userCache:    make(map[uint32]string),
 	}
