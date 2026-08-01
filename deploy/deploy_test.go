@@ -27,11 +27,11 @@ func repoRoot(t *testing.T) string {
 	return root
 }
 
-// TestScripts_BashSyntax — install.sh 与 entrypoint.sh 必须过 `bash -n`
+// TestScripts_BashSyntax — 所有 Shell 入口必须过 `bash -n`
 func TestScripts_BashSyntax(t *testing.T) {
 	root := repoRoot(t)
 	for _, rel := range []string{
-		"install.sh", "scripts/install-deps.sh", "deploy/entrypoint.sh",
+		"install.sh", "uninstall.sh", "scripts/install-deps.sh", "deploy/entrypoint.sh",
 	} {
 		p := filepath.Join(root, rel)
 		out, err := exec.Command("bash", "-n", p).CombinedOutput()
@@ -43,7 +43,7 @@ func TestScripts_BashSyntax(t *testing.T) {
 
 func TestUserFacingScriptsAreExecutable(t *testing.T) {
 	root := repoRoot(t)
-	for _, rel := range []string{"install.sh", "scripts/install-deps.sh"} {
+	for _, rel := range []string{"install.sh", "uninstall.sh", "scripts/install-deps.sh"} {
 		info, err := os.Stat(filepath.Join(root, rel))
 		if err != nil {
 			t.Fatal(err)
@@ -64,10 +64,37 @@ func TestInstall_UsageCoversAllSubcommands(t *testing.T) {
 	cmd.Stderr = &out
 	_ = cmd.Run() // --help 返回 0 也可能非 0, 只看输出
 	got := out.String()
-	for _, sub := range []string{"install", "recover", "uninstall", "status", "logs"} {
+	for _, sub := range []string{"install", "recover", "status", "logs"} {
 		if !strings.Contains(got, sub) {
 			t.Errorf("--help 输出缺子命令 %q\n完整输出:\n%s", sub, got)
 		}
+	}
+	if strings.Contains(got, "install.sh uninstall") {
+		t.Errorf("install.sh 不应再暴露卸载子命令\n完整输出:\n%s", got)
+	}
+	if !strings.Contains(got, "source ./uninstall.sh [--purge]") {
+		t.Errorf("install.sh --help 未指向独立卸载脚本\n完整输出:\n%s", got)
+	}
+}
+
+func TestUninstall_HelpRequiresSourceAndDocumentsPurge(t *testing.T) {
+	root := repoRoot(t)
+	sh := filepath.Join(root, "uninstall.sh")
+	out, err := exec.Command("bash", "-c", `source "$1" --help`, "bash", sh).CombinedOutput()
+	if err != nil {
+		t.Fatalf("source uninstall.sh --help: %v\n%s", err, out)
+	}
+	for _, required := range []string{"source ./uninstall.sh", "--purge", "命令缓存"} {
+		if !bytes.Contains(out, []byte(required)) {
+			t.Errorf("uninstall.sh --help 缺少 %q\n完整输出:\n%s", required, out)
+		}
+	}
+	out, err = exec.Command("bash", sh, "--help").CombinedOutput()
+	if err == nil {
+		t.Fatal("直接执行 uninstall.sh 应失败，必须要求 source")
+	}
+	if !bytes.Contains(out, []byte("source ./uninstall.sh")) {
+		t.Errorf("直接执行时未给出 source 指引:\n%s", out)
 	}
 }
 
@@ -117,7 +144,7 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := []byte("\nACTION=\"${1:-install}\"\n")
+	marker := []byte("\ninstall_main() {\n")
 	index := bytes.Index(content, marker)
 	if index < 0 {
 		t.Fatal("install.sh 未找到主命令 case")
@@ -246,16 +273,15 @@ func TestInstall_DetachesOnlyPitrFuseBeforeRecover(t *testing.T) {
 			t.Errorf("install.sh 缺少安全的失联 FUSE 恢复片段 %q", required)
 		}
 	}
-	uninstallStart := strings.Index(script, "do_uninstall()")
-	uninstallEnd := strings.Index(script, "do_status()")
-	if uninstallStart < 0 || uninstallEnd <= uninstallStart {
-		t.Fatal("install.sh 未找到完整 do_uninstall 函数")
+	uninstallContent, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	uninstall := script[uninstallStart:uninstallEnd]
+	uninstall := string(uninstallContent)
 	detach := strings.Index(uninstall, "detach_stale_fuse")
 	remove := strings.Index(uninstall, `docker_cli_timeout 30 rm -f "$CONTAINER"`)
 	if detach < 0 || remove < 0 || detach > remove {
-		t.Error("do_uninstall 必须先解除 FUSE，再删除容器")
+		t.Error("uninstall.sh 必须先解除 FUSE，再删除容器")
 	}
 }
 
@@ -266,13 +292,29 @@ func TestInstall_DockerOperationsAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(content)
-	for _, required := range []string{
-		`timeout 10 docker info`,
-		`docker_cli_timeout 30 rm -f "$CONTAINER"`,
-		`sudo -n true`,
-	} {
+	for _, required := range []string{`timeout 10 docker info`, `sudo -n true`} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh 缺少有界 Docker/sudo 处理 %q", required)
+		}
+	}
+	uninstall, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(uninstall, []byte(`docker_cli_timeout 30 rm -f "$CONTAINER"`)) {
+		t.Error("uninstall.sh 缺少有界容器停止")
+	}
+}
+
+func TestUninstall_RefreshesParentShellCommandCache(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"pitr_uninstall_main() (", "hash -r", `source "$_pitr_uninstall_dir/install.sh"`} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("uninstall.sh 缺少父 Shell 缓存处理 %q", required)
 		}
 	}
 }
@@ -304,11 +346,17 @@ func TestInstall_SupportsUserMountedBlockStorage(t *testing.T) {
 		`BLOCK_PATH="${PITR_BLOCK_PATH:-${SAVED_BLOCK_PATH:-}}"`,
 		`type=bind,source=$BLOCK_PATH,target=/data`,
 		`block_mount=(-v "$DATA_VOLUME:/data")`,
-		`用户块存储目录未删除`,
 	} {
 		if !bytes.Contains(content, []byte(required)) {
 			t.Errorf("install.sh 缺少块存储挂载语义 %q", required)
 		}
+	}
+	uninstall, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(uninstall, []byte(`用户块存储目录未删除`)) {
+		t.Error("uninstall.sh 未说明用户块存储不会被删除")
 	}
 }
 
@@ -404,11 +452,17 @@ func TestInstall_TracksAndRemovesOnlyManagedDependencies(t *testing.T) {
 		`bash "$SCRIPT_DIR/scripts/install-deps.sh"`,
 		`--docker-snapshot-before`,
 		`--docker-snapshot-after "$IMAGE"`,
-		`bash "$SCRIPT_DIR/scripts/install-deps.sh" --uninstall`,
 	} {
 		if !bytes.Contains(install, []byte(required)) {
 			t.Errorf("install.sh 缺少一键环境管理片段 %q", required)
 		}
+	}
+	uninstall, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(uninstall, []byte(`bash "$SCRIPT_DIR/scripts/install-deps.sh" --uninstall`)) {
+		t.Error("uninstall.sh 缺少托管依赖清理调用")
 	}
 }
 

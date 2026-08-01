@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pitr-fs Linux 一键安装 / 卸载 / 恢复
+# pitr-fs Linux 一键安装 / 恢复 / 状态检查
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,12 +21,13 @@ DOCKER_COMMAND=(docker)
 
 usage() {
     cat <<EOF
-用法: $0 [install|recover|uninstall|status|logs]
+用法: $0 [install|recover|status|logs]
   install               构建镜像、启动服务并安装 pitr 命令；不自动挂载目录
   recover               数据卷已存在时重启服务并恢复已 init 的挂载
-  uninstall [--purge]   删除服务；--purge 一并清理数据和本项目安装的宿主依赖
   status                查看服务与挂载状态
   logs                  查看最近 200 行服务诊断日志
+
+卸载请使用: source ./uninstall.sh [--purge]
 
 仅支持 Linux。install 会自动检查并安装缺失的宿主依赖。
 
@@ -43,7 +44,7 @@ usage() {
   PITR_GC_THREADS  对象 GC 删除并发数 (默认 4)
   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   云对象存储凭证 (透传)
 
-非敏感安装参数会持久化到 $INSTALL_CONFIG，后续 recover/uninstall 无需重复设置。
+非敏感安装参数会持久化到 $INSTALL_CONFIG，后续 recover 和 uninstall.sh 无需重复设置。
 EOF
 }
 
@@ -361,34 +362,6 @@ EOF
     fi
 }
 
-do_uninstall() {
-    configure_docker
-    detach_stale_fuse
-    if docker_cli_timeout 10 inspect "$CONTAINER" >/dev/null 2>&1; then
-        docker_cli_timeout 30 rm -f "$CONTAINER" >/dev/null 2>&1 || {
-            echo "错误: 服务未能在 30 秒内停止；数据卷和 pitr 命令均未删除" >&2
-            return 1
-        }
-    fi
-    if [ "${1:-}" = "--purge" ]; then
-        docker_cli volume rm "$PG_VOLUME" "$DATA_VOLUME" >/dev/null 2>&1 || true
-        echo "  数据卷已清理"
-        if [ -n "$BLOCK_PATH" ]; then
-            echo "  用户块存储目录未删除: $BLOCK_PATH"
-        fi
-    fi
-    local sudo
-    sudo=$(sudo_if_needed "$BIN_LINK")
-    $sudo rm -f "$BIN_LINK"
-    if [ "${1:-}" = "--purge" ]; then
-        bash "$SCRIPT_DIR/scripts/install-deps.sh" --uninstall
-        sudo=$(sudo_if_needed "$INSTALL_CONFIG")
-        $sudo rm -f "$INSTALL_CONFIG"
-        $sudo rmdir "$(dirname "$INSTALL_CONFIG")" 2>/dev/null || true
-    fi
-    echo "  ✓ 已卸载"
-}
-
 do_status() {
     configure_docker
     if docker_cli inspect "$CONTAINER" >/dev/null 2>&1; then
@@ -441,19 +414,24 @@ do_recover() {
     fi
 }
 
-ACTION="${1:-install}"
-case "$ACTION" in
-    -h|--help) usage ;;
-    install|recover|uninstall|status|logs)
-        require_linux
-        validate_mount_root
-        case "$ACTION" in
-            install) do_install ;;
-            recover) do_recover ;;
-            uninstall) do_uninstall "${2:-}" ;;
-            status) do_status ;;
-            logs) do_logs ;;
-        esac
-        ;;
-    *) usage; exit 1 ;;
-esac
+install_main() {
+    ACTION="${1:-install}"
+    case "$ACTION" in
+        -h|--help) usage ;;
+        install|recover|status|logs)
+            require_linux
+            validate_mount_root
+            case "$ACTION" in
+                install) do_install ;;
+                recover) do_recover ;;
+                status) do_status ;;
+                logs) do_logs ;;
+            esac
+            ;;
+        *) usage; return 1 ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    install_main "$@"
+fi

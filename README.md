@@ -143,8 +143,8 @@ cat quickstart/test.txt
 ./install.sh recover
 ./install.sh status
 ./install.sh logs             # 查看服务诊断日志，无需使用 docker 命令
-./install.sh uninstall
-./install.sh uninstall --purge  # 永久删除数据，并清理由本项目安装的宿主依赖
+source ./uninstall.sh
+source ./uninstall.sh --purge  # 永久删除数据，并清理由本项目安装的宿主依赖
 ```
 
 普通卸载和不可恢复的彻底清理有不同语义，详见下方“卸载与彻底清理”。
@@ -154,7 +154,7 @@ cat quickstart/test.txt
 ### 普通卸载：保留数据以便恢复
 
 ```bash
-./install.sh uninstall
+source ./uninstall.sh
 ```
 
 普通卸载会解除 pitr-fs 挂载、删除服务容器和 `/usr/local/bin/pitr`，但保留：
@@ -174,7 +174,7 @@ cat quickstart/test.txt
 > **警告：以下操作不可恢复。执行前请确认不再需要任何历史版本和当前文件。**
 
 ```bash
-./install.sh uninstall --purge
+source ./uninstall.sh --purge
 ```
 
 彻底卸载会删除：
@@ -196,7 +196,7 @@ cat quickstart/test.txt
 再次运行同一条命令即可继续清理：
 
 ```bash
-./install.sh uninstall --purge
+source ./uninstall.sh --purge
 ```
 
 可用以下命令确认 pitr-fs 已彻底清理；第一条不应输出路径，后两条应输出确认信息：
@@ -206,6 +206,13 @@ findmnt -rn -t fuse.pitrfs -o TARGET
 test ! -e /usr/local/bin/pitr && echo 'pitr 命令已删除'
 test ! -e /var/lib/pitr-fs/host-install.state && echo '安装清单已删除'
 ```
+
+`uninstall.sh` 必须通过 `source` 在当前 Bash 中执行，直接运行 `./uninstall.sh` 会拒绝
+执行并给出正确用法。实际清理在隔离的子 Shell 完成，返回当前 Shell 后会自动刷新
+Bash 的命令路径缓存（即使彻底卸载因外部 Docker 资源保护而中止也会刷新），因此
+不会留下指向 `/usr/local/bin/pitr` 的失效快捷路径，也不需要额外执行 `hash -r`。
+安装器不会创建 shell alias 或 function；若 `type -a pitr` 仍显示用户自行配置的
+alias/function，需要从对应的 shell 配置文件中删除它。
 
 ## 使用指南
 
