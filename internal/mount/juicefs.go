@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,30 @@ type JuiceFS struct {
 	cmd     *exec.Cmd
 	done    chan error
 	managed bool
+}
+
+// GC 使用 JuiceFS 原生对象适配层做 mark/compact/delete，因此 file、S3、
+// OSS 等后端共享同一套安全语义。调用方负责与写窗口串行化。
+func (m *JuiceFS) GC(ctx context.Context, threads int) error {
+	m.mu.Lock()
+	if err := m.validate(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	binary, metaURL, output := m.Binary, m.MetaURL, m.LogOutput
+	m.mu.Unlock()
+	if threads <= 0 {
+		threads = 4
+	}
+	cmd := exec.CommandContext(ctx, binary,
+		"gc", "--compact", "--delete", "--threads", strconv.Itoa(threads),
+		metaURL)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("juicefs gc: %w", err)
+	}
+	return nil
 }
 
 func (m *JuiceFS) validate() error {

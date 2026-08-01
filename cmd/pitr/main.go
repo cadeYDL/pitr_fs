@@ -217,6 +217,8 @@ $(brew --prefix)/share/zsh/site-functions/_pitr。
 
 func newDaemonCmd() *cobra.Command {
 	var pgDSN, volume, jfsMount, mountRoot, retention, logLevel string
+	var gcInterval time.Duration
+	var gcThreads int
 	c := &cobra.Command{
 		Use:   "daemon",
 		Short: "前台启动 pitrd(通常由 install/systemd 拉起)",
@@ -234,6 +236,8 @@ func newDaemonCmd() *cobra.Command {
 				"--socket", socket,
 				"--retention", retention,
 				"--log-level", logLevel,
+				"--gc-interval", gcInterval.String(),
+				"--gc-threads", fmt.Sprint(gcThreads),
 			}
 			if pgDSN != "" {
 				arguments = append(arguments, "--pg-dsn", pgDSN)
@@ -254,6 +258,8 @@ func newDaemonCmd() *cobra.Command {
 	c.Flags().StringVar(&mountRoot, "mount-root", "/pitr", "允许 init 使用的挂载根目录")
 	c.Flags().StringVar(&retention, "retention", "compact", "保留策略")
 	c.Flags().StringVar(&logLevel, "log-level", "info", "日志级别")
+	c.Flags().DurationVar(&gcInterval, "gc-interval", 10*time.Minute, "对象 GC 批处理间隔")
+	c.Flags().IntVar(&gcThreads, "gc-threads", 4, "对象 GC 删除并发数")
 	return c
 }
 

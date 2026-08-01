@@ -94,6 +94,9 @@ func setupManager(t *testing.T) (*Manager, *pg.DB) {
 		);
 		CREATE TABLE jfs_chunk_ref (
 			chunkid bigint PRIMARY KEY, size int, refs int
+		);
+		CREATE TABLE jfs_delslices (
+			chunkid bigint PRIMARY KEY, deleted bigint, slices bytea
 		)`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}

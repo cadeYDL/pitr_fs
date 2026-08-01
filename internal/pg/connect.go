@@ -18,6 +18,30 @@ func WithMaxConns(n int32) Option {
 	}
 }
 
+// WithAdvisoryLock 在独占的池连接上持有 session advisory lock。适合把
+// PostgreSQL 之外的维护动作（例如 JuiceFS GC）与版本写窗口串行化。
+func (db *DB) WithAdvisoryLock(
+	ctx context.Context,
+	key string,
+	fn func() error,
+) error {
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("获取维护连接: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx,
+		"SELECT pg_advisory_lock(hashtext($1))", key); err != nil {
+		return fmt.Errorf("获取 advisory lock %q: %w", key, err)
+	}
+	defer func() {
+		unlockCtx := context.WithoutCancel(ctx)
+		_, _ = conn.Exec(unlockCtx,
+			"SELECT pg_advisory_unlock(hashtext($1))", key)
+	}()
+	return fn()
+}
+
 type DB struct {
 	pool *pgxpool.Pool
 }

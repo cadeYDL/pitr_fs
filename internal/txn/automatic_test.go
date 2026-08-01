@@ -2,13 +2,23 @@ package txn
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"pitr_fs/internal/pg"
+	"pitr_fs/internal/schema"
 )
+
+func encodedSlice(id uint64, size uint32) []byte {
+	value := make([]byte, 24)
+	binary.BigEndian.PutUint64(value[4:12], id)
+	binary.BigEndian.PutUint32(value[12:16], size)
+	binary.BigEndian.PutUint32(value[20:24], size)
+	return value
+}
 
 func TestStandaloneVersionPersistsAuditMetadata(t *testing.T) {
 	mgr, _ := setupManager(t)
@@ -263,5 +273,234 @@ func TestAutomaticClearRejectsOpenWriteAndAbortRestores(t *testing.T) {
 	}
 	if length != 10 || versions != 0 {
 		t.Fatalf("abort length=%d versions=%d", length, versions)
+	}
+}
+
+func TestSlicePinsReleasedAndGCQueueIsDurable(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (101,4096,1)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx,
+		"INSERT INTO jfs_chunk(inode,indx,slices) VALUES (900,0,$1)",
+		encodedSlice(101, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	versionID, err := mgr.OpenStandaloneVersion(
+		ctx, "/workspace/file", "write", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InTx(ctx, func(txDB pg.Tx) error {
+		if err := txDB.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(versionID)); err != nil {
+			return err
+		}
+		if _, err := txDB.Exec(ctx,
+			"UPDATE jfs_chunk SET slices=$1 WHERE inode=900 AND indx=0",
+			encodedSlice(0, 0)); err != nil {
+			return err
+		}
+		_, err := txDB.Exec(ctx,
+			"UPDATE jfs_chunk_ref SET refs=refs-1 WHERE chunkid=101")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CloseStandaloneVersion(ctx, versionID, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	var refs, pins, delayed, logical int64
+	if err := db.QueryRow(ctx,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=101").Scan(&refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT pins FROM pitr_slice_ref WHERE chunkid=101").Scan(&pins); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM jfs_delslices WHERE chunkid>=8000000000000000000").
+		Scan(&delayed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `
+		SELECT (snapshot->>'refs')::bigint
+		  FROM pitr_chunk_ref_history
+		 WHERE txn_id=$1 AND chunkid=101`, versionID).Scan(&logical); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 1 || pins != 1 || delayed != 1 || logical != 1 {
+		t.Fatalf("pinned refs=%d pins=%d delayed=%d logical=%d",
+			refs, pins, delayed, logical)
+	}
+
+	if _, err := mgr.ClearHistory(ctx, "/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=101").Scan(&refs); err != nil {
+		t.Fatal(err)
+	}
+	var pinRows, queueRows int64
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_slice_ref").Scan(&pinRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_gc_queue").Scan(&queueRows); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 0 || pinRows != 0 || queueRows != 1 {
+		t.Fatalf("released refs=%d pins=%d queue=%d", refs, pinRows, queueRows)
+	}
+
+	called := 0
+	ran, err := mgr.RunPendingGC(ctx, func(context.Context) error {
+		called++
+		return nil
+	})
+	if err != nil || !ran || called != 1 {
+		t.Fatalf("RunPendingGC ran=%v called=%d err=%v", ran, called, err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_gc_queue").Scan(&queueRows); err != nil {
+		t.Fatal(err)
+	}
+	if queueRows != 0 {
+		t.Fatalf("成功 GC 后 queue=%d", queueRows)
+	}
+}
+
+func TestPendingGCDefersWhileWriteIsOpen(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	versionID, err := mgr.OpenStandaloneVersion(
+		ctx, "/workspace/file", "write", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx,
+		"INSERT INTO pitr_gc_queue(singleton) VALUES (true)"); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	ran, err := mgr.RunPendingGC(ctx, func(context.Context) error {
+		called = true
+		return nil
+	})
+	if ran || called || !errors.Is(err, ErrMaintenanceBusy) {
+		t.Fatalf("ran=%v called=%v err=%v", ran, called, err)
+	}
+	if err := mgr.CloseStandaloneVersion(ctx, versionID, "", ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSliceIndexUpgradeRebuildsLegacyAndCleanupState(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (201,8192,1)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx,
+		"INSERT INTO jfs_chunk(inode,indx,slices) VALUES (901,0,$1)",
+		encodedSlice(201, 8192)); err != nil {
+		t.Fatal(err)
+	}
+	versionID, err := mgr.OpenStandaloneVersion(
+		ctx, "/workspace/legacy", "write", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InTx(ctx, func(txDB pg.Tx) error {
+		if err := txDB.SetLocal(ctx, "pitr.current_txn", fmt.Sprint(versionID)); err != nil {
+			return err
+		}
+		if _, err := txDB.Exec(ctx,
+			"UPDATE jfs_chunk SET slices=$1 WHERE inode=901 AND indx=0",
+			encodedSlice(0, 0)); err != nil {
+			return err
+		}
+		_, err := txDB.Exec(ctx,
+			"UPDATE jfs_chunk_ref SET refs=refs-1 WHERE chunkid=201")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CloseStandaloneVersion(ctx, versionID, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟旧版本留下了 history，但还没有 slice 索引。先去掉当前测试 schema
+	// 自动建立的 pin，使 jfs refs 恢复为纯逻辑值。
+	if _, err := db.Exec(ctx, `
+		UPDATE jfs_chunk_ref SET refs=refs-1 WHERE chunkid=201;
+		DELETE FROM jfs_delslices WHERE chunkid>=8000000000000000000;
+		DELETE FROM pitr_slice_pin;
+		DELETE FROM pitr_slice_ref;
+		DELETE FROM pitr_slice_index_state`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, schema.InitSQL); err != nil {
+		t.Fatalf("升级旧卷重建 slice 索引: %v", err)
+	}
+	var refs, pins, through int64
+	var indexedAt, cleanupAt *time.Time
+	if err := db.QueryRow(ctx, `
+		SELECT r.refs,p.pins,s.indexed_through_txn_id,
+		       s.indexed_at,s.last_version_cleanup_at
+		  FROM jfs_chunk_ref r
+		  JOIN pitr_slice_ref p ON p.chunkid=r.chunkid
+		  CROSS JOIN pitr_slice_index_state s
+		 WHERE r.chunkid=201`).Scan(
+		&refs, &pins, &through, &indexedAt, &cleanupAt); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 1 || pins != 1 || through < versionID || indexedAt == nil || cleanupAt != nil {
+		t.Fatalf("legacy rebuild refs=%d pins=%d through=%d indexed=%v cleanup=%v",
+			refs, pins, through, indexedAt, cleanupAt)
+	}
+
+	// 幂等重放不能重复增加引用。
+	if _, err := db.Exec(ctx, schema.InitSQL); err != nil {
+		t.Fatalf("幂等重放 schema: %v", err)
+	}
+	if err := db.QueryRow(ctx,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=201").Scan(&refs); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 1 {
+		t.Fatalf("幂等重放后 refs=%d，期望 1", refs)
+	}
+
+	// 索引后删除版本必须记录 cleanup 水位；下次升级只能全量重建，并把
+	// 新索引时间推进到 cleanup 之后。
+	if _, err := db.Exec(ctx, "DELETE FROM pitr_txn WHERE id=$1", versionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `
+		SELECT indexed_at,last_version_cleanup_at
+		  FROM pitr_slice_index_state WHERE singleton`).Scan(
+		&indexedAt, &cleanupAt); err != nil {
+		t.Fatal(err)
+	}
+	if indexedAt == nil || cleanupAt == nil || !cleanupAt.After(*indexedAt) {
+		t.Fatalf("cleanup 水位未晚于索引: indexed=%v cleanup=%v", indexedAt, cleanupAt)
+	}
+	if _, err := db.Exec(ctx, schema.InitSQL); err != nil {
+		t.Fatalf("cleanup 后全量重建: %v", err)
+	}
+	if err := db.QueryRow(ctx, `
+		SELECT r.refs,s.indexed_at,s.last_version_cleanup_at
+		  FROM jfs_chunk_ref r CROSS JOIN pitr_slice_index_state s
+		 WHERE r.chunkid=201`).Scan(&refs, &indexedAt, &cleanupAt); err != nil {
+		t.Fatal(err)
+	}
+	if refs != 0 || indexedAt == nil || cleanupAt == nil || indexedAt.Before(*cleanupAt) {
+		t.Fatalf("cleanup rebuild refs=%d indexed=%v cleanup=%v",
+			refs, indexedAt, cleanupAt)
 	}
 }

@@ -33,7 +33,7 @@ if ! juicefs status "$PG_DSN" >/dev/null 2>&1; then
         ${AWS_ACCESS_KEY_ID:+--access-key "$AWS_ACCESS_KEY_ID"} \
         ${AWS_SECRET_ACCESS_KEY:+--secret-key "$AWS_SECRET_ACCESS_KEY"} \
         ${PITR_SESSION_TOKEN:+--session-token "$PITR_SESSION_TOKEN"} \
-        --trash-days 36500 \
+        --trash-days 0 \
         "$PG_DSN" "$PITR_VOLUME" >/dev/null
     log "juicefs format 完成; 再跑一次 init SQL 装 jfs_* 触发器..."
     PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
@@ -41,6 +41,11 @@ if ! juicefs status "$PG_DSN" >/dev/null 2>&1; then
 else
     log "JuiceFS 卷已存在, 跳过 format (recover 场景)"
 fi
+
+# PITR 已在 PostgreSQL 中为保留版本建立 slice pin。关闭 JuiceFS 自身的
+# 长期 trash,让被淘汰版本释放 pin 后可由原生 gc 真正回收对象。
+log "校准 JuiceFS 对象生命周期策略 (trash-days=0)..."
+juicefs config --yes --trash-days 0 "$PG_DSN" >/dev/null
 
 # 5. 建目录
 mkdir -p "$(dirname "$PITR_SOCKET")" "$PITR_MOUNT_ROOT" /var/lib/pitr/jfs
@@ -53,6 +58,8 @@ pitrd \
     --volume "$PITR_VOLUME" \
     --jfs-mount /var/lib/pitr/jfs \
     --mount-root "$PITR_MOUNT_ROOT" \
+    --gc-interval "${PITR_GC_INTERVAL:-10m}" \
+    --gc-threads "${PITR_GC_THREADS:-4}" \
     --socket   "$PITR_SOCKET" &
 PITRD_PID=$!
 

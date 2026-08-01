@@ -116,6 +116,47 @@ CREATE TABLE IF NOT EXISTS pitr_blob_retention (
     retained_until  timestamptz
 );
 
+-- 历史 slice 的物理 pin。pitr_slice_pin 使用 JuiceFS 自身 delslices 的紧凑
+-- 编码(id:uint64 + size:uint32,每项 12 B),避免为每个 block 建一行。
+-- pitr_slice_ref 是按 slice 聚合的 pin 计数,用于在回放 jfs_chunk_ref 时把
+-- JuiceFS 的逻辑引用与 PITR 历史引用分开计算。
+CREATE TABLE IF NOT EXISTS pitr_slice_pin (
+    txn_id       bigint PRIMARY KEY REFERENCES pitr_txn(id) ON DELETE CASCADE,
+    delayed_id   bigint UNIQUE NOT NULL,
+    slices       bytea NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS pitr_slice_ref (
+    chunkid      bigint PRIMARY KEY,
+    size         integer NOT NULL CHECK (size > 0),
+    pins         bigint NOT NULL CHECK (pins > 0)
+);
+
+-- 多次版本淘汰合并成一个 GC 请求,由 daemon 低频批量处理。队列落库可保证
+-- daemon 崩溃/重启后不会漏掉对象回收。
+CREATE TABLE IF NOT EXISTS pitr_gc_queue (
+    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    requested_at timestamptz NOT NULL DEFAULT now(),
+    attempts     bigint NOT NULL DEFAULT 0,
+    last_error   text
+);
+
+CREATE TABLE IF NOT EXISTS pitr_internal_state (
+    key          text PRIMARY KEY,
+    value        text NOT NULL,
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- slice 索引升级水位。时间用于判断“索引后发生过版本清理”，txn id 用作
+-- 无歧义的版本水位（避免相同时间戳精度导致漏建）。
+CREATE TABLE IF NOT EXISTS pitr_slice_index_state (
+    singleton               boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    indexed_at              timestamptz NOT NULL,
+    indexed_through_txn_id  bigint NOT NULL DEFAULT 0,
+    last_version_cleanup_at timestamptz
+);
+
 -- 持久化分层配置。当前控制面只允许写全局 '/'，查询按最长路径前缀解析，
 -- 为后续“子目录继承父目录、就近配置优先”预留数据模型。
 CREATE TABLE IF NOT EXISTS pitr_config (
@@ -182,6 +223,268 @@ EXCEPTION WHEN invalid_text_representation THEN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+-- JuiceFS slice 编码使用大端整数。chunk.slices 每项 24 B:
+-- pos(4)+id(8)+size(4)+off(4)+len(4);delslices 每项仅 id(8)+size(4)。
+CREATE OR REPLACE FUNCTION pitr_decode_u64(p_value bytea) RETURNS bigint AS $$
+    SELECT (
+        get_byte(p_value,0)::numeric * 72057594037927936 +
+        get_byte(p_value,1)::numeric * 281474976710656 +
+        get_byte(p_value,2)::numeric * 1099511627776 +
+        get_byte(p_value,3)::numeric * 4294967296 +
+        get_byte(p_value,4)::numeric * 16777216 +
+        get_byte(p_value,5)::numeric * 65536 +
+        get_byte(p_value,6)::numeric * 256 +
+        get_byte(p_value,7)::numeric
+    )::bigint
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION pitr_decode_u32(p_value bytea) RETURNS integer AS $$
+    SELECT (
+        get_byte(p_value,0)::bigint * 16777216 +
+        get_byte(p_value,1)::bigint * 65536 +
+        get_byte(p_value,2)::bigint * 256 +
+        get_byte(p_value,3)::bigint
+    )::integer
+$$ LANGUAGE sql IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION pitr_pin_delayed_id(p_txn_id bigint)
+RETURNS bigint AS $$
+BEGIN
+    IF p_txn_id < 0 OR p_txn_id > 1000000000000000000 THEN
+        RAISE EXCEPTION 'txn id % 超出 slice pin 保留区', p_txn_id;
+    END IF;
+    RETURN 8000000000000000000 + p_txn_id;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+-- 为一个首次捕获的旧 chunk 状态建立历史引用。只有 history INSERT 成功时
+-- 才调用,所以同一版本内对同一 chunk 的重复更新不会重复 pin。
+CREATE OR REPLACE FUNCTION pitr_pin_chunk_slices(
+    p_txn_id bigint,
+    p_slices bytea
+) RETURNS void AS $$
+DECLARE
+    v_count        integer;
+    v_index        integer;
+    v_piece        bytea;
+    v_delayed      bytea := ''::bytea;
+    v_chunkid      bigint;
+    v_size         integer;
+    v_delayed_id   bigint := pitr_pin_delayed_id(p_txn_id);
+    v_existing     bytea;
+    v_old_suppress text := current_setting('pitr.suppress_capture', true);
+BEGIN
+    IF p_slices IS NULL OR length(p_slices) = 0 THEN
+        RETURN;
+    END IF;
+    IF length(p_slices) % 24 <> 0 THEN
+        RAISE EXCEPTION 'txn % 的 chunk slice 编码长度非法:%',
+            p_txn_id, length(p_slices);
+    END IF;
+
+    v_count := length(p_slices) / 24;
+    PERFORM set_config('pitr.suppress_capture', 'on', true);
+    FOR v_index IN 0..v_count-1 LOOP
+        v_piece := substring(p_slices FROM v_index*24+5 FOR 12);
+        v_chunkid := pitr_decode_u64(substring(v_piece FROM 1 FOR 8));
+        v_size := pitr_decode_u32(substring(v_piece FROM 9 FOR 4));
+        IF v_chunkid = 0 THEN
+            CONTINUE;
+        END IF;
+        IF v_size <= 0 THEN
+            RAISE EXCEPTION 'txn % 的 slice % size 非法:%',
+                p_txn_id, v_chunkid, v_size;
+        END IF;
+        v_delayed := v_delayed || v_piece;
+        INSERT INTO pitr_slice_ref(chunkid,size,pins)
+        VALUES (v_chunkid,v_size,1)
+        ON CONFLICT (chunkid) DO UPDATE
+           SET pins=pitr_slice_ref.pins+1
+         WHERE pitr_slice_ref.size=EXCLUDED.size;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'slice % 的 size 发生冲突', v_chunkid;
+        END IF;
+        UPDATE jfs_chunk_ref
+           SET refs=refs+1
+         WHERE chunkid=v_chunkid AND size=v_size;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'slice %/% 缺少 JuiceFS 引用行', v_chunkid, v_size;
+        END IF;
+    END LOOP;
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+
+    IF length(v_delayed) = 0 THEN
+        RETURN;
+    END IF;
+    SELECT slices INTO v_existing
+      FROM pitr_slice_pin WHERE txn_id=p_txn_id FOR UPDATE;
+    IF FOUND THEN
+        UPDATE pitr_slice_pin SET slices=slices || v_delayed
+         WHERE txn_id=p_txn_id;
+        UPDATE jfs_delslices SET slices=slices || v_delayed
+         WHERE chunkid=v_delayed_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'txn % 的 JuiceFS pin 行丢失', p_txn_id;
+        END IF;
+    ELSE
+        IF EXISTS (SELECT 1 FROM jfs_delslices WHERE chunkid=v_delayed_id) THEN
+            RAISE EXCEPTION 'slice pin 保留 id % 已被占用', v_delayed_id;
+        END IF;
+        INSERT INTO pitr_slice_pin(txn_id,delayed_id,slices)
+        VALUES (p_txn_id,v_delayed_id,v_delayed);
+        -- year 9999。该行只由 PITR 版本释放触发器删除,不会被 JuiceFS
+        -- trash 超时清理;官方 gc 会把其中 slice 视为可达。
+        INSERT INTO jfs_delslices(chunkid,deleted,slices)
+        VALUES (v_delayed_id,253402300799,v_delayed);
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+    RAISE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- pitr_chunk_ref_history 存 JuiceFS 的逻辑 refs,不把历史 pin 数写入快照。
+-- replay 时再加上“此刻仍保留”的 pin,从而不因时间旅行覆盖物理引用。
+CREATE OR REPLACE FUNCTION pitr_logical_chunk_ref_snapshot(
+    p_row jsonb,
+    p_chunkid bigint
+) RETURNS jsonb AS $$
+DECLARE
+    v_pins bigint := 0;
+    v_refs bigint;
+BEGIN
+    SELECT pins INTO v_pins FROM pitr_slice_ref WHERE chunkid=p_chunkid;
+    v_pins := COALESCE(v_pins,0);
+    v_refs := (p_row->>'refs')::bigint - v_pins;
+    IF v_refs < 0 THEN
+        RAISE EXCEPTION 'slice % 逻辑 refs 为负数:% - %',
+            p_chunkid, p_row->>'refs', v_pins;
+    END IF;
+    RETURN jsonb_set(p_row,'{refs}',to_jsonb(v_refs),false);
+END;
+$$ LANGUAGE plpgsql STABLE STRICT;
+
+-- 从“现存 history”完整重建 slice 索引。先把旧 PITR pin 从 JuiceFS 物理
+-- refs 中安全扣除，再重建 pitr_slice_pin/ref 与 jfs_delslices。全部动作处于
+-- 同一事务；任何不一致都会回滚，策略是宁可停止升级也不误删对象。
+CREATE OR REPLACE FUNCTION pitr_rebuild_slice_index() RETURNS void AS $$
+DECLARE
+    v_ref               RECORD;
+    v_pin               RECORD;
+    v_history           RECORD;
+    v_last_txn_id       bigint := 0;
+    v_cleanup_at        timestamptz;
+    v_old_suppress      text := current_setting('pitr.suppress_capture', true);
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('pitr-fs:versions'));
+    PERFORM set_config('pitr.suppress_capture', 'on', true);
+
+    FOR v_ref IN SELECT chunkid,size,pins FROM pitr_slice_ref FOR UPDATE LOOP
+        UPDATE jfs_chunk_ref
+           SET refs=refs-v_ref.pins
+         WHERE chunkid=v_ref.chunkid
+           AND size=v_ref.size
+           AND refs>=v_ref.pins;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION '重建 slice 索引时无法安全释放 %/% 的 % 个旧 pin',
+                v_ref.chunkid,v_ref.size,v_ref.pins;
+        END IF;
+    END LOOP;
+
+    FOR v_pin IN SELECT delayed_id FROM pitr_slice_pin FOR UPDATE LOOP
+        DELETE FROM jfs_delslices WHERE chunkid=v_pin.delayed_id;
+    END LOOP;
+    DELETE FROM pitr_slice_pin;
+    DELETE FROM pitr_slice_ref;
+
+    FOR v_history IN
+        SELECT h.txn_id,
+               (jsonb_populate_record(NULL::jfs_chunk,h.snapshot)).slices AS slices
+          FROM pitr_chunk_history h
+         WHERE h.snapshot IS NOT NULL
+         ORDER BY h.txn_id,h.inode,h.indx
+    LOOP
+        PERFORM pitr_pin_chunk_slices(v_history.txn_id,v_history.slices);
+    END LOOP;
+
+    SELECT COALESCE(max(id),0) INTO v_last_txn_id FROM pitr_txn;
+    SELECT last_version_cleanup_at INTO v_cleanup_at
+      FROM pitr_slice_index_state WHERE singleton;
+    INSERT INTO pitr_slice_index_state(
+        singleton,indexed_at,indexed_through_txn_id,last_version_cleanup_at
+    ) VALUES (true,clock_timestamp(),v_last_txn_id,v_cleanup_at)
+    ON CONFLICT (singleton) DO UPDATE
+       SET indexed_at=EXCLUDED.indexed_at,
+           indexed_through_txn_id=EXCLUDED.indexed_through_txn_id,
+           last_version_cleanup_at=EXCLUDED.last_version_cleanup_at;
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+    RAISE;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION pitr_release_version_pins() RETURNS TRIGGER AS $$
+DECLARE
+    v_pin          RECORD;
+    v_index        integer;
+    v_piece        bytea;
+    v_chunkid      bigint;
+    v_size         integer;
+    v_old_suppress text := current_setting('pitr.suppress_capture', true);
+BEGIN
+    INSERT INTO pitr_slice_index_state(
+        singleton,indexed_at,indexed_through_txn_id,last_version_cleanup_at
+    ) VALUES (true,'epoch',0,clock_timestamp())
+    ON CONFLICT (singleton) DO UPDATE
+       SET last_version_cleanup_at=EXCLUDED.last_version_cleanup_at;
+    SELECT delayed_id,slices INTO v_pin
+      FROM pitr_slice_pin WHERE txn_id=OLD.id FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN OLD;
+    END IF;
+    IF length(v_pin.slices) % 12 <> 0 THEN
+        RAISE EXCEPTION 'txn % 的 slice pin 编码损坏', OLD.id;
+    END IF;
+    PERFORM set_config('pitr.suppress_capture', 'on', true);
+    FOR v_index IN 0..(length(v_pin.slices)/12)-1 LOOP
+        v_piece := substring(v_pin.slices FROM v_index*12+1 FOR 12);
+        v_chunkid := pitr_decode_u64(substring(v_piece FROM 1 FOR 8));
+        v_size := pitr_decode_u32(substring(v_piece FROM 9 FOR 4));
+        UPDATE jfs_chunk_ref SET refs=refs-1
+         WHERE chunkid=v_chunkid AND size=v_size;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION '释放 txn % 时 slice %/% 引用行丢失',
+                OLD.id, v_chunkid, v_size;
+        END IF;
+        DELETE FROM pitr_slice_ref
+         WHERE chunkid=v_chunkid AND pins=1;
+        IF NOT FOUND THEN
+            UPDATE pitr_slice_ref SET pins=pins-1
+             WHERE chunkid=v_chunkid AND pins>1;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION '释放 txn % 时 slice % pin 丢失',
+                    OLD.id, v_chunkid;
+            END IF;
+        END IF;
+    END LOOP;
+    DELETE FROM jfs_delslices WHERE chunkid=v_pin.delayed_id;
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+    INSERT INTO pitr_gc_queue(singleton,requested_at)
+    VALUES (true,now())
+    ON CONFLICT (singleton) DO UPDATE SET requested_at=EXCLUDED.requested_at;
+    RETURN OLD;
+EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+    RAISE;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tg_pitr_release_version_pins ON pitr_txn;
+CREATE TRIGGER tg_pitr_release_version_pins
+    BEFORE DELETE ON pitr_txn
+    FOR EACH ROW EXECUTE FUNCTION pitr_release_version_pins();
+
 CREATE OR REPLACE FUNCTION pitr_capture_node_change() RETURNS TRIGGER AS $$
 DECLARE
     v_txn bigint := pitr_current_txn();
@@ -234,7 +537,9 @@ BEGIN
         v_txn,
         COALESCE(OLD.chunkid, NEW.chunkid),
         CASE TG_OP WHEN 'INSERT' THEN 'I' WHEN 'DELETE' THEN 'D' ELSE 'U' END,
-        CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END
+        CASE WHEN TG_OP = 'INSERT' THEN NULL
+             ELSE pitr_logical_chunk_ref_snapshot(to_jsonb(OLD),OLD.chunkid)
+        END
     )
     ON CONFLICT (txn_id, chunkid) DO NOTHING;
     RETURN COALESCE(NEW, OLD);
@@ -244,6 +549,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION pitr_capture_chunk_change() RETURNS TRIGGER AS $$
 DECLARE
     v_txn bigint := pitr_current_txn();
+    v_inserted integer;
 BEGIN
     IF v_txn IS NULL THEN
         RETURN COALESCE(NEW, OLD);
@@ -257,6 +563,10 @@ BEGIN
         CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END
     )
     ON CONFLICT (txn_id, inode, indx) DO NOTHING;
+    GET DIAGNOSTICS v_inserted = ROW_COUNT;
+    IF v_inserted = 1 AND TG_OP <> 'INSERT' AND OLD.slices IS NOT NULL THEN
+        PERFORM pitr_pin_chunk_slices(v_txn,OLD.slices);
+    END IF;
     RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
@@ -298,6 +608,38 @@ BEGIN
     END IF;
 END $$;
 
+-- 升级/重启校准：首次建立索引、出现更晚版本，或索引后发生过版本清理时
+-- 全量重建。清理会移除历史行，不能只追加；txn id 水位避免时间戳碰撞漏建。
+DO $$
+DECLARE
+    v_state           RECORD;
+    v_last_txn_id     bigint := 0;
+    v_last_version_at timestamptz;
+    v_rebuild         boolean := false;
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='jfs_chunk')
+       AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='jfs_chunk_ref')
+       AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='jfs_delslices') THEN
+        SELECT * INTO v_state FROM pitr_slice_index_state WHERE singleton;
+        SELECT COALESCE(max(id),0),
+               max(GREATEST(created_at,COALESCE(closed_at,created_at)))
+          INTO v_last_txn_id,v_last_version_at
+          FROM pitr_txn;
+        IF NOT FOUND OR v_state.indexed_at IS NULL THEN
+            v_rebuild := true;
+        ELSE
+            v_rebuild := v_state.indexed_through_txn_id < v_last_txn_id
+                OR (v_last_version_at IS NOT NULL
+                    AND v_state.indexed_at < v_last_version_at)
+                OR (v_state.last_version_cleanup_at IS NOT NULL
+                    AND v_state.indexed_at < v_state.last_version_cleanup_at);
+        END IF;
+        IF v_rebuild THEN
+            PERFORM pitr_rebuild_slice_index();
+        END IF;
+    END IF;
+END $$;
+
 -- ============================================================================
 -- 6.1 commit 坍缩存储过程
 --
@@ -306,8 +648,57 @@ END $$;
 -- 完成后中间的 auto 事务被删掉(state='auto' + parent_id=commit_id)。
 -- ============================================================================
 
-CREATE OR REPLACE PROCEDURE pitr_collapse_commit(p_commit_id bigint) AS $$
+-- commit 坍缩只改变版本归属,不能释放物理 pin。把 auto 的紧凑 slice 缓冲
+-- 合并到 commit 行,全局 pitr_slice_ref/jfs_chunk_ref 计数保持不变。
+CREATE OR REPLACE FUNCTION pitr_move_slice_pins(
+    p_from_ids bigint[],
+    p_to_id bigint
+) RETURNS void AS $$
+DECLARE
+    v_source      RECORD;
+    v_target_slices bytea;
+    v_target_id   bigint := pitr_pin_delayed_id(p_to_id);
 BEGIN
+    SELECT slices INTO v_target_slices
+      FROM pitr_slice_pin WHERE txn_id=p_to_id FOR UPDATE;
+    IF NOT FOUND AND EXISTS (
+        SELECT 1 FROM jfs_delslices WHERE chunkid=v_target_id
+    ) THEN
+        RAISE EXCEPTION 'commit slice pin 保留 id % 已被占用', v_target_id;
+    END IF;
+
+    FOR v_source IN
+        SELECT txn_id,delayed_id,slices
+          FROM pitr_slice_pin
+         WHERE txn_id=ANY(p_from_ids)
+         ORDER BY txn_id
+         FOR UPDATE
+    LOOP
+        IF v_target_slices IS NULL THEN
+            INSERT INTO pitr_slice_pin(txn_id,delayed_id,slices)
+            VALUES (p_to_id,v_target_id,v_source.slices);
+            INSERT INTO jfs_delslices(chunkid,deleted,slices)
+            VALUES (v_target_id,253402300799,v_source.slices);
+            v_target_slices := v_source.slices;
+        ELSE
+            UPDATE pitr_slice_pin SET slices=slices || v_source.slices
+             WHERE txn_id=p_to_id;
+            UPDATE jfs_delslices SET slices=slices || v_source.slices
+             WHERE chunkid=v_target_id;
+            v_target_slices := v_target_slices || v_source.slices;
+        END IF;
+        DELETE FROM jfs_delslices WHERE chunkid=v_source.delayed_id;
+        DELETE FROM pitr_slice_pin WHERE txn_id=v_source.txn_id;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE PROCEDURE pitr_collapse_commit(p_commit_id bigint) AS $$
+DECLARE
+    v_auto_ids bigint[];
+BEGIN
+    SELECT COALESCE(array_agg(id),ARRAY[]::bigint[]) INTO v_auto_ids
+      FROM pitr_txn WHERE parent_id=p_commit_id AND state='auto';
     -- pitr_node_history: 每个 inode 只留最早一份
     DELETE FROM pitr_node_history nh USING (
         SELECT txn_id, inode
@@ -374,6 +765,8 @@ BEGIN
     UPDATE pitr_chunk_ref_history SET txn_id = p_commit_id
       WHERE txn_id IN (SELECT id FROM pitr_txn WHERE parent_id = p_commit_id AND state = 'auto');
 
+    PERFORM pitr_move_slice_pins(v_auto_ids,p_commit_id);
+
     -- 删中间 auto 事务
     DELETE FROM pitr_txn WHERE parent_id = p_commit_id AND state = 'auto';
 
@@ -425,6 +818,8 @@ DECLARE
     r_edge RECORD;
     r_chunk RECORD;
     r_chunk_ref RECORD;
+    v_pin_count bigint;
+    v_pin_size integer;
 BEGIN
     SELECT id INTO v_target_txn_id
       FROM pitr_txn WHERE version_hash = p_target_hash;
@@ -538,17 +933,29 @@ BEGIN
                ))
         ORDER  BY crh.recorded_at DESC, crh.txn_id DESC
     LOOP
+        SELECT pins,size INTO v_pin_count,v_pin_size
+          FROM pitr_slice_ref WHERE chunkid=r_chunk_ref.chunkid;
+        v_pin_count := COALESCE(v_pin_count,0);
         IF r_chunk_ref.op = 'I' THEN
-            DELETE FROM jfs_chunk_ref WHERE chunkid = r_chunk_ref.chunkid;
+            IF v_pin_count = 0 THEN
+                DELETE FROM jfs_chunk_ref WHERE chunkid = r_chunk_ref.chunkid;
+            ELSE
+                INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+                VALUES (r_chunk_ref.chunkid,v_pin_size,v_pin_count)
+                ON CONFLICT (chunkid) DO UPDATE
+                   SET size=EXCLUDED.size,refs=EXCLUDED.refs;
+            END IF;
         ELSIF r_chunk_ref.snapshot IS NOT NULL THEN
             IF EXISTS (SELECT 1 FROM jfs_chunk_ref WHERE chunkid = r_chunk_ref.chunkid) THEN
-                UPDATE jfs_chunk_ref SET (chunkid, size, refs) =
-                    (SELECT jcr.chunkid, jcr.size, jcr.refs
-                     FROM jsonb_populate_record(NULL::jfs_chunk_ref, r_chunk_ref.snapshot) AS jcr)
+                UPDATE jfs_chunk_ref
+                   SET size=(r_chunk_ref.snapshot->>'size')::integer,
+                       refs=(r_chunk_ref.snapshot->>'refs')::integer+v_pin_count
                 WHERE chunkid = r_chunk_ref.chunkid;
             ELSE
-                INSERT INTO jfs_chunk_ref
-                SELECT * FROM jsonb_populate_record(NULL::jfs_chunk_ref, r_chunk_ref.snapshot);
+                INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+                VALUES (r_chunk_ref.chunkid,
+                        (r_chunk_ref.snapshot->>'size')::integer,
+                        (r_chunk_ref.snapshot->>'refs')::integer+v_pin_count);
             END IF;
         END IF;
     END LOOP;
@@ -569,6 +976,8 @@ DECLARE
     r_edge RECORD;
     r_chunk RECORD;
     r_chunk_ref RECORD;
+    v_pin_count bigint;
+    v_pin_size integer;
 BEGIN
     SELECT state INTO v_state FROM pitr_txn WHERE id = p_txn_id FOR UPDATE;
     IF v_state IS NULL THEN
@@ -661,20 +1070,30 @@ BEGIN
          WHERE t.parent_id = p_txn_id AND t.state = 'auto'
          ORDER BY crh.recorded_at DESC, crh.txn_id DESC
     LOOP
+        SELECT pins,size INTO v_pin_count,v_pin_size
+          FROM pitr_slice_ref WHERE chunkid=r_chunk_ref.chunkid;
+        v_pin_count := COALESCE(v_pin_count,0);
         IF r_chunk_ref.op = 'I' THEN
-            DELETE FROM jfs_chunk_ref WHERE chunkid = r_chunk_ref.chunkid;
+            IF v_pin_count = 0 THEN
+                DELETE FROM jfs_chunk_ref WHERE chunkid = r_chunk_ref.chunkid;
+            ELSE
+                INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+                VALUES (r_chunk_ref.chunkid,v_pin_size,v_pin_count)
+                ON CONFLICT (chunkid) DO UPDATE
+                   SET size=EXCLUDED.size,refs=EXCLUDED.refs;
+            END IF;
         ELSIF r_chunk_ref.snapshot IS NOT NULL THEN
             IF EXISTS (SELECT 1 FROM jfs_chunk_ref
                         WHERE chunkid = r_chunk_ref.chunkid) THEN
-                UPDATE jfs_chunk_ref SET (chunkid, size, refs) =
-                    (SELECT jcr.chunkid, jcr.size, jcr.refs
-                       FROM jsonb_populate_record(NULL::jfs_chunk_ref,
-                                                  r_chunk_ref.snapshot) AS jcr)
+                UPDATE jfs_chunk_ref
+                   SET size=(r_chunk_ref.snapshot->>'size')::integer,
+                       refs=(r_chunk_ref.snapshot->>'refs')::integer+v_pin_count
                  WHERE chunkid = r_chunk_ref.chunkid;
             ELSE
-                INSERT INTO jfs_chunk_ref
-                SELECT * FROM jsonb_populate_record(NULL::jfs_chunk_ref,
-                                                    r_chunk_ref.snapshot);
+                INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+                VALUES (r_chunk_ref.chunkid,
+                        (r_chunk_ref.snapshot->>'size')::integer,
+                        (r_chunk_ref.snapshot->>'refs')::integer+v_pin_count);
             END IF;
         END IF;
     END LOOP;

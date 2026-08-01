@@ -109,6 +109,9 @@ func setupServer(t *testing.T) *serverFixture {
 		CREATE TABLE jfs_chunk_ref (
 			chunkid bigint PRIMARY KEY, size int, refs int
 		);
+		CREATE TABLE jfs_delslices (
+			chunkid bigint PRIMARY KEY, deleted bigint, slices bytea
+		);
 		CREATE TABLE jfs_setting (
 			name text PRIMARY KEY, value text
 		);

@@ -1,8 +1,11 @@
 package mount
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +23,25 @@ func TestIsMountPoint(t *testing.T) {
 	}
 	if mounted {
 		t.Fatal("普通临时目录不应是 mountpoint")
+	}
+}
+
+func TestJuiceFS_GCUsesNativeCompactDelete(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "juicefs")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	m := &JuiceFS{
+		Binary: binary, MetaURL: "postgres://example",
+		MountPoint: "/tmp/jfs", LogOutput: &output,
+	}
+	if err := m.GC(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(output.String())
+	if got != "gc --compact --delete --threads 7 postgres://example" {
+		t.Fatalf("gc args=%q", got)
 	}
 }
 

@@ -28,13 +28,15 @@ import (
 )
 
 var (
-	flagPGDSN     string
-	flagVolume    string
-	flagJFSMount  string
-	flagMountRoot string
-	flagSocket    string
-	flagRetention string
-	flagLogLevel  string
+	flagPGDSN      string
+	flagVolume     string
+	flagJFSMount   string
+	flagMountRoot  string
+	flagSocket     string
+	flagRetention  string
+	flagLogLevel   string
+	flagGCInterval time.Duration
+	flagGCThreads  int
 )
 
 func main() {
@@ -55,6 +57,8 @@ gRPC 控制面 unix socket。`,
 	root.Flags().StringVar(&flagSocket, "socket", "/var/run/pitrd.sock", "pitrd unix 控制 socket")
 	root.Flags().StringVar(&flagRetention, "retention", "compact", "保留策略")
 	root.Flags().StringVar(&flagLogLevel, "log-level", "info", "日志级别:debug|info|warn|error")
+	root.Flags().DurationVar(&flagGCInterval, "gc-interval", 10*time.Minute, "对象 GC 批处理间隔；0 表示停用")
+	root.Flags().IntVar(&flagGCThreads, "gc-threads", 4, "JuiceFS GC 对象删除并发数")
 	root.SetContext(ctx)
 
 	if err := root.Execute(); err != nil {
@@ -108,6 +112,15 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		return err
 	} else if closed != 0 {
 		slog.Warn("closed dangling auto windows", "count", closed)
+	}
+	if flagGCInterval < 0 {
+		return errors.New("--gc-interval 不能为负数")
+	}
+	if flagGCThreads <= 0 {
+		return errors.New("--gc-threads 必须大于 0")
+	}
+	if flagGCInterval > 0 {
+		go runGCWorker(cmd.Context(), mgr, jfs, flagGCInterval, flagGCThreads)
 	}
 	persisted, err := mgr.LoadVolumeMountConfig(cmd.Context(), flagVolume)
 	if err != nil {
@@ -184,6 +197,41 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		"fuse_mount", fuseMount,
 	)
 	return serveSocket(cmd.Context(), flagSocket, grpcServer)
+}
+
+func runGCWorker(
+	ctx context.Context,
+	mgr *txn.Manager,
+	jfs *pitrmount.JuiceFS,
+	interval time.Duration,
+	threads int,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			timeout := interval
+			if timeout < time.Hour {
+				timeout = time.Hour
+			}
+			runCtx, cancel := context.WithTimeout(ctx, timeout)
+			ran, err := mgr.RunPendingGC(runCtx, func(gcCtx context.Context) error {
+				return jfs.GC(gcCtx, threads)
+			})
+			cancel()
+			switch {
+			case err == nil && ran:
+				slog.Info("JuiceFS lifecycle GC completed")
+			case errors.Is(err, txn.ErrMaintenanceBusy):
+				slog.Debug("JuiceFS lifecycle GC deferred", "reason", err)
+			case err != nil && !errors.Is(err, context.Canceled):
+				slog.Error("JuiceFS lifecycle GC failed", "error", err)
+			}
+		}
+	}
 }
 
 func pathInsideMountRoot(candidate, root string) bool {
