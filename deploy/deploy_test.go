@@ -249,6 +249,42 @@ func TestInstall_IsLinuxOnlyAndUsesGenericMountRoot(t *testing.T) {
 	}
 }
 
+func TestInstall_SupportsUserMountedBlockStorage(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`BLOCK_PATH="${PITR_BLOCK_PATH:-}"`,
+		`type=bind,source=$BLOCK_PATH,target=/data`,
+		`block_mount=(-v "$DATA_VOLUME:/data")`,
+		`用户块存储目录未删除`,
+	} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("install.sh 缺少块存储挂载语义 %q", required)
+		}
+	}
+}
+
+func TestEntrypoint_EnablesPinnedSliceLifecycleGC(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "deploy/entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"--trash-days 0",
+		`juicefs config --yes --trash-days 0 "$PG_DSN"`,
+		`--gc-interval "${PITR_GC_INTERVAL:-10m}"`,
+		`--gc-threads "${PITR_GC_THREADS:-4}"`,
+	} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("entrypoint 缺少生命周期配置 %q", required)
+		}
+	}
+}
+
 // TestInstall_StatusOnMissingContainer — status 在容器不存在时输出"容器未运行"
 // 需要 docker 才能跑; 无 docker 直接跳过
 func TestInstall_StatusOnMissingContainer(t *testing.T) {

@@ -8,6 +8,7 @@ MOUNT_ROOT="${PITR_MOUNT_ROOT:-/pitr}"
 BIN_LINK="${PITR_BIN:-/usr/local/bin/pitr}"
 PG_VOLUME="${PITR_PG_VOLUME:-pitr_pgdata}"
 DATA_VOLUME="${PITR_DATA_VOLUME:-pitr_data}"
+BLOCK_PATH="${PITR_BLOCK_PATH:-}"
 READY_TIMEOUT="${PITR_READY_TIMEOUT:-120}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -27,8 +28,11 @@ usage() {
   PITR_IMAGE       镜像名 (默认 pitr-fs:latest)
   PITR_PG_VOLUME   PostgreSQL Docker volume (默认 pitr_pgdata)
   PITR_DATA_VOLUME 对象数据 Docker volume (默认 pitr_data)
+  PITR_BLOCK_PATH  用户已挂载的块存储目录；为空时使用本地 Docker volume
   PITR_STORAGE     JuiceFS 存储后端 (默认 file); s3/minio/oss/cos/...
   PITR_BUCKET      存储 bucket URL / 本地路径 (默认容器内 /data)
+  PITR_GC_INTERVAL 对象 GC 合并执行间隔 (默认 10m; 0 停用)
+  PITR_GC_THREADS  对象 GC 删除并发数 (默认 4)
   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   云对象存储凭证 (透传)
 EOF
 }
@@ -49,6 +53,28 @@ validate_mount_root() {
         echo "错误: PITR_MOUNT_ROOT 不能是根目录" >&2
         exit 1
     }
+    if [ -n "$BLOCK_PATH" ]; then
+        case "$BLOCK_PATH" in
+            /*) ;;
+            *) echo "错误: PITR_BLOCK_PATH 必须是绝对路径: $BLOCK_PATH" >&2; exit 1 ;;
+        esac
+        [ "$BLOCK_PATH" != "/" ] || {
+            echo "错误: PITR_BLOCK_PATH 不能是根目录" >&2
+            exit 1
+        }
+        case "$BLOCK_PATH/" in
+            "$MOUNT_ROOT/"* )
+                echo "错误: PITR_BLOCK_PATH 不能位于 PITR_MOUNT_ROOT 内" >&2
+                exit 1
+                ;;
+        esac
+        case "$MOUNT_ROOT/" in
+            "$BLOCK_PATH/"* )
+                echo "错误: PITR_MOUNT_ROOT 不能位于 PITR_BLOCK_PATH 内" >&2
+                exit 1
+                ;;
+        esac
+    fi
 }
 
 sudo_if_needed() {
@@ -79,6 +105,19 @@ prepare_mount_root() {
         sudo=$(sudo_if_needed "$MOUNT_ROOT")
         $sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$MOUNT_ROOT"
     fi
+}
+
+prepare_block_storage() {
+    [ -n "$BLOCK_PATH" ] || return 0
+    if [ ! -d "$BLOCK_PATH" ]; then
+        local sudo
+        sudo=$(sudo_if_needed "$BLOCK_PATH")
+        $sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$BLOCK_PATH"
+    fi
+    [ -w "$BLOCK_PATH" ] || {
+        echo "错误: 当前用户不能写入 PITR_BLOCK_PATH: $BLOCK_PATH" >&2
+        exit 1
+    }
 }
 
 detach_stale_fuse() {
@@ -154,6 +193,12 @@ EOF2
 }
 
 run_container() {
+    local -a block_mount
+    if [ -n "$BLOCK_PATH" ]; then
+        block_mount=(--mount "type=bind,source=$BLOCK_PATH,target=/data")
+    else
+        block_mount=(-v "$DATA_VOLUME:/data")
+    fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     detach_stale_fuse
     docker run -d --name "$CONTAINER" \
@@ -168,8 +213,10 @@ run_container() {
         ${PITR_BUCKET:+-e "PITR_BUCKET=$PITR_BUCKET"} \
         ${AWS_ACCESS_KEY_ID:+-e "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"} \
         ${AWS_SECRET_ACCESS_KEY:+-e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"} \
+        ${PITR_GC_INTERVAL:+-e "PITR_GC_INTERVAL=$PITR_GC_INTERVAL"} \
+        ${PITR_GC_THREADS:+-e "PITR_GC_THREADS=$PITR_GC_THREADS"} \
         -v "$PG_VOLUME:/var/lib/postgresql/data" \
-        -v "$DATA_VOLUME:/data" \
+        "${block_mount[@]}" \
         --mount "type=bind,source=/etc/passwd,target=/host/etc/passwd,readonly" \
         --mount "type=bind,source=$MOUNT_ROOT,target=$MOUNT_ROOT,bind-propagation=rshared" \
         "$IMAGE" >/dev/null
@@ -178,6 +225,7 @@ run_container() {
 do_install() {
     need_host_tools
     prepare_mount_root
+    prepare_block_storage
     echo "==> 构建镜像 $IMAGE"
     docker build -t "$IMAGE" -f "$SCRIPT_DIR/deploy/Dockerfile" "$SCRIPT_DIR"
     echo "==> 启动容器 $CONTAINER"
@@ -189,6 +237,7 @@ do_install() {
 
   ✓ 服务安装完成，尚未挂载用户目录
   允许的挂载根目录: $MOUNT_ROOT
+  块存储: ${BLOCK_PATH:-本地 Docker volume $DATA_VOLUME}
 
   下一步:
     mkdir -p $MOUNT_ROOT/data
@@ -205,6 +254,9 @@ do_uninstall() {
     if [ "${1:-}" = "--purge" ]; then
         docker volume rm "$PG_VOLUME" "$DATA_VOLUME" >/dev/null 2>&1 || true
         echo "  数据卷已清理"
+        if [ -n "$BLOCK_PATH" ]; then
+            echo "  用户块存储目录未删除: $BLOCK_PATH"
+        fi
     fi
     local sudo
     sudo=$(sudo_if_needed "$BIN_LINK")
@@ -225,6 +277,7 @@ started:   {{.State.StartedAt}}' "$CONTAINER"
 do_recover() {
     need_host_tools
     prepare_mount_root
+    prepare_block_storage
     if docker inspect "$CONTAINER" >/dev/null 2>&1; then
         local state
         state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER")
