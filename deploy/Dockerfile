@@ -40,10 +40,7 @@ COPY internal/schema/init_pitr.sql /etc/pitr/init_pitr.sql
 COPY deploy/entrypoint.sh /usr/local/bin/pitr-entrypoint.sh
 RUN chmod +x /usr/local/bin/pitr-entrypoint.sh
 
-ENV POSTGRES_USER=pitr \
-    POSTGRES_PASSWORD=pitr \
-    POSTGRES_DB=pitr_fs \
-    PITR_VOLUME=default \
+ENV PITR_VOLUME=default \
     PITR_MOUNT_ROOT=/pitr \
     PITR_GC_INTERVAL=10m \
     PITR_GC_THREADS=4 \

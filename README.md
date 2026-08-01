@@ -35,26 +35,46 @@ Linux `/proc/<pid>/cmdline` 尽力获取，用户名按 UID 从宿主机只读
 
 以下命令都应在 **Linux 主机**中执行。
 
-### 1. 一键安装宿主机依赖
+### 1. 获取源码
+
+极简 Linux 可能没有 Git，可只用系统自带的 `curl` 和 `tar` 下载：
 
 ```bash
-git clone <仓库地址> pitr-fs
-cd pitr-fs
-./scripts/install-deps.sh
-./scripts/install-deps.sh --check
+curl -fL https://github.com/cadeYDL/pitr_fs/archive/refs/heads/main.tar.gz \
+  -o /tmp/pitr-fs.tar.gz
+tar -xzf /tmp/pitr-fs.tar.gz
+cd pitr_fs-main
 ```
 
-依赖脚本支持使用 `apt`、`dnf`、`yum`、`pacman` 或 `zypper` 的常见 Linux
-发行版，会安装 Docker、FUSE3、util-linux、CA 证书、curl、git、Python 3
-和 awk，并尽力启动 Docker。最小宿主机要求是可用的 `/dev/fuse`、Docker daemon 和支持
-shared bind propagation 的 Linux 内核。
+已有 Git 时也可以执行：
 
-### 2. 安装服务
+```bash
+git clone https://github.com/cadeYDL/pitr_fs.git pitr-fs
+cd pitr-fs
+```
+
+### 2. 一键安装环境与服务
 
 ```bash
 ./install.sh install
 pitr status
 ```
+
+`install` 会自动检查 Linux 环境，并通过 `apt`、`dnf`、`yum`、`pacman` 或
+`zypper` 安装缺失的 Docker、FUSE3、util-linux、CA 证书、curl、Git、Python 3
+和 awk。已有命令和可用 Docker 不会被替换、升级、重启或重新配置。安装器把本项目
+实际新增的软件包、Docker 组成员和服务状态记录在
+`/var/lib/pitr-fs/host-install.state`，重复安装不会覆盖最初状态。
+挂载根、块存储路径和容器/数据卷名称等非敏感参数保存在
+`/etc/pitr-fs/install.conf`，后续 `recover` 和 `uninstall` 无需重复设置环境变量；
+命令行环境变量仍可显式覆盖。访问凭证不会写入该文件。
+
+若刚把当前用户加入 `docker` 组，安装程序会在重新登录前自动使用 `sudo`。可单独
+执行 `./scripts/install-deps.sh --check` 做只读环境检查。最小宿主机要求是可用的
+`/dev/fuse` 和支持 shared bind propagation 的 Linux 内核。
+
+用户不需要单独安装、初始化或配置 JuiceFS 和 PostgreSQL：它们由 pitr-fs 镜像
+在内部管理。
 
 安装只启动服务，不会擅自占用用户目录。默认允许挂载到 `/pitr` 的子目录；
 可在首次安装时通过 `PITR_MOUNT_ROOT=/自定义根目录` 修改。挂载根不能是 `/`。
@@ -121,9 +141,17 @@ cat quickstart/test.txt
 
 ```bash
 ./install.sh recover
+./install.sh status
+./install.sh logs             # 查看服务诊断日志，无需使用 docker 命令
 ./install.sh uninstall
-./install.sh uninstall --purge  # 同时永久删除数据库和对象数据卷
+./install.sh uninstall --purge  # 永久删除数据，并清理由本项目安装的宿主依赖
 ```
+
+普通 `uninstall` 保留数据卷和宿主依赖，便于稍后 `recover`。彻底卸载只处理安装
+清单中由 pitr-fs 新增的内容，安装前已有的软件不动；如果某个受管依赖后来被其他
+软件使用，安全检查会停止依赖清理并保留清单，不会级联误删外部软件。若 Docker
+本身由 pitr-fs 安装，检测到后来新增的容器、镜像、数据卷或自定义网络时也会保留
+Docker；只有确认不存在外部 Docker 对象后，才会清理其运行数据。
 
 ## 使用指南
 

@@ -41,7 +41,20 @@ func TestScripts_BashSyntax(t *testing.T) {
 	}
 }
 
-// TestInstall_UsageCoversAllSubcommands — --help 输出必须列 4 个子命令
+func TestUserFacingScriptsAreExecutable(t *testing.T) {
+	root := repoRoot(t)
+	for _, rel := range []string{"install.sh", "scripts/install-deps.sh"} {
+		info, err := os.Stat(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&0o111 == 0 {
+			t.Errorf("%s 缺少可执行权限", rel)
+		}
+	}
+}
+
+// TestInstall_UsageCoversAllSubcommands — --help 输出必须列出全部子命令
 func TestInstall_UsageCoversAllSubcommands(t *testing.T) {
 	root := repoRoot(t)
 	sh := filepath.Join(root, "install.sh")
@@ -51,7 +64,7 @@ func TestInstall_UsageCoversAllSubcommands(t *testing.T) {
 	cmd.Stderr = &out
 	_ = cmd.Run() // --help 返回 0 也可能非 0, 只看输出
 	got := out.String()
-	for _, sub := range []string{"install", "recover", "uninstall", "status"} {
+	for _, sub := range []string{"install", "recover", "uninstall", "status", "logs"} {
 		if !strings.Contains(got, sub) {
 			t.Errorf("--help 输出缺子命令 %q\n完整输出:\n%s", sub, got)
 		}
@@ -85,7 +98,9 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 		`docker_args=(exec --workdir "\$container_workdir")`,
 		`if [ -t 0 ] && [ -t 1 ]; then`,
 		"docker_args+=(-it)",
-		`exec docker "\${docker_args[@]}" "$CONTAINER" pitr "\${pitr_args[@]}"`,
+		`docker_command=(docker)`,
+		`docker_command=(sudo docker)`,
+		`exec "\${docker_command[@]}" "\${docker_args[@]}" "$CONTAINER" pitr "\${pitr_args[@]}"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh wrapper 缺少非 TTY 兼容片段 %q", required)
@@ -179,8 +194,8 @@ func TestInstall_ReadyRequiresSuccessfulRPC(t *testing.T) {
 	}
 	script := string(content)
 	for _, required := range []string{
-		`docker exec "$CONTAINER" test -S /var/run/pitrd.sock`,
-		`docker exec "$CONTAINER" pitr status >/dev/null 2>&1`,
+		`docker_cli exec "$CONTAINER" test -S /var/run/pitrd.sock`,
+		`docker_cli exec "$CONTAINER" pitr status >/dev/null 2>&1`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("wait_ready 缺少端到端就绪检查 %q", required)
@@ -222,12 +237,42 @@ func TestInstall_DetachesOnlyPitrFuseBeforeRecover(t *testing.T) {
 	for _, required := range []string{
 		`for attempt in $(seq 1 8); do`,
 		`findmnt -rn -t fuse.pitrfs -o TARGET`,
+		`docker_cli_timeout 10 exec "$CONTAINER" fusermount3 -uz "$target"`,
 		`fusermount3 -uz "$target"`,
 		`pitr FUSE 层超过安全清理上限 8`,
-		"detach_stale_fuse\n            docker start",
+		"detach_stale_fuse\n            docker_cli start",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh 缺少安全的失联 FUSE 恢复片段 %q", required)
+		}
+	}
+	uninstallStart := strings.Index(script, "do_uninstall()")
+	uninstallEnd := strings.Index(script, "do_status()")
+	if uninstallStart < 0 || uninstallEnd <= uninstallStart {
+		t.Fatal("install.sh 未找到完整 do_uninstall 函数")
+	}
+	uninstall := script[uninstallStart:uninstallEnd]
+	detach := strings.Index(uninstall, "detach_stale_fuse")
+	remove := strings.Index(uninstall, `docker_cli_timeout 30 rm -f "$CONTAINER"`)
+	if detach < 0 || remove < 0 || detach > remove {
+		t.Error("do_uninstall 必须先解除 FUSE，再删除容器")
+	}
+}
+
+func TestInstall_DockerOperationsAreBounded(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	for _, required := range []string{
+		`timeout 10 docker info`,
+		`docker_cli_timeout 30 rm -f "$CONTAINER"`,
+		`sudo -n true`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("install.sh 缺少有界 Docker/sudo 处理 %q", required)
 		}
 	}
 }
@@ -240,7 +285,7 @@ func TestInstall_IsLinuxOnlyAndUsesGenericMountRoot(t *testing.T) {
 	}
 	for _, required := range []string{
 		`[ "$(uname -s)" = "Linux" ]`,
-		`MOUNT_ROOT="${PITR_MOUNT_ROOT:-/pitr}"`,
+		`MOUNT_ROOT="${PITR_MOUNT_ROOT:-${SAVED_MOUNT_ROOT:-/pitr}}"`,
 		`source=$MOUNT_ROOT,target=$MOUNT_ROOT,bind-propagation=rshared`,
 	} {
 		if !bytes.Contains(content, []byte(required)) {
@@ -256,7 +301,7 @@ func TestInstall_SupportsUserMountedBlockStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, required := range []string{
-		`BLOCK_PATH="${PITR_BLOCK_PATH:-}"`,
+		`BLOCK_PATH="${PITR_BLOCK_PATH:-${SAVED_BLOCK_PATH:-}}"`,
 		`type=bind,source=$BLOCK_PATH,target=/data`,
 		`block_mount=(-v "$DATA_VOLUME:/data")`,
 		`用户块存储目录未删除`,
@@ -301,8 +346,102 @@ func TestInstall_StatusOnMissingContainer(t *testing.T) {
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	_ = cmd.Run()
-	if !strings.Contains(out.String(), "容器未运行") {
-		t.Errorf("status 应输出'容器未运行', 实际:\n%s", out.String())
+	if !strings.Contains(out.String(), "服务未安装或未运行") {
+		t.Errorf("status 应输出'服务未安装或未运行', 实际:\n%s", out.String())
+	}
+}
+
+func TestInstall_DoesNotReplaceExistingDocker(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "scripts/install-deps.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(content)
+	for _, required := range []string{
+		`command -v docker >/dev/null 2>&1 || add_package docker.io`,
+		`宿主机依赖均已存在，未替换或重装任何软件包`,
+		`usermod -aG docker "$install_user"`,
+		`systemctl enable --now docker.socket`,
+		`安装前已有的 Docker，但 daemon 不可用`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("依赖脚本缺少已有 Docker 保护片段 %q", required)
+		}
+	}
+}
+
+func TestInstall_TracksAndRemovesOnlyManagedDependencies(t *testing.T) {
+	root := repoRoot(t)
+	deps, err := os.ReadFile(filepath.Join(root, "scripts/install-deps.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`STATE_FILE="$STATE_DIR/host-install.state"`,
+		`state_append "package=$package"`,
+		`state_append "docker_group_user=$install_user"`,
+		`state_append "docker_group_created=1"`,
+		`apt-get -s purge "${owned_packages[@]}"`,
+		`run_root rpm -e "${owned_packages[@]}"`,
+		`if [ "${1:-}" = "--uninstall" ]`,
+		`docker_snapshot_before`,
+		`docker_snapshot_after`,
+		`Docker 中存在非 pitr-fs 管理的镜像`,
+		`Docker 中存在非 pitr-fs 容器`,
+		`run_root rm -rf -- /var/lib/docker /var/lib/containerd`,
+	} {
+		if !bytes.Contains(deps, []byte(required)) {
+			t.Errorf("依赖脚本缺少可追踪清理片段 %q", required)
+		}
+	}
+
+	install, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`bash "$SCRIPT_DIR/scripts/install-deps.sh"`,
+		`--docker-snapshot-before`,
+		`--docker-snapshot-after "$IMAGE"`,
+		`bash "$SCRIPT_DIR/scripts/install-deps.sh" --uninstall`,
+	} {
+		if !bytes.Contains(install, []byte(required)) {
+			t.Errorf("install.sh 缺少一键环境管理片段 %q", required)
+		}
+	}
+}
+
+func TestInstall_PersistsNonSecretInstallConfiguration(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`INSTALL_CONFIG="${PITR_INSTALL_CONFIG:-/etc/pitr-fs/install.conf}"`,
+		`MOUNT_ROOT="${PITR_MOUNT_ROOT:-${SAVED_MOUNT_ROOT:-/pitr}}"`,
+		`printf 'SAVED_MOUNT_ROOT=%q\n' "$MOUNT_ROOT"`,
+		`write_install_config`,
+	} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("install.sh 缺少安装参数持久化片段 %q", required)
+		}
+	}
+	if bytes.Contains(content, []byte("SAVED_AWS_SECRET_ACCESS_KEY")) ||
+		bytes.Contains(content, []byte("SAVED_POSTGRES_PASSWORD")) {
+		t.Error("安装配置不得持久化访问凭证或数据库密码")
+	}
+}
+
+func TestDockerfileDoesNotBakeDatabasePassword(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "deploy/Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(content, []byte("POSTGRES_PASSWORD=")) {
+		t.Error("Dockerfile 不应把数据库密码写进镜像 ENV")
 	}
 }
 
