@@ -1,0 +1,79 @@
+name: 发布开发预览版
+
+on:
+  push:
+    tags:
+      - "dev-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: 构建并发布 Linux 升级包
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出发布提交
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 构建双架构升级包
+        env:
+          PITR_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          for arch in amd64 arm64; do
+            PITR_BUILD_DATE="$build_date" PITR_GOARCH="$arch" \
+              ./scripts/build-upgrade-bundle.sh \
+              "dist/pitr-fs_${PITR_VERSION}_linux_${arch}.tar.gz"
+          done
+          cd dist
+          sha256sum pitr-fs_*.tar.gz > SHA256SUMS
+
+      - name: 校验升级包
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS
+          for bundle in pitr-fs_*.tar.gz; do
+            work=$(mktemp -d)
+            tar -xzf "$bundle" -C "$work"
+            (cd "$work" && sha256sum -c SHA256SUMS)
+            test "$(cat "$work/VERSION")" = "${GITHUB_REF_NAME}"
+            rm -rf "$work"
+          done
+
+      - name: 发布 GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "开发预览版，基于提交 \`${GITHUB_SHA:0:12}\`。" \
+            "" \
+            "## 使用" \
+            "" \
+            "\`\`\`bash" \
+            "pitr upgrade ${GITHUB_REF_NAME}" \
+            "\`\`\`" \
+            "" \
+            "这是 pre-release，不作为生产稳定版本承诺。升级会短暂停止 pitrd/FUSE，请先确保没有进行写入。" \
+            > release-notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            dist/pitr-fs_*.tar.gz dist/SHA256SUMS \
+            --prerelease \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md
