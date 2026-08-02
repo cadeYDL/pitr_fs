@@ -95,6 +95,8 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 		`release_asset_from_json`,
 		`asset.get("digest") or ""`,
 		`--proto '=https'`,
+		`--retry-all-errors`,
+		`--retry-max-time 60`,
 		`PITR_UPDATE_REPOSITORY`,
 		`pitr-host-upgrade init_pitr.sql`,
 		`upgrade-fallback`,

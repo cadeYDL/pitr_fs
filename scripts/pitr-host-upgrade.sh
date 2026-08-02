@@ -163,7 +163,7 @@ PY
 download_release_bundle() {
     local requested=$1 work=$2 arch metadata endpoint asset_url digest tag bundle actual
     local auth_config
-    local -a curl_headers release_info
+    local -a curl_headers curl_retry release_info
     arch=$(release_arch) || return 1
     metadata="$work/release.json"
     if [[ ! "$UPDATE_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
@@ -182,6 +182,10 @@ download_release_bundle() {
     fi
     curl_headers=(-H 'Accept: application/vnd.github+json' \
         -H 'X-GitHub-Api-Version: 2022-11-28')
+    # Release 下载经过公网，连接重置、TLS 提前断开等瞬时错误不应让升级直接失败。
+    # 不设置总传输超时，避免大包或慢链路被误杀；重试次数和等待时间保持有界。
+    curl_retry=(--retry 4 --retry-delay 1 --retry-max-time 60 \
+        --retry-all-errors --connect-timeout 15)
     if [ -n "${GITHUB_TOKEN:-}" ]; then
         if [[ ! "$GITHUB_TOKEN" =~ ^[A-Za-z0-9_]+$ ]]; then
             echo "错误: GITHUB_TOKEN 格式无效" >&2
@@ -193,7 +197,7 @@ download_release_bundle() {
         curl_headers+=(--config "$auth_config")
     fi
     if ! curl --fail --silent --show-error --location \
-        --proto '=https' --tlsv1.2 "${curl_headers[@]}" \
+        --proto '=https' --tlsv1.2 "${curl_retry[@]}" "${curl_headers[@]}" \
         -o "$metadata" "$endpoint"; then
         echo "错误: 获取 GitHub Release 失败: ${requested:-latest}" >&2
         return 1
@@ -207,7 +211,7 @@ download_release_bundle() {
     digest=${release_info[2]}
     bundle="$work/pitr-fs_${tag}_linux_${arch}.tar.gz"
     if ! curl --fail --silent --show-error --location \
-        --proto '=https' --tlsv1.2 "${curl_headers[@]}" \
+        --proto '=https' --tlsv1.2 "${curl_retry[@]}" "${curl_headers[@]}" \
         -o "$bundle" "$asset_url"; then
         echo "错误: 下载 Release 资产失败: $asset_url" >&2
         return 1
