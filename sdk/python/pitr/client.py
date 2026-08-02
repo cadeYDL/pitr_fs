@@ -61,7 +61,6 @@ class Volume:
     fuse_mount: str
     jfs_mounted: bool
     fuse_mounted: bool
-    retention: str
     history_limit: int
     error: str
     max_space_bytes: int = 0
@@ -311,7 +310,6 @@ class Client:
                 fuse_mount=value.fuse_mount,
                 jfs_mounted=value.jfs_mounted,
                 fuse_mounted=value.fuse_mounted,
-                retention=value.retention,
                 history_limit=value.history_limit,
                 error=value.error,
                 max_space_bytes=value.max_space_bytes,
@@ -327,8 +325,8 @@ class Client:
         limit: int,
         timeout: float | None = None,
     ) -> None:
-        if not 1 <= limit <= 100000:
-            raise ValueError(f"history limit 必须在 1..100000 之间: {limit}")
+        if limit != -1 and limit < 1:
+            raise ValueError(f"history limit 必须是 -1 或正整数: {limit}")
         self._stub.ConfigSet(
             pb.ConfigSetRequest(key="history-limit", value=str(limit)),
             timeout=timeout,

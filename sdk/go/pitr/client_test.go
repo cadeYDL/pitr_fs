@@ -231,6 +231,12 @@ func TestGoSDK_ConfigAndClear(t *testing.T) {
 	if err := client.SetHistoryLimit(context.Background(), 12); err != nil {
 		t.Fatal(err)
 	}
+	if err := client.SetHistoryLimit(context.Background(), -1); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetHistoryLimit(context.Background(), 0); err == nil {
+		t.Fatal("zero history limit should fail")
+	}
 	if err := client.SetMaxSpaceBytes(context.Background(), 100<<30); err != nil {
 		t.Fatal(err)
 	}

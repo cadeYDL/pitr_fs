@@ -163,7 +163,7 @@ func newUpgradeCmd() *cobra.Command {
 // ---------- 生命周期 ----------
 
 func newDaemonCmd() *cobra.Command {
-	var pgDSN, volume, jfsMount, mountRoot, retention, logLevel string
+	var pgDSN, volume, jfsMount, mountRoot, logLevel string
 	var gcInterval time.Duration
 	var gcThreads int
 	c := &cobra.Command{
@@ -181,7 +181,6 @@ func newDaemonCmd() *cobra.Command {
 				"--jfs-mount", jfsMount,
 				"--mount-root", mountRoot,
 				"--socket", socket,
-				"--retention", retention,
 				"--log-level", logLevel,
 				"--gc-interval", gcInterval.String(),
 				"--gc-threads", fmt.Sprint(gcThreads),
@@ -203,7 +202,6 @@ func newDaemonCmd() *cobra.Command {
 	c.Flags().StringVar(&volume, "volume", "default", "JuiceFS 卷名")
 	c.Flags().StringVar(&jfsMount, "jfs-mount", "/var/lib/pitr/jfs", "底层 JuiceFS 挂载点")
 	c.Flags().StringVar(&mountRoot, "mount-root", "/pitr", "允许 init 使用的挂载根目录")
-	c.Flags().StringVar(&retention, "retention", "compact", "保留策略")
 	c.Flags().StringVar(&logLevel, "log-level", "info", "日志级别")
 	c.Flags().DurationVar(&gcInterval, "gc-interval", 10*time.Minute, "对象 GC 批处理间隔")
 	c.Flags().IntVar(&gcThreads, "gc-threads", 4, "对象 GC 删除并发数")
@@ -211,8 +209,9 @@ func newDaemonCmd() *cobra.Command {
 }
 
 func newInitCmd() *cobra.Command {
-	var volume, storage, bucket, accessKey, secretKey, retention, dataDir string
-	var historyLimit, spaceReserve int
+	var volume, storage, bucket, accessKey, secretKey, dataDir string
+	var historyLimit int64
+	var spaceReserve int
 	var maxSpace string
 	c := &cobra.Command{
 		Use:   "init <path>",
@@ -241,10 +240,10 @@ func newInitCmd() *cobra.Command {
 			defer cancel()
 			request := &pb.InitRequest{
 				Path: resolved, Volume: volume,
-				Retention: retention, StorageArgs: storageArgs,
+				StorageArgs: storageArgs,
 			}
 			if cmd.Flags().Changed("history-limit") {
-				value := int32(historyLimit)
+				value := historyLimit
 				request.HistoryLimit = &value
 			}
 			if cmd.Flags().Changed("max-space") {
@@ -264,9 +263,9 @@ func newInitCmd() *cobra.Command {
 			}
 			item := resp.GetVolume()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"initialized %s @ %s (jfs=%s retention=%s history-limit=%d max-space=%s reserve=%d%%)\n",
+				"initialized %s @ %s (jfs=%s history-limit=%s max-space=%s reserve=%d%%)\n",
 				item.GetName(), item.GetFuseMount(),
-				item.GetJfsMount(), item.GetRetention(), item.GetHistoryLimit(),
+				item.GetJfsMount(), formatHistoryLimit(item.GetHistoryLimit()),
 				txn.FormatSpaceLimit(item.GetMaxSpaceBytes()),
 				item.GetSpaceReservePercent())
 			return nil
@@ -277,10 +276,9 @@ func newInitCmd() *cobra.Command {
 	c.Flags().StringVar(&bucket, "bucket", "", "兼容参数；bucket 在 install 时确定")
 	c.Flags().StringVar(&accessKey, "access-key", "", "兼容参数；凭证在 install 时确定")
 	c.Flags().StringVar(&secretKey, "secret-key", "", "兼容参数；凭证在 install 时确定")
-	c.Flags().StringVar(&retention, "retention", "compact", "保留策略: verbose|compact|archive")
 	c.Flags().StringVar(&dataDir, "data-dir", "", "兼容参数；file 数据目录在 install 时确定")
-	c.Flags().IntVar(&historyLimit, "history-limit", defaultHistoryLimitCLI,
-		"最多保留的版本数")
+	c.Flags().Int64Var(&historyLimit, "history-limit", defaultHistoryLimitCLI,
+		"最多保留的版本数；-1 表示不限制")
 	c.Flags().StringVar(&maxSpace, "max-space", "unlimited",
 		"文件数据空间上限，例如 100GiB；unlimited 表示不限")
 	c.Flags().IntVar(&spaceReserve, "space-reserve", 20,
@@ -412,13 +410,13 @@ func newStatusCmd() *cobra.Command {
 				"connected to pitrd %s, %d volumes, %d open writes\n",
 				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetOpenWrites())
 			rows := [][]string{{
-				"卷", "JuiceFS", "挂载点", "保留策略", "版本上限",
+				"卷", "JuiceFS", "挂载点", "版本上限",
 				"空间上限", "预留比例", "已占用", "可回收",
 			}}
 			for _, volume := range resp.GetVolumes() {
 				rows = append(rows, []string{
 					volume.GetName(), volume.GetJfsMount(), volume.GetFuseMount(),
-					volume.GetRetention(), fmt.Sprintf("%d", volume.GetHistoryLimit()),
+					formatHistoryLimit(volume.GetHistoryLimit()),
 					txn.FormatSpaceLimit(volume.GetMaxSpaceBytes()),
 					fmt.Sprintf("%d%%", volume.GetSpaceReservePercent()),
 					txn.FormatSpaceBytes(volume.GetRetainedSpaceBytes()),
@@ -490,8 +488,7 @@ func newConfigCmd() *cobra.Command {
 	const configHelp = `查看或设置全局运行时配置。
 
 支持的配置项：
-  retention      预留的三档策略名；当前自动模式尚未按三档执行
-  history-limit  1..100000，版本数量硬上限
+  history-limit  -1 或正整数；-1 表示不限制版本数量
   max-space      unlimited、0 或容量值；支持 B/KB/MB/GB/TB 和 KiB/MiB/GiB/TiB
   space-reserve  1..99%，20% 表示达到 max-space 的 80% 后继续淘汰老版本
 
@@ -508,23 +505,17 @@ history-limit 与空间水位同时生效，最终由更严格的约束决定保
 		if err != nil {
 			return friendlyRPCError(cmd, err)
 		}
-		retention, historyLimit, maxSpace, spaceReserve := "-", "-", "-", "-"
+		historyLimit, maxSpace, spaceReserve := "-", "-", "-"
 		if len(resp.GetVolumes()) > 0 {
 			volume := resp.GetVolumes()[0]
-			retention = volume.GetRetention()
-			if retention == "" {
-				retention = "-"
-			}
-			historyLimit = fmt.Sprintf("%d", volume.GetHistoryLimit())
+			historyLimit = formatHistoryLimit(volume.GetHistoryLimit())
 			maxSpace = txn.FormatSpaceLimit(volume.GetMaxSpaceBytes())
 			spaceReserve = fmt.Sprintf("%d%%", volume.GetSpaceReservePercent())
 		}
 		if err := writeAlignedTable(cmd.OutOrStdout(), [][]string{
 			{"配置项", "当前值", "默认值", "取值范围", "说明"},
-			{"retention", retention, "compact", "verbose|compact|archive",
-				"预留策略名；当前自动模式尚未按三档执行"},
-			{"history-limit", historyLimit, "100", "1..100000",
-				"版本数量硬上限，超出后从最老版本开始删除"},
+			{"history-limit", historyLimit, "100", "-1|正整数",
+				"版本数量上限；-1 不按数量裁剪，超限时从最老版本开始删除"},
 			{"max-space", maxSpace, "unlimited", "unlimited|0|容量值",
 				"当前文件与历史版本仍引用的数据空间预算（近似值）"},
 			{"space-reserve", spaceReserve, "20%", "1..99%",
@@ -533,10 +524,8 @@ history-limit 与空间水位同时生效，最终由更严格的约束决定保
 			return err
 		}
 		_, _ = fmt.Fprint(cmd.OutOrStdout(), `
-retention 预期语义：verbose=保留每次写版本；compact=压缩业务改动的中间版本；archive=仅保留 --window 内版本。
-当前实现：自动模式下 retention 尚未接入裁剪，实际由 history-limit 和空间水位控制。
 容量单位：KB/MB/GB/TB 按 1000，KiB/MiB/GiB/TiB 按 1024；不写单位按 B；0/unlimited 表示不限。
-裁剪关系：先满足 history-limit，再在已配置 max-space 且超过“100% 减去 space-reserve”的水位时继续删除最老版本；最终以更严格的约束为准。
+裁剪关系：history-limit=-1 时不按数量裁剪；空间水位仍独立生效。其他取值下先满足 history-limit，再在已配置 max-space 且超过“100% 减去 space-reserve”的水位时继续删除最老版本；最终以更严格的约束为准。
 `)
 		return nil
 	}
@@ -564,25 +553,22 @@ retention 预期语义：verbose=保留每次写版本；compact=压缩业务改
 				return err
 			}
 			defer client.close()
-			window, _ := cmd.Flags().GetString("window")
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
-				Key: args[0], Value: args[1], Window: window,
+				Key: args[0], Value: args[1],
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "set %s=%s",
 				resp.GetKey(), resp.GetValue())
-			if resp.GetWindow() != "" {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), " window=%s", resp.GetWindow())
-			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout())
 			return nil
 		},
 	}
-	set.Flags().String("window", "", "archive 策略的保留窗口,如 30d")
+	// value 允许直接写 -1；此子命令没有位于位置参数之后的选项。
+	set.Flags().SetInterspersed(false)
 	c.AddCommand(list, set)
 	return c
 }

@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS pitr_space_state (
 -- 为后续“子目录继承父目录、就近配置优先”预留数据模型。
 CREATE TABLE IF NOT EXISTS pitr_config (
     scope_path      text PRIMARY KEY,
-    history_limit   integer NOT NULL CHECK (history_limit > 0),
+    history_limit   bigint NOT NULL CHECK (history_limit = -1 OR history_limit > 0),
     max_space_bytes bigint NOT NULL DEFAULT 0 CHECK (max_space_bytes >= 0),
     space_reserve_percent integer NOT NULL DEFAULT 20
         CHECK (space_reserve_percent BETWEEN 1 AND 99),
@@ -183,12 +183,21 @@ ALTER TABLE pitr_config
     ADD COLUMN IF NOT EXISTS max_space_bytes bigint NOT NULL DEFAULT 0;
 ALTER TABLE pitr_config
     ADD COLUMN IF NOT EXISTS space_reserve_percent integer NOT NULL DEFAULT 20;
+ALTER TABLE pitr_config
+    ALTER COLUMN history_limit TYPE bigint;
+-- 旧版本只允许正整数；-1 现在表示不按版本数量裁剪。空间水位策略仍生效。
+ALTER TABLE pitr_config
+    DROP CONSTRAINT IF EXISTS pitr_config_history_limit_check;
+ALTER TABLE pitr_config
+    ADD CONSTRAINT pitr_config_history_limit_check
+    CHECK (history_limit = -1 OR history_limit > 0);
 
 -- 卷挂载配置。当前服务只管理一个全局卷；单独建表可让 daemon 在重启后
 -- 恢复由 `pitr init <path>` 选定的用户挂载点。
 CREATE TABLE IF NOT EXISTS pitr_volume_config (
     volume_name    text PRIMARY KEY,
     fuse_mount     text NOT NULL,
+    -- 仅用于兼容旧 schema；运行时不再读取或更新。
     retention      text NOT NULL DEFAULT 'compact',
     updated_at     timestamptz NOT NULL DEFAULT now()
 );

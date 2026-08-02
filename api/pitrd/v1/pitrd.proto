@@ -29,9 +29,9 @@ service Pitrd {
 message InitRequest {
   string path = 1;
   string volume = 2;
-  string retention = 3;
+  string retention = 3 [deprecated = true];
   repeated string storage_args = 4;
-  optional int32 history_limit = 5;
+  optional int64 history_limit = 5;
   optional int64 max_space_bytes = 6;
   optional int32 space_reserve_percent = 7;
 }
@@ -61,9 +61,9 @@ message VolumeStatus {
   string fuse_mount = 3;
   bool jfs_mounted = 4;
   bool fuse_mounted = 5;
-  string retention = 6;
+  string retention = 6 [deprecated = true];
   string error = 7;
-  int32 history_limit = 8;
+  int64 history_limit = 8;
   int64 max_space_bytes = 9;
   int32 space_reserve_percent = 10;
   int64 retained_space_bytes = 11;
@@ -186,13 +186,13 @@ message RecoverResponse {
 message ConfigSetRequest {
   string key = 1;
   string value = 2;
-  string window = 3;
+  string window = 3 [deprecated = true];
 }
 
 message ConfigSetResponse {
   string key = 1;
   string value = 2;
-  string window = 3;
+  string window = 3 [deprecated = true];
 }
 
 message ClearRequest {

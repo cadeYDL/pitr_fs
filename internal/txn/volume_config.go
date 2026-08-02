@@ -12,7 +12,6 @@ import (
 type VolumeMountConfig struct {
 	VolumeName string
 	FUSEMount  string
-	Retention  string
 }
 
 func (m *Manager) LoadVolumeMountConfig(
@@ -21,10 +20,10 @@ func (m *Manager) LoadVolumeMountConfig(
 ) (*VolumeMountConfig, error) {
 	out := new(VolumeMountConfig)
 	err := m.db.QueryRow(ctx, `
-		SELECT volume_name, fuse_mount, retention
+		SELECT volume_name, fuse_mount
 		  FROM pitr_volume_config
 		 WHERE volume_name=$1`, volumeName).Scan(
-		&out.VolumeName, &out.FUSEMount, &out.Retention)
+		&out.VolumeName, &out.FUSEMount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -39,13 +38,12 @@ func (m *Manager) SaveVolumeMountConfig(
 	config VolumeMountConfig,
 ) error {
 	_, err := m.db.Exec(ctx, `
-		INSERT INTO pitr_volume_config (volume_name, fuse_mount, retention)
-		VALUES ($1,$2,$3)
+		INSERT INTO pitr_volume_config (volume_name, fuse_mount)
+		VALUES ($1,$2)
 		ON CONFLICT (volume_name) DO UPDATE
 		SET fuse_mount=EXCLUDED.fuse_mount,
-		    retention=EXCLUDED.retention,
 		    updated_at=now()`,
-		config.VolumeName, config.FUSEMount, config.Retention)
+		config.VolumeName, config.FUSEMount)
 	if err != nil {
 		return fmt.Errorf("保存卷挂载配置: %w", err)
 	}

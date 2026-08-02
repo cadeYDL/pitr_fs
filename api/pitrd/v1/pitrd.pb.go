@@ -24,14 +24,15 @@ const (
 )
 
 type InitRequest struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	Path                string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Volume              string                 `protobuf:"bytes,2,opt,name=volume,proto3" json:"volume,omitempty"`
-	Retention           string                 `protobuf:"bytes,3,opt,name=retention,proto3" json:"retention,omitempty"`
-	StorageArgs         []string               `protobuf:"bytes,4,rep,name=storage_args,json=storageArgs,proto3" json:"storage_args,omitempty"`
-	HistoryLimit        *int32                 `protobuf:"varint,5,opt,name=history_limit,json=historyLimit,proto3,oneof" json:"history_limit,omitempty"`
-	MaxSpaceBytes       *int64                 `protobuf:"varint,6,opt,name=max_space_bytes,json=maxSpaceBytes,proto3,oneof" json:"max_space_bytes,omitempty"`
-	SpaceReservePercent *int32                 `protobuf:"varint,7,opt,name=space_reserve_percent,json=spaceReservePercent,proto3,oneof" json:"space_reserve_percent,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Path   string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Volume string                 `protobuf:"bytes,2,opt,name=volume,proto3" json:"volume,omitempty"`
+	// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
+	Retention           string   `protobuf:"bytes,3,opt,name=retention,proto3" json:"retention,omitempty"`
+	StorageArgs         []string `protobuf:"bytes,4,rep,name=storage_args,json=storageArgs,proto3" json:"storage_args,omitempty"`
+	HistoryLimit        *int64   `protobuf:"varint,5,opt,name=history_limit,json=historyLimit,proto3,oneof" json:"history_limit,omitempty"`
+	MaxSpaceBytes       *int64   `protobuf:"varint,6,opt,name=max_space_bytes,json=maxSpaceBytes,proto3,oneof" json:"max_space_bytes,omitempty"`
+	SpaceReservePercent *int32   `protobuf:"varint,7,opt,name=space_reserve_percent,json=spaceReservePercent,proto3,oneof" json:"space_reserve_percent,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -80,6 +81,7 @@ func (x *InitRequest) GetVolume() string {
 	return ""
 }
 
+// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
 func (x *InitRequest) GetRetention() string {
 	if x != nil {
 		return x.Retention
@@ -94,7 +96,7 @@ func (x *InitRequest) GetStorageArgs() []string {
 	return nil
 }
 
-func (x *InitRequest) GetHistoryLimit() int32 {
+func (x *InitRequest) GetHistoryLimit() int64 {
 	if x != nil && x.HistoryLimit != nil {
 		return *x.HistoryLimit
 	}
@@ -336,19 +338,20 @@ func (*StatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type VolumeStatus struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	Name                  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	JfsMount              string                 `protobuf:"bytes,2,opt,name=jfs_mount,json=jfsMount,proto3" json:"jfs_mount,omitempty"`
-	FuseMount             string                 `protobuf:"bytes,3,opt,name=fuse_mount,json=fuseMount,proto3" json:"fuse_mount,omitempty"`
-	JfsMounted            bool                   `protobuf:"varint,4,opt,name=jfs_mounted,json=jfsMounted,proto3" json:"jfs_mounted,omitempty"`
-	FuseMounted           bool                   `protobuf:"varint,5,opt,name=fuse_mounted,json=fuseMounted,proto3" json:"fuse_mounted,omitempty"`
-	Retention             string                 `protobuf:"bytes,6,opt,name=retention,proto3" json:"retention,omitempty"`
-	Error                 string                 `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
-	HistoryLimit          int32                  `protobuf:"varint,8,opt,name=history_limit,json=historyLimit,proto3" json:"history_limit,omitempty"`
-	MaxSpaceBytes         int64                  `protobuf:"varint,9,opt,name=max_space_bytes,json=maxSpaceBytes,proto3" json:"max_space_bytes,omitempty"`
-	SpaceReservePercent   int32                  `protobuf:"varint,10,opt,name=space_reserve_percent,json=spaceReservePercent,proto3" json:"space_reserve_percent,omitempty"`
-	RetainedSpaceBytes    int64                  `protobuf:"varint,11,opt,name=retained_space_bytes,json=retainedSpaceBytes,proto3" json:"retained_space_bytes,omitempty"`
-	ReclaimableSpaceBytes int64                  `protobuf:"varint,12,opt,name=reclaimable_space_bytes,json=reclaimableSpaceBytes,proto3" json:"reclaimable_space_bytes,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Name        string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	JfsMount    string                 `protobuf:"bytes,2,opt,name=jfs_mount,json=jfsMount,proto3" json:"jfs_mount,omitempty"`
+	FuseMount   string                 `protobuf:"bytes,3,opt,name=fuse_mount,json=fuseMount,proto3" json:"fuse_mount,omitempty"`
+	JfsMounted  bool                   `protobuf:"varint,4,opt,name=jfs_mounted,json=jfsMounted,proto3" json:"jfs_mounted,omitempty"`
+	FuseMounted bool                   `protobuf:"varint,5,opt,name=fuse_mounted,json=fuseMounted,proto3" json:"fuse_mounted,omitempty"`
+	// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
+	Retention             string `protobuf:"bytes,6,opt,name=retention,proto3" json:"retention,omitempty"`
+	Error                 string `protobuf:"bytes,7,opt,name=error,proto3" json:"error,omitempty"`
+	HistoryLimit          int64  `protobuf:"varint,8,opt,name=history_limit,json=historyLimit,proto3" json:"history_limit,omitempty"`
+	MaxSpaceBytes         int64  `protobuf:"varint,9,opt,name=max_space_bytes,json=maxSpaceBytes,proto3" json:"max_space_bytes,omitempty"`
+	SpaceReservePercent   int32  `protobuf:"varint,10,opt,name=space_reserve_percent,json=spaceReservePercent,proto3" json:"space_reserve_percent,omitempty"`
+	RetainedSpaceBytes    int64  `protobuf:"varint,11,opt,name=retained_space_bytes,json=retainedSpaceBytes,proto3" json:"retained_space_bytes,omitempty"`
+	ReclaimableSpaceBytes int64  `protobuf:"varint,12,opt,name=reclaimable_space_bytes,json=reclaimableSpaceBytes,proto3" json:"reclaimable_space_bytes,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -418,6 +421,7 @@ func (x *VolumeStatus) GetFuseMounted() bool {
 	return false
 }
 
+// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
 func (x *VolumeStatus) GetRetention() string {
 	if x != nil {
 		return x.Retention
@@ -432,7 +436,7 @@ func (x *VolumeStatus) GetError() string {
 	return ""
 }
 
-func (x *VolumeStatus) GetHistoryLimit() int32 {
+func (x *VolumeStatus) GetHistoryLimit() int64 {
 	if x != nil {
 		return x.HistoryLimit
 	}
@@ -1578,10 +1582,11 @@ func (x *RecoverResponse) GetVolumes() []*VolumeStatus {
 }
 
 type ConfigSetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	Window        string                 `protobuf:"bytes,3,opt,name=window,proto3" json:"window,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
+	Window        string `protobuf:"bytes,3,opt,name=window,proto3" json:"window,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1630,6 +1635,7 @@ func (x *ConfigSetRequest) GetValue() string {
 	return ""
 }
 
+// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
 func (x *ConfigSetRequest) GetWindow() string {
 	if x != nil {
 		return x.Window
@@ -1638,10 +1644,11 @@ func (x *ConfigSetRequest) GetWindow() string {
 }
 
 type ConfigSetResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	Window        string                 `protobuf:"bytes,3,opt,name=window,proto3" json:"window,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
+	Window        string `protobuf:"bytes,3,opt,name=window,proto3" json:"window,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1690,6 +1697,7 @@ func (x *ConfigSetResponse) GetValue() string {
 	return ""
 }
 
+// Deprecated: Marked as deprecated in pitrd/v1/pitrd.proto.
 func (x *ConfigSetResponse) GetWindow() string {
 	if x != nil {
 		return x.Window
@@ -2017,13 +2025,13 @@ var File_pitrd_v1_pitrd_proto protoreflect.FileDescriptor
 
 const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\n" +
-	"\x14pitrd/v1/pitrd.proto\x12\bpitrd.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xca\x02\n" +
+	"\x14pitrd/v1/pitrd.proto\x12\bpitrd.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xce\x02\n" +
 	"\vInitRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x16\n" +
-	"\x06volume\x18\x02 \x01(\tR\x06volume\x12\x1c\n" +
-	"\tretention\x18\x03 \x01(\tR\tretention\x12!\n" +
+	"\x06volume\x18\x02 \x01(\tR\x06volume\x12 \n" +
+	"\tretention\x18\x03 \x01(\tB\x02\x18\x01R\tretention\x12!\n" +
 	"\fstorage_args\x18\x04 \x03(\tR\vstorageArgs\x12(\n" +
-	"\rhistory_limit\x18\x05 \x01(\x05H\x00R\fhistoryLimit\x88\x01\x01\x12+\n" +
+	"\rhistory_limit\x18\x05 \x01(\x03H\x00R\fhistoryLimit\x88\x01\x01\x12+\n" +
 	"\x0fmax_space_bytes\x18\x06 \x01(\x03H\x01R\rmaxSpaceBytes\x88\x01\x01\x127\n" +
 	"\x15space_reserve_percent\x18\a \x01(\x05H\x02R\x13spaceReservePercent\x88\x01\x01B\x10\n" +
 	"\x0e_history_limitB\x12\n" +
@@ -2038,7 +2046,7 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x06volume\x18\x01 \x01(\v2\x16.pitrd.v1.VolumeStatusR\x06volume\"#\n" +
 	"\rUmountRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\"\x0f\n" +
-	"\rStatusRequest\"\xc1\x03\n" +
+	"\rStatusRequest\"\xc5\x03\n" +
 	"\fVolumeStatus\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tjfs_mount\x18\x02 \x01(\tR\bjfsMount\x12\x1d\n" +
@@ -2046,10 +2054,10 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"fuse_mount\x18\x03 \x01(\tR\tfuseMount\x12\x1f\n" +
 	"\vjfs_mounted\x18\x04 \x01(\bR\n" +
 	"jfsMounted\x12!\n" +
-	"\ffuse_mounted\x18\x05 \x01(\bR\vfuseMounted\x12\x1c\n" +
-	"\tretention\x18\x06 \x01(\tR\tretention\x12\x14\n" +
+	"\ffuse_mounted\x18\x05 \x01(\bR\vfuseMounted\x12 \n" +
+	"\tretention\x18\x06 \x01(\tB\x02\x18\x01R\tretention\x12\x14\n" +
 	"\x05error\x18\a \x01(\tR\x05error\x12#\n" +
-	"\rhistory_limit\x18\b \x01(\x05R\fhistoryLimit\x12&\n" +
+	"\rhistory_limit\x18\b \x01(\x03R\fhistoryLimit\x12&\n" +
 	"\x0fmax_space_bytes\x18\t \x01(\x03R\rmaxSpaceBytes\x122\n" +
 	"\x15space_reserve_percent\x18\n" +
 	" \x01(\x05R\x13spaceReservePercent\x120\n" +
@@ -2142,15 +2150,15 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x0eRecoverRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\"C\n" +
 	"\x0fRecoverResponse\x120\n" +
-	"\avolumes\x18\x01 \x03(\v2\x16.pitrd.v1.VolumeStatusR\avolumes\"R\n" +
+	"\avolumes\x18\x01 \x03(\v2\x16.pitrd.v1.VolumeStatusR\avolumes\"V\n" +
 	"\x10ConfigSetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\x12\x16\n" +
-	"\x06window\x18\x03 \x01(\tR\x06window\"S\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\x12\x1a\n" +
+	"\x06window\x18\x03 \x01(\tB\x02\x18\x01R\x06window\"W\n" +
 	"\x11ConfigSetResponse\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\x12\x16\n" +
-	"\x06window\x18\x03 \x01(\tR\x06window\"T\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\x12\x1a\n" +
+	"\x06window\x18\x03 \x01(\tB\x02\x18\x01R\x06window\"T\n" +
 	"\fClearRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x16\n" +
 	"\x06global\x18\x02 \x01(\bR\x06global\x12\x18\n" +

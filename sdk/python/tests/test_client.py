@@ -179,6 +179,9 @@ def test_config_and_clear(pitrd):
     socket, _ = pitrd
     with Client(socket) as client:
         client.set_history_limit(12)
+        client.set_history_limit(-1)
+        with pytest.raises(ValueError, match="-1 或正整数"):
+            client.set_history_limit(0)
         client.set_max_space_bytes(100 << 30)
         client.set_space_reserve(20)
         space = client.space("/workspace", 10)

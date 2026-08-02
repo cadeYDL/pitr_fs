@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import statistics
@@ -427,12 +428,14 @@ def build_report(
 
 
 def current_history_limit() -> int:
-    """读取 config 的稳定制表符输出，避免覆盖用户原有配置。"""
+    """读取 config 的对齐表格输出，避免覆盖用户原有配置。"""
     output = run([PITR_CLI, "config"])
     for line in output.splitlines():
-        columns = line.split("\t")
+        columns = re.split(r"\t|\s{2,}", line.strip())
         if columns and columns[0] == "history-limit" and len(columns) >= 2:
-            return int(columns[1])
+            match = re.match(r"-?\d+", columns[1])
+            if match:
+                return int(match.group(0))
     raise RuntimeError("无法从 pitr config 读取 history-limit")
 
 

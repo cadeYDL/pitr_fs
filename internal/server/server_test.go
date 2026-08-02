@@ -140,7 +140,6 @@ func setupServer(t *testing.T) *serverFixture {
 		JFSMount:      "/jfs",
 		FUSEMount:     "/workspace",
 		MountRoot:     "/",
-		Retention:     "compact",
 		JFSMounted:    true,
 		FUSEMounted:   true,
 		MountFunc:     func(context.Context, string) error { return nil },
@@ -433,11 +432,11 @@ func TestServer_RecoverMultiVolume_OneFailureDoesNotHideSuccess(t *testing.T) {
 		Volumes: []VolumeConfig{
 			{
 				Name: "healthy", JFSMount: "/jfs-a", FUSEMount: "/workspace-a",
-				Retention: "compact", JFSMounted: true, FUSEMounted: true, DB: f.db,
+				JFSMounted: true, FUSEMounted: true, DB: f.db,
 			},
 			{
 				Name: "missing", JFSMount: "/jfs-b", FUSEMount: "/workspace-b",
-				Retention: "compact", JFSMounted: false, FUSEMounted: false,
+				JFSMounted: false, FUSEMounted: false,
 			},
 		},
 	})
@@ -458,12 +457,12 @@ func TestServer_RecoverMultiVolume_OneFailureDoesNotHideSuccess(t *testing.T) {
 func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
-	initialHistory := int32(9)
+	initialHistory := int64(9)
 	initialMax := int64(100 << 20)
 	initialReserve := int32(20)
 
 	initialized, err := f.client.Init(ctx, &pb.InitRequest{
-		Path: "/workspace", Volume: "test-volume", Retention: "verbose",
+		Path: "/workspace", Volume: "test-volume",
 		HistoryLimit: &initialHistory, MaxSpaceBytes: &initialMax,
 		SpaceReservePercent: &initialReserve,
 	})
@@ -471,7 +470,6 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !initialized.GetVolume().GetFuseMounted() ||
-		initialized.GetVolume().GetRetention() != "verbose" ||
 		initialized.GetVolume().GetHistoryLimit() != initialHistory ||
 		initialized.GetVolume().GetMaxSpaceBytes() != initialMax {
 		t.Fatalf("init=%+v", initialized)
@@ -496,14 +494,11 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	if !mounted.GetVolume().GetFuseMounted() {
 		t.Fatalf("mount=%+v", mounted)
 	}
-	configured, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
-		Key: "retention", Value: "archive", Window: "30d",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if configured.GetValue() != "archive" || configured.GetWindow() != "30d" {
-		t.Fatalf("config=%+v", configured)
+	if _, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "retention", Value: "archive",
+	}); status.Code(err) != codes.InvalidArgument ||
+		!strings.Contains(err.Error(), "retention 已移除") {
+		t.Fatalf("retention compatibility error=%v", err)
 	}
 	historyConfig, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
 		Key: "history-limit", Value: "7",
@@ -513,6 +508,16 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	}
 	if historyConfig.GetValue() != "7" {
 		t.Fatalf("history config=%+v", historyConfig)
+	}
+	if _, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "history-limit", Value: "100001",
+	}); err != nil {
+		t.Fatalf("大于旧上限的正整数应被接受: %v", err)
+	}
+	if unlimited, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
+		Key: "history-limit", Value: "-1",
+	}); err != nil || unlimited.GetValue() != "-1" {
+		t.Fatalf("unlimited=%+v err=%v", unlimited, err)
 	}
 	spaceConfig, err := f.client.ConfigSet(ctx, &pb.ConfigSetRequest{
 		Key: "max-space", Value: "200MiB",
@@ -536,7 +541,7 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := statusResponse.GetVolumes()[0].GetHistoryLimit(); got != 7 {
+	if got := statusResponse.GetVolumes()[0].GetHistoryLimit(); got != -1 {
 		t.Fatalf("persisted history limit=%d", got)
 	}
 	volume := statusResponse.GetVolumes()[0]
@@ -561,7 +566,6 @@ func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
 		Volume:     "dynamic-volume",
 		JFSMount:   "/jfs",
 		MountRoot:  "/pitr",
-		Retention:  "compact",
 		JFSMounted: true,
 		MountFunc: func(_ context.Context, mountPath string) error {
 			mounted = append(mounted, mountPath)
@@ -576,8 +580,14 @@ func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
 			t.Fatalf("init(%q) code=%s err=%v", invalid, status.Code(err), err)
 		}
 	}
+	if _, err := handler.Init(ctx, &pb.InitRequest{
+		Path: "/pitr/data", Volume: "dynamic-volume", Retention: "compact",
+	}); status.Code(err) != codes.InvalidArgument ||
+		!strings.Contains(err.Error(), "retention 已移除") {
+		t.Fatalf("legacy retention code=%s err=%v", status.Code(err), err)
+	}
 	initialized, err := handler.Init(ctx, &pb.InitRequest{
-		Path: "/pitr/data", Volume: "dynamic-volume", Retention: "verbose",
+		Path: "/pitr/data", Volume: "dynamic-volume",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -591,17 +601,16 @@ func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted == nil || persisted.FUSEMount != "/pitr/data" ||
-		persisted.Retention != "verbose" {
+	if persisted == nil || persisted.FUSEMount != "/pitr/data" {
 		t.Fatalf("persisted=%+v", persisted)
 	}
 	if _, err := handler.Init(ctx, &pb.InitRequest{
-		Path: "/pitr/data", Volume: "dynamic-volume", Retention: "compact",
+		Path: "/pitr/data", Volume: "dynamic-volume",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	persisted, err = f.mgr.LoadVolumeMountConfig(ctx, "dynamic-volume")
-	if err != nil || persisted.Retention != "compact" || len(mounted) != 1 {
+	if err != nil || persisted == nil || len(mounted) != 1 {
 		t.Fatalf("idempotent persisted=%+v mounted=%v err=%v",
 			persisted, mounted, err)
 	}

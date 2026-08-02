@@ -11,6 +11,13 @@ import (
 
 const tableColumnGap = 2
 
+func formatHistoryLimit(limit int64) string {
+	if limit == -1 {
+		return "-1（不限制）"
+	}
+	return fmt.Sprintf("%d", limit)
+}
+
 // terminalDisplayWidth 按常见 Linux 终端的单元格宽度计算文本长度：中文等
 // East Asian Wide/Fullwidth 字符占两格，组合字符不单独占格。
 func terminalDisplayWidth(value string) int {

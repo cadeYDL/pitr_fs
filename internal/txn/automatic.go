@@ -38,12 +38,12 @@ type ClearStats struct {
 
 // HistoryLimit 按最长 scope 前缀读取配置。当前控制面只写入根配置，但这里
 // 已具备未来目录级“子目录优先、否则继承父目录”的解析语义。
-func (m *Manager) HistoryLimit(ctx context.Context, scope string) (int, error) {
+func (m *Manager) HistoryLimit(ctx context.Context, scope string) (int64, error) {
 	normalized, err := NormalizeScope(scope)
 	if err != nil {
 		return 0, err
 	}
-	var limit int
+	var limit int64
 	err = m.db.QueryRow(ctx, `
 		SELECT history_limit
 		  FROM pitr_config
@@ -61,8 +61,8 @@ func (m *Manager) HistoryLimit(ctx context.Context, scope string) (int, error) {
 	return limit, nil
 }
 
-func historyLimitTx(ctx context.Context, tx pg.Tx, scope string) (int, error) {
-	var limit int
+func historyLimitTx(ctx context.Context, tx pg.Tx, scope string) (int64, error) {
+	var limit int64
 	err := tx.QueryRow(ctx, `
 		SELECT history_limit
 		  FROM pitr_config
@@ -177,19 +177,20 @@ func (m *Manager) SetSpacePolicy(
 	return pruned, nil
 }
 
-// SetHistoryLimit 持久化指定 scope 的版本上限并立即裁剪。服务层当前只允许
+// SetHistoryLimit 持久化指定 scope 的版本上限并立即裁剪。-1 表示不按
+// 版本数量裁剪，但配置的空间水位仍然生效。服务层当前只允许
 // scope='/'，保留 scope 参数是为了未来目录级配置不改变存储接口。
 func (m *Manager) SetHistoryLimit(
 	ctx context.Context,
 	scope string,
-	limit int,
+	limit int64,
 ) (int64, error) {
 	normalized, err := NormalizeScope(scope)
 	if err != nil {
 		return 0, err
 	}
-	if limit <= 0 {
-		return 0, fmt.Errorf("history limit 必须大于 0: %d", limit)
+	if limit != -1 && limit <= 0 {
+		return 0, fmt.Errorf("history limit 必须是 -1 或正整数: %d", limit)
 	}
 	var pruned int64
 	err = m.db.InTx(ctx, func(tx pg.Tx) error {
@@ -360,31 +361,36 @@ func pruneClosedVersions(
 	ctx context.Context,
 	tx pg.Tx,
 	scope string,
-	limit int,
+	limit int64,
 ) (int64, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT id
-		  FROM pitr_txn
-		 WHERE state<>'root' AND closed_at IS NOT NULL
-		 ORDER BY id DESC
-		 OFFSET $1`, limit)
-	if err != nil {
-		return 0, err
-	}
 	var doomed []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+	if limit != -1 {
+		if limit <= 0 {
+			return 0, fmt.Errorf("history limit 必须是 -1 或正整数: %d", limit)
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id
+			  FROM pitr_txn
+			 WHERE state<>'root' AND closed_at IS NOT NULL
+			 ORDER BY id DESC
+			 OFFSET $1`, limit)
+		if err != nil {
+			return 0, err
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return 0, err
+			}
+			doomed = append(doomed, id)
+		}
+		if err := rows.Err(); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		doomed = append(doomed, id)
-	}
-	if err := rows.Err(); err != nil {
 		rows.Close()
-		return 0, err
 	}
-	rows.Close()
 	var rootID int64
 	if err := tx.QueryRow(ctx,
 		"SELECT id FROM pitr_txn WHERE state='root' ORDER BY id LIMIT 1").

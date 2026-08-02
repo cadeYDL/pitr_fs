@@ -200,6 +200,42 @@ func TestAutomaticHistoryLimitPersistenceAndInheritance(t *testing.T) {
 	}
 }
 
+func TestAutomaticHistoryLimitUnlimitedAndNoArtificialUpperBound(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+
+	if _, err := mgr.SetHistoryLimit(ctx, "/", 100001); err != nil {
+		t.Fatalf("大于旧上限的正整数应被接受: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO pitr_txn(version_hash,scope_path,state,command,closed_at)
+		VALUES ('limit0000001','/','auto','test',now()),
+		       ('limit0000002','/','auto','test',now()),
+		       ('limit0000003','/','auto','test',now())`); err != nil {
+		t.Fatal(err)
+	}
+	if pruned, err := mgr.SetHistoryLimit(ctx, "/", -1); err != nil {
+		t.Fatal(err)
+	} else if pruned != 0 {
+		t.Fatalf("unlimited pruned=%d", pruned)
+	}
+	limit, err := mgr.HistoryLimit(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versions int64
+	if err := db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_txn WHERE state<>'root'").Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if limit != -1 || versions != 3 {
+		t.Fatalf("limit=%d versions=%d", limit, versions)
+	}
+	if _, err := mgr.SetHistoryLimit(ctx, "/", 0); err == nil {
+		t.Fatal("0 应被拒绝")
+	}
+}
+
 func TestAutomaticVersionsPruneAndClear(t *testing.T) {
 	mgr, db := setupManager(t)
 	ctx := context.Background()

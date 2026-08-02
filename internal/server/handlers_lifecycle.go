@@ -69,7 +69,6 @@ func (s *Server) mountLocked(ctx context.Context, index int, requestedPath strin
 		if err := s.mgr.SaveVolumeMountConfig(ctx, txn.VolumeMountConfig{
 			VolumeName: volume.Name,
 			FUSEMount:  cleaned,
-			Retention:  volume.Retention,
 		}); err != nil {
 			return status.Error(codes.Internal,
 				fmt.Sprintf("持久化挂载配置: %v", err))
@@ -88,7 +87,6 @@ func (s *Server) mountLocked(ctx context.Context, index int, requestedPath strin
 	if err := s.mgr.SaveVolumeMountConfig(ctx, txn.VolumeMountConfig{
 		VolumeName: volume.Name,
 		FUSEMount:  cleaned,
-		Retention:  volume.Retention,
 	}); err != nil {
 		if s.cfg.UmountFunc != nil {
 			_ = s.cfg.UmountFunc(ctx)
@@ -112,16 +110,14 @@ func (s *Server) Init(
 	if req.GetPath() == "" {
 		return nil, status.Error(codes.InvalidArgument, "path 不能为空")
 	}
-	switch req.GetRetention() {
-	case "", "verbose", "compact", "archive":
-	default:
-		return nil, status.Errorf(codes.InvalidArgument,
-			"非法 retention %q", req.GetRetention())
+	if req.GetRetention() != "" {
+		return nil, status.Error(codes.InvalidArgument,
+			"retention 已移除；请使用 history-limit 和 max-space 控制历史保留")
 	}
 	if req.HistoryLimit != nil &&
-		(req.GetHistoryLimit() < 1 || req.GetHistoryLimit() > 100000) {
+		req.GetHistoryLimit() != -1 && req.GetHistoryLimit() < 1 {
 		return nil, status.Errorf(codes.InvalidArgument,
-			"history-limit 必须是 1..100000: %d", req.GetHistoryLimit())
+			"history-limit 必须是 -1 或正整数: %d", req.GetHistoryLimit())
 	}
 	if req.MaxSpaceBytes != nil && req.GetMaxSpaceBytes() < 0 {
 		return nil, status.Error(codes.InvalidArgument, "max-space 不能为负数")
@@ -137,11 +133,8 @@ func (s *Server) Init(
 	if err != nil {
 		return nil, err
 	}
-	if req.GetRetention() != "" {
-		s.volumes[index].Retention = req.GetRetention()
-	}
 	if req.HistoryLimit != nil {
-		if _, err := s.mgr.SetHistoryLimit(ctx, "/", int(req.GetHistoryLimit())); err != nil {
+		if _, err := s.mgr.SetHistoryLimit(ctx, "/", req.GetHistoryLimit()); err != nil {
 			return nil, rpcError(err)
 		}
 	}
@@ -176,7 +169,7 @@ func (s *Server) Init(
 	if err != nil {
 		return nil, rpcError(err)
 	}
-	result.HistoryLimit = int32(historyLimit)
+	result.HistoryLimit = historyLimit
 	result.MaxSpaceBytes = policy.MaxBytes
 	result.SpaceReservePercent = int32(policy.ReservePercent)
 	result.RetainedSpaceBytes = policy.RetainedBytes
@@ -291,26 +284,23 @@ func (s *Server) ConfigSet(
 ) (*pb.ConfigSetResponse, error) {
 	key := strings.ToLower(strings.TrimSpace(req.GetKey()))
 	value := strings.ToLower(strings.TrimSpace(req.GetValue()))
+	if req.GetWindow() != "" {
+		return nil, status.Error(codes.InvalidArgument,
+			"--window 已随 retention 配置移除")
+	}
 	if key == "history-limit" {
-		if req.GetWindow() != "" {
-			return nil, status.Error(codes.InvalidArgument,
-				"history-limit 不接受 --window")
-		}
-		limit, err := strconv.Atoi(value)
-		if err != nil || limit < 1 || limit > 100000 {
+		limit, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || (limit != -1 && limit < 1) {
 			return nil, status.Errorf(codes.InvalidArgument,
-				"history-limit 必须是 1..100000 的整数: %q", value)
+				"history-limit 必须是 -1 或正整数: %q", value)
 		}
 		if _, err := s.mgr.SetHistoryLimit(ctx, "/", limit); err != nil {
 			return nil, rpcError(err)
 		}
-		return &pb.ConfigSetResponse{Key: key, Value: strconv.Itoa(limit)}, nil
+		return &pb.ConfigSetResponse{
+			Key: key, Value: strconv.FormatInt(limit, 10)}, nil
 	}
 	if key == "max-space" {
-		if req.GetWindow() != "" {
-			return nil, status.Error(codes.InvalidArgument,
-				"max-space 不接受 --window")
-		}
 		maxBytes, err := txn.ParseSpaceBytes(value)
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -327,10 +317,6 @@ func (s *Server) ConfigSet(
 			Key: key, Value: txn.FormatSpaceLimit(maxBytes)}, nil
 	}
 	if key == "space-reserve" {
-		if req.GetWindow() != "" {
-			return nil, status.Error(codes.InvalidArgument,
-				"space-reserve 不接受 --window")
-		}
 		percentText := strings.TrimSuffix(value, "%")
 		percent, err := strconv.Atoi(percentText)
 		if err != nil || percent < 1 || percent > 99 {
@@ -348,37 +334,9 @@ func (s *Server) ConfigSet(
 		return &pb.ConfigSetResponse{
 			Key: key, Value: fmt.Sprintf("%d%%", percent)}, nil
 	}
-	if key != "retention" {
-		return nil, status.Errorf(codes.InvalidArgument, "不支持配置项 %q", key)
+	if key == "retention" {
+		return nil, status.Error(codes.InvalidArgument,
+			"retention 已移除；请使用 history-limit 和 max-space 控制历史保留")
 	}
-	switch value {
-	case "verbose", "compact":
-		if req.GetWindow() != "" {
-			return nil, status.Error(codes.InvalidArgument,
-				"只有 archive retention 接受 window")
-		}
-	case "archive":
-		if strings.TrimSpace(req.GetWindow()) == "" {
-			return nil, status.Error(codes.InvalidArgument,
-				"archive retention 必须指定 --window")
-		}
-	default:
-		return nil, status.Errorf(codes.InvalidArgument,
-			"非法 retention %q", value)
-	}
-
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-	for index := range s.volumes {
-		s.volumes[index].Retention = value
-	}
-	s.cfg.Retention = value
-	if req.GetWindow() == "" {
-		delete(s.windows, key)
-	} else {
-		s.windows[key] = req.GetWindow()
-	}
-	return &pb.ConfigSetResponse{
-		Key: key, Value: value, Window: req.GetWindow(),
-	}, nil
+	return nil, status.Errorf(codes.InvalidArgument, "不支持配置项 %q", key)
 }

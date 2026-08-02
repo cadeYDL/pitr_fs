@@ -9,7 +9,7 @@ import (
 func TestWriteAlignedTableUsesTerminalDisplayWidth(t *testing.T) {
 	rows := [][]string{
 		{"配置项", "当前值", "说明"},
-		{"retention", "compact", "英文键"},
+		{"history-limit", "100", "英文键"},
 		{"空间上限", "100.00 GiB", "中文键"},
 	}
 	var output bytes.Buffer

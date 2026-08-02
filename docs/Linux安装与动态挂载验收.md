@@ -9,7 +9,7 @@
   Python 3 和 awk。
 - `install.sh install` 启动服务但不自动占用用户目录。
 - `pitr init <path>` 支持绝对路径与相对路径，动态创建 FUSE 挂载。
-- 挂载路径和 retention 在 PostgreSQL 中持久化，服务重启后自动恢复。
+- 挂载路径和版本/空间配置在 PostgreSQL 中持久化，服务重启后自动恢复。
 - 当前单卷只能选择一个挂载路径，路径不能逃逸配置的挂载根。
 - 生产基准脚本可通过 `PITR_BENCH_MOUNT` 指定动态挂载点。
 - 验收完成后不留下测试容器、挂载、wrapper、镜像或数据卷。
@@ -29,7 +29,7 @@ go test -race ./...
 覆盖的新增单元/集成场景包括：
 
 - 动态 `init` 选择挂载点并写入 `pitr_volume_config`。
-- 同一路径重复 `init` 幂等，retention 更新后仍持久化。
+- 同一路径重复 `init` 幂等，版本和空间配置更新后仍持久化。
 - 相对路径由宿主 wrapper 解析为正确的绝对路径。
 - 相对路径、挂载根本身、挂载根之外路径在 daemon 边界被拒绝。
 - 已初始化卷不能切换到第二个路径。

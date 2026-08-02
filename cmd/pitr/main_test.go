@@ -136,7 +136,7 @@ func (fakePitrd) Status(context.Context, *pb.StatusRequest) (*pb.StatusResponse,
 		OpenWrites:      0,
 		Volumes: []*pb.VolumeStatus{{
 			Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
-			Retention: "compact", HistoryLimit: 100,
+			HistoryLimit: 100,
 			MaxSpaceBytes: 100 << 30, SpaceReservePercent: 20,
 			RetainedSpaceBytes: 60 << 30, ReclaimableSpaceBytes: 4 << 30,
 		}},
@@ -206,7 +206,7 @@ func (fakePitrd) Recover(context.Context, *pb.RecoverRequest) (*pb.RecoverRespon
 func (fakePitrd) Init(context.Context, *pb.InitRequest) (*pb.InitResponse, error) {
 	return &pb.InitResponse{Volume: &pb.VolumeStatus{
 		Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
-		JfsMounted: true, FuseMounted: true, Retention: "compact",
+		JfsMounted: true, FuseMounted: true,
 	}}, nil
 }
 
@@ -268,7 +268,7 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		want string
 	}{
 		{[]string{"--socket", socket, "status"}, "connected to pitrd test, 1 volumes"},
-		{[]string{"--socket", socket, "status"}, "保留策略  版本上限"},
+		{[]string{"--socket", socket, "status"}, "挂载点      版本上限"},
 		{[]string{"--socket", socket, "space", "/workspace"}, "删除后预计释放"},
 		{[]string{"--socket", socket, "space", "/workspace"}, "012345abcdef  1.00 GiB"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef  commit"},
@@ -282,11 +282,10 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "init", "/workspace"}, "initialized default @ /workspace"},
 		{[]string{"--socket", socket, "umount", "/workspace"}, "unmounted /workspace"},
 		{[]string{"--socket", socket, "mount", "/workspace"}, "mounted default @ /workspace"},
-		{[]string{"--socket", socket, "config", "set", "retention", "archive", "--window", "30d"}, "set retention=archive window=30d"},
 		{[]string{"--socket", socket, "config", "set", "history-limit", "42"}, "set history-limit=42"},
+		{[]string{"--socket", socket, "config", "set", "history-limit", "-1"}, "set history-limit=-1"},
 		{[]string{"--socket", socket, "config", "set", "max-space", "100GiB"}, "set max-space=100GiB"},
 		{[]string{"--socket", socket, "config", "set", "space-reserve", "15%"}, "set space-reserve=15%"},
-		{[]string{"--socket", socket, "config"}, "预留策略名；当前自动模式尚未按三档执行"},
 		{[]string{"--socket", socket, "config"}, "history-limit"},
 		{[]string{"--socket", socket, "config", "list"}, "容量单位：KB/MB/GB/TB 按 1000"},
 		{[]string{"--socket", socket, "config", "list"}, "最终以更严格的约束为准"},

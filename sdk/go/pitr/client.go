@@ -312,7 +312,6 @@ type Volume struct {
 	FUSEMount             string
 	JFSMounted            bool
 	FUSEMounted           bool
-	Retention             string
 	HistoryLimit          int
 	MaxSpaceBytes         int64
 	SpaceReservePercent   int
@@ -328,7 +327,6 @@ func volumeFromPB(value *pb.VolumeStatus) Volume {
 		FUSEMount:             value.GetFuseMount(),
 		JFSMounted:            value.GetJfsMounted(),
 		FUSEMounted:           value.GetFuseMounted(),
-		Retention:             value.GetRetention(),
 		HistoryLimit:          int(value.GetHistoryLimit()),
 		MaxSpaceBytes:         value.GetMaxSpaceBytes(),
 		SpaceReservePercent:   int(value.GetSpaceReservePercent()),
@@ -414,8 +412,8 @@ func (c *Client) Space(
 }
 
 func (c *Client) SetHistoryLimit(ctx context.Context, limit int) error {
-	if limit < 1 || limit > 100000 {
-		return fmt.Errorf("history limit 必须在 1..100000 之间: %d", limit)
+	if limit != -1 && limit < 1 {
+		return fmt.Errorf("history limit 必须是 -1 或正整数: %d", limit)
 	}
 	_, err := c.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
 		Key: "history-limit", Value: fmt.Sprint(limit),

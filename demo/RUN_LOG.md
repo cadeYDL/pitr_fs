@@ -31,7 +31,7 @@ docker exec pitrfs-phase6 pitr status
 image=pitr-fs:final status=running
 psql (PostgreSQL) 16.14 (Debian 16.14-1.pgdg13+1)
 connected to pitrd dev, 1 volumes, 0 active transactions
-default  jfs=/var/lib/pitr/jfs  fuse=/workspace  retention=archive
+default  jfs=/var/lib/pitr/jfs  fuse=/workspace  history-limit=100
 ```
 
 ## §2 JuiceFS 客户端可用

@@ -205,7 +205,6 @@ func volumeStatusPB(volume VolumeConfig) *pb.VolumeStatus {
 		FuseMount:   volume.FUSEMount,
 		JfsMounted:  volume.JFSMounted,
 		FuseMounted: volume.FUSEMounted,
-		Retention:   volume.Retention,
 	}
 }
 

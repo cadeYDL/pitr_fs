@@ -20,11 +20,16 @@ SPEC.loader.exec_module(BENCH)
 class BenchIORecoveryTest(unittest.TestCase):
     def test_current_history_limit_parses_tabular_config(self) -> None:
         config = (
-            "配置项\t当前值\t默认值\t范围\t说明\n"
-            "history-limit\t42\t100\t1..100000\t最多保留的版本数\n"
+            "配置项         当前值  默认值  范围        说明\n"
+            "history-limit  42      100     -1|正整数  最多保留的版本数\n"
         )
         with mock.patch.object(BENCH, "run", return_value=config):
             self.assertEqual(BENCH.current_history_limit(), 42)
+
+    def test_current_history_limit_parses_unlimited(self) -> None:
+        config = "history-limit  -1（不限制）  100  -1|正整数  版本数量上限\n"
+        with mock.patch.object(BENCH, "run", return_value=config):
+            self.assertEqual(BENCH.current_history_limit(), -1)
 
     def test_current_history_limit_rejects_missing_row(self) -> None:
         with mock.patch.object(BENCH, "run", return_value="配置项\t当前值"):

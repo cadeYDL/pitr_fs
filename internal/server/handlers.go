@@ -84,7 +84,7 @@ func (s *Server) Status(
 		return nil, rpcError(err)
 	}
 	for _, volume := range volumes {
-		volume.HistoryLimit = int32(historyLimit)
+		volume.HistoryLimit = historyLimit
 		volume.MaxSpaceBytes = spacePolicy.MaxBytes
 		volume.SpaceReservePercent = int32(spacePolicy.ReservePercent)
 		volume.RetainedSpaceBytes = spacePolicy.RetainedBytes

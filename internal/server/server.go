@@ -19,7 +19,6 @@ type Config struct {
 	JFSMount                string
 	FUSEMount               string
 	MountRoot               string
-	Retention               string
 	JFSMounted              bool
 	FUSEMounted             bool
 	Volumes                 []VolumeConfig
@@ -37,7 +36,6 @@ type VolumeConfig struct {
 	Name        string
 	JFSMount    string
 	FUSEMount   string
-	Retention   string
 	JFSMounted  bool
 	FUSEMounted bool
 	DB          *pg.DB
@@ -53,7 +51,6 @@ type Server struct {
 	volumes []VolumeConfig
 
 	lifecycleMu sync.Mutex
-	windows     map[string]string
 }
 
 func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
@@ -62,9 +59,6 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 	}
 	if cfg.Volume == "" {
 		cfg.Volume = "default"
-	}
-	if cfg.Retention == "" {
-		cfg.Retention = "compact"
 	}
 	if cfg.MountRoot == "" {
 		cfg.MountRoot = "/"
@@ -75,22 +69,15 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 			Name:        cfg.Volume,
 			JFSMount:    cfg.JFSMount,
 			FUSEMount:   cfg.FUSEMount,
-			Retention:   cfg.Retention,
 			JFSMounted:  cfg.JFSMounted,
 			FUSEMounted: cfg.FUSEMounted,
 			DB:          db,
 		}}
-	}
-	for index := range volumes {
-		if volumes[index].Retention == "" {
-			volumes[index].Retention = "compact"
-		}
 	}
 	return &Server{
 		db: db, mgr: mgr,
 		rev:     revert.NewEngine(db, revert.WithMountPath(cfg.FUSEMount)),
 		cfg:     cfg,
 		volumes: volumes,
-		windows: make(map[string]string),
 	}
 }

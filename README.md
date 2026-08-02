@@ -11,7 +11,8 @@ pitr-fs 是运行在 JuiceFS 之上的时间回溯文件系统。它透明拦截
 
 - 默认自动版本模式，无需 `begin` 或 `commit`。创建、写入、截断、删除、
   重命名、链接和扩展属性变更都会自动形成版本。
-- 默认全局保留最近 100 个版本；`history-limit` 可配置并持久化。
+- 默认全局保留最近 100 个版本；`history-limit` 可配置并持久化，设为 `-1`
+  时不限制版本数量。
 - 可按用户熟悉的文件容量设置空间上限和预留比例；默认在预计占用达到上限的
   80% 时从最老版本开始裁剪，共享 slice 只在最后一个引用释放时计入空间。
 - CLI 支持绝对路径和相对路径，相对路径按调用命令时的工作目录解析。
@@ -374,19 +375,21 @@ pitr logs . -l -n 20
 版本号  POSIX操作  原始命令  操作时间  操作人  内容变化
 ```
 
-设置持久化的全局历史上限，允许范围为 `1..100000`：
+设置持久化的全局历史上限。可使用任意正整数，`-1` 表示不按版本数量裁剪：
 
 ```bash
 pitr config
 pitr config list
 pitr config set history-limit 100
+pitr config set history-limit -1
 pitr config set max-space 100GiB
 pitr config set space-reserve 20%
 ```
 
 `pitr config` 与 `pitr config list` 等价，会列出所有支持项、当前值、默认值、
-取值范围和说明。目前支持 `retention`、`history-limit`、`max-space` 和
-`space-reserve`；`pitr config --help` 也会显示这些键。
+取值范围和说明。目前支持 `history-limit`、`max-space` 和 `space-reserve`；
+`pitr config --help` 也会显示这些键。`history-limit=-1` 只关闭数量裁剪，
+已配置的空间水位仍会从最老版本开始淘汰。
 
 查看当前空间水位，以及按最老优先顺序单独删除每个版本的预计释放量：
 

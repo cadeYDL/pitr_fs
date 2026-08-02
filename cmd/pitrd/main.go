@@ -35,7 +35,6 @@ var (
 	flagJFSMount   string
 	flagMountRoot  string
 	flagSocket     string
-	flagRetention  string
 	flagLogLevel   string
 	flagGCInterval time.Duration
 	flagGCThreads  int
@@ -59,7 +58,6 @@ gRPC 控制面 unix socket。`,
 	root.Flags().StringVar(&flagJFSMount, "jfs-mount", "/var/lib/pitr/jfs", "JuiceFS 底层挂载目录")
 	root.Flags().StringVar(&flagMountRoot, "mount-root", "/pitr", "允许 init 使用的宿主机挂载根目录")
 	root.Flags().StringVar(&flagSocket, "socket", "/var/run/pitrd.sock", "pitrd unix 控制 socket")
-	root.Flags().StringVar(&flagRetention, "retention", "compact", "保留策略")
 	root.Flags().StringVar(&flagLogLevel, "log-level", "info", "日志级别:debug|info|warn|error")
 	root.Flags().DurationVar(&flagGCInterval, "gc-interval", 10*time.Minute, "对象 GC 批处理间隔；0 表示停用")
 	root.Flags().IntVar(&flagGCThreads, "gc-threads", 4, "JuiceFS GC 对象删除并发数")
@@ -182,10 +180,8 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		return fuseProxy.UnmountLazy()
 	}
 	fuseMount := ""
-	retention := flagRetention
 	if persisted != nil {
 		fuseMount = persisted.FUSEMount
-		retention = persisted.Retention
 		if !pathInsideMountRoot(fuseMount, flagMountRoot) {
 			return fmt.Errorf("持久化挂载点 %q 不在 mount root %q 下",
 				fuseMount, flagMountRoot)
@@ -206,7 +202,6 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		JFSMount:        flagJFSMount,
 		FUSEMount:       fuseMount,
 		MountRoot:       flagMountRoot,
-		Retention:       retention,
 		JFSMounted:      true,
 		FUSEMounted:     fuseProxy != nil && fuseProxy.Mounted(),
 		MountFunc:       mountProxy,
