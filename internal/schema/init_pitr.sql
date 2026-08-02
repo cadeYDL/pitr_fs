@@ -328,11 +328,17 @@ BEGIN
         IF NOT FOUND THEN
             RAISE EXCEPTION 'slice % 的 size 发生冲突', v_chunkid;
         END IF;
-        UPDATE jfs_chunk_ref
-           SET refs=refs+1
-         WHERE chunkid=v_chunkid AND size=v_size;
+        -- 历史 pin 的来源是 jfs_chunk 快照。正常情况下 JuiceFS 引用行仍然
+        -- 存在；旧版本曾在异步 unlink/revert 时把引用行降到 0 并提前清掉，
+        -- 此处必须能够从权威快照自愈，而不是让后续 schema 升级永久失败。
+        INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+        VALUES (v_chunkid,v_size,1)
+        ON CONFLICT (chunkid) DO UPDATE
+           SET refs=jfs_chunk_ref.refs+1
+         WHERE jfs_chunk_ref.size=EXCLUDED.size;
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'slice %/% 缺少 JuiceFS 引用行', v_chunkid, v_size;
+            RAISE EXCEPTION 'slice % 的 size 与 JuiceFS 引用行冲突:%',
+                v_chunkid,v_size;
         END IF;
     END LOOP;
     PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
@@ -388,38 +394,114 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE STRICT;
 
--- 从“现存 history”完整重建 slice 索引。先把旧 PITR pin 从 JuiceFS 物理
--- refs 中安全扣除，再重建 pitr_slice_pin/ref 与 jfs_delslices。全部动作处于
--- 同一事务；任何不一致都会回滚，策略是宁可停止升级也不误删对象。
+-- 以当前 jfs_chunk 中的 slice 出现次数和现存历史 pin 为权威，校准
+-- jfs_chunk_ref。JuiceFS 的异步 unlink 可能在 auto 窗口关闭后才减少引用，
+-- 这次变化没有版本归属；revert 直接恢复 chunk 行时也不会触发 JuiceFS 自身
+-- 的引用维护，因此不能只依赖 chunk_ref history。
+--
+-- p_chunkids=NULL 表示全量校准（启动/升级重建）；传入数组时只校准受一次
+-- revert 影响的 slice。返回值为兼容预留，当前固定为 0。
+CREATE OR REPLACE FUNCTION pitr_reconcile_slice_refs(
+    p_chunkids bigint[] DEFAULT NULL
+) RETURNS bigint AS $$
+DECLARE
+    v_drift_count bigint := 0;
+    v_old_suppress text := current_setting('pitr.suppress_capture', true);
+BEGIN
+    PERFORM set_config('pitr.suppress_capture', 'on', true);
+
+    -- 同一 slice id 的 size 必须在当前 chunk、历史 pin 和 JuiceFS 引用行
+    -- 三方保持稳定；否则无法判断对象真实边界，宁可中止而不覆盖元数据。
+    IF EXISTS (
+        WITH decoded AS (
+            SELECT pitr_decode_u64(substring(c.slices FROM g.i*24+5 FOR 8)) AS chunkid,
+                   pitr_decode_u32(substring(c.slices FROM g.i*24+13 FOR 4)) AS size
+              FROM jfs_chunk c
+              CROSS JOIN LATERAL generate_series(0,length(c.slices)/24-1) AS g(i)
+        ), known_sizes AS (
+            SELECT chunkid,size FROM decoded WHERE chunkid<>0
+            UNION ALL
+            SELECT chunkid,size FROM pitr_slice_ref
+            UNION ALL
+            SELECT chunkid,size FROM jfs_chunk_ref
+        )
+        SELECT 1 FROM known_sizes
+         WHERE chunkid<>0
+           AND (p_chunkids IS NULL OR chunkid=ANY(p_chunkids))
+         GROUP BY chunkid HAVING count(DISTINCT size)>1
+    ) THEN
+        RAISE EXCEPTION '当前 chunk 中存在 size 冲突的 slice，无法校准引用';
+    END IF;
+
+    IF p_chunkids IS NULL THEN
+        UPDATE jfs_chunk_ref SET refs=0;
+    ELSE
+        UPDATE jfs_chunk_ref SET refs=0 WHERE chunkid=ANY(p_chunkids);
+    END IF;
+
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(c.slices FROM g.i*24+5 FOR 8)) AS chunkid,
+               pitr_decode_u32(substring(c.slices FROM g.i*24+13 FOR 4)) AS size
+          FROM jfs_chunk c
+          CROSS JOIN LATERAL generate_series(0,length(c.slices)/24-1) AS g(i)
+    ), current_usage AS (
+        SELECT chunkid,min(size)::integer AS size,count(*)::bigint AS refs
+          FROM decoded
+         WHERE chunkid<>0
+           AND (p_chunkids IS NULL OR chunkid=ANY(p_chunkids))
+         GROUP BY chunkid
+    ), desired AS (
+        SELECT COALESCE(c.chunkid,p.chunkid) AS chunkid,
+               COALESCE(c.size,p.size) AS size,
+               COALESCE(c.refs,0)+COALESCE(p.pins,0) AS refs
+          FROM current_usage c
+          FULL JOIN (
+              SELECT chunkid,size,pins FROM pitr_slice_ref
+               WHERE p_chunkids IS NULL OR chunkid=ANY(p_chunkids)
+          ) p USING(chunkid)
+    )
+    INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+    SELECT chunkid,size,refs::integer FROM desired WHERE refs>0
+    ON CONFLICT (chunkid) DO UPDATE
+       SET refs=EXCLUDED.refs
+     WHERE jfs_chunk_ref.size=EXCLUDED.size;
+
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+    RETURN v_drift_count;
+EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
+    RAISE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 从“当前 chunk + 现存 history”完整重建 slice 索引。旧版本可能因异步
+-- unlink/revert 遗留引用漂移，不能通过 refs-pins 推导当前引用；先清除旧 pin，
+-- 从当前 chunk 精确重算，再重建历史 pin。全部动作处于同一事务。
 CREATE OR REPLACE FUNCTION pitr_rebuild_slice_index() RETURNS void AS $$
 DECLARE
-    v_ref               RECORD;
     v_pin               RECORD;
     v_history           RECORD;
     v_last_txn_id       bigint := 0;
     v_cleanup_at        timestamptz;
+    v_legacy_drift      bigint := 0;
     v_old_suppress      text := current_setting('pitr.suppress_capture', true);
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('pitr-fs:versions'));
     PERFORM set_config('pitr.suppress_capture', 'on', true);
 
-    FOR v_ref IN SELECT chunkid,size,pins FROM pitr_slice_ref FOR UPDATE LOOP
-        UPDATE jfs_chunk_ref
-           SET refs=refs-v_ref.pins
-         WHERE chunkid=v_ref.chunkid
-           AND size=v_ref.size
-           AND refs>=v_ref.pins;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION '重建 slice 索引时无法安全释放 %/% 的 % 个旧 pin',
-                v_ref.chunkid,v_ref.size,v_ref.pins;
-        END IF;
-    END LOOP;
+    SELECT count(*) INTO v_legacy_drift
+      FROM pitr_slice_ref r LEFT JOIN jfs_chunk_ref j USING(chunkid)
+     WHERE j.chunkid IS NULL OR j.size<>r.size OR j.refs<r.pins;
 
     FOR v_pin IN SELECT delayed_id FROM pitr_slice_pin FOR UPDATE LOOP
         DELETE FROM jfs_delslices WHERE chunkid=v_pin.delayed_id;
     END LOOP;
     DELETE FROM pitr_slice_pin;
     DELETE FROM pitr_slice_ref;
+
+    -- 清掉历史 pin 后，先把 JuiceFS 引用恢复为“当前 chunk 出现次数”。这样
+    -- 历史独占、引用行已丢失的 slice 也能由后续 pin 重建安全插回。
+    PERFORM pitr_reconcile_slice_refs(NULL);
 
     FOR v_history IN
         SELECT h.txn_id,
@@ -430,7 +512,10 @@ BEGIN
     LOOP
         PERFORM pitr_pin_chunk_slices(v_history.txn_id,v_history.slices);
     END LOOP;
-
+    IF v_legacy_drift>0 THEN
+        RAISE WARNING '检测到 % 个历史 slice 的旧引用计数漂移，已按当前文件和版本快照重建；修复前已被回收的数据块无法恢复，请先在副本验证较早版本回退',
+            v_legacy_drift;
+    END IF;
     SELECT COALESCE(max(id),0) INTO v_last_txn_id FROM pitr_txn;
     SELECT last_version_cleanup_at INTO v_cleanup_at
       FROM pitr_slice_index_state WHERE singleton;
@@ -519,6 +604,8 @@ DECLARE
     v_chunkid      bigint;
     v_size         integer;
     v_refs_after   integer;
+    v_pin_count    bigint;
+    v_jfs_refs     integer;
     v_release_bytes bigint := 0;
     v_old_suppress text := current_setting('pitr.suppress_capture', true);
 BEGIN
@@ -540,16 +627,15 @@ BEGIN
         v_piece := substring(v_pin.slices FROM v_index*12+1 FOR 12);
         v_chunkid := pitr_decode_u64(substring(v_piece FROM 1 FOR 8));
         v_size := pitr_decode_u32(substring(v_piece FROM 9 FOR 4));
-        UPDATE jfs_chunk_ref SET refs=refs-1
-         WHERE chunkid=v_chunkid AND size=v_size AND refs>0
-         RETURNING refs INTO v_refs_after;
+        SELECT pins INTO v_pin_count FROM pitr_slice_ref
+         WHERE chunkid=v_chunkid AND size=v_size FOR UPDATE;
         IF NOT FOUND THEN
-            RAISE EXCEPTION '释放 txn % 时 slice %/% 引用行丢失',
-                OLD.id, v_chunkid, v_size;
+            RAISE EXCEPTION '释放 txn % 时 slice % pin 丢失',
+                OLD.id,v_chunkid;
         END IF;
-        IF v_refs_after = 0 THEN
-            v_release_bytes := v_release_bytes+v_size;
-        END IF;
+        SELECT refs INTO v_jfs_refs FROM jfs_chunk_ref
+         WHERE chunkid=v_chunkid AND size=v_size FOR UPDATE;
+
         DELETE FROM pitr_slice_ref
          WHERE chunkid=v_chunkid AND pins=1;
         IF NOT FOUND THEN
@@ -559,6 +645,23 @@ BEGIN
                 RAISE EXCEPTION '释放 txn % 时 slice % pin 丢失',
                     OLD.id, v_chunkid;
             END IF;
+        END IF;
+
+        -- 正常路径保持 O(1)。若旧版本已经出现 refs<pins 或引用行丢失，
+        -- 只对这个异常 slice 扫描当前 chunk 并重算，保证 clear/prune 能安全
+        -- 清理历史，而不是被旧漂移永久卡住。
+        IF v_jfs_refs IS NOT NULL AND v_jfs_refs>=v_pin_count THEN
+            UPDATE jfs_chunk_ref SET refs=refs-1
+             WHERE chunkid=v_chunkid AND size=v_size
+             RETURNING refs INTO v_refs_after;
+        ELSE
+            PERFORM pitr_reconcile_slice_refs(ARRAY[v_chunkid]);
+            SELECT refs INTO v_refs_after FROM jfs_chunk_ref
+             WHERE chunkid=v_chunkid AND size=v_size;
+            v_refs_after := COALESCE(v_refs_after,0);
+        END IF;
+        IF v_refs_after = 0 THEN
+            v_release_bytes := v_release_bytes+v_size;
         END IF;
     END LOOP;
     -- pin 释放后不能直接丢掉 delslices 索引，否则 refs=0 的 slice 可能不再
@@ -958,6 +1061,10 @@ DECLARE
     r_chunk_ref RECORD;
     v_pin_count bigint;
     v_pin_size integer;
+    v_current_slices bytea;
+    v_snapshot_slices bytea;
+    v_loop_chunkids bigint[];
+    v_affected_chunkids bigint[] := ARRAY[]::bigint[];
 BEGIN
     SELECT id INTO v_target_txn_id
       FROM pitr_txn WHERE version_hash = p_target_hash;
@@ -1040,6 +1147,29 @@ BEGIN
           AND  (p_scope_inodes IS NULL OR ch.inode = ANY(p_scope_inodes))
         ORDER  BY ch.recorded_at DESC, ch.txn_id DESC
     LOOP
+        SELECT slices INTO v_current_slices FROM jfs_chunk
+         WHERE inode=r_chunk.inode AND indx=r_chunk.indx;
+        IF r_chunk.snapshot IS NULL THEN
+            v_snapshot_slices := NULL;
+        ELSE
+            v_snapshot_slices :=
+                (jsonb_populate_record(NULL::jfs_chunk,r_chunk.snapshot)).slices;
+        END IF;
+        WITH encoded AS (
+            SELECT v_current_slices AS slices
+            UNION ALL
+            SELECT v_snapshot_slices
+        ), decoded AS (
+            SELECT pitr_decode_u64(
+                       substring(e.slices FROM g.i*24+5 FOR 8)) AS chunkid
+              FROM encoded e
+              CROSS JOIN LATERAL generate_series(0,length(e.slices)/24-1) AS g(i)
+        )
+        SELECT COALESCE(array_agg(DISTINCT chunkid)
+                        FILTER (WHERE chunkid<>0),ARRAY[]::bigint[])
+          INTO v_loop_chunkids FROM decoded;
+        v_affected_chunkids := v_affected_chunkids || v_loop_chunkids;
+
         IF r_chunk.op = 'I' THEN
             DELETE FROM jfs_chunk WHERE inode = r_chunk.inode AND indx = r_chunk.indx;
         ELSIF r_chunk.snapshot IS NOT NULL THEN
@@ -1097,6 +1227,14 @@ BEGIN
             END IF;
         END IF;
     END LOOP;
+
+    -- chunk_ref history 可能缺少 auto 关闭后才发生的异步 unlink 减引用。
+    -- 先保留原有 replay 兼容非 chunk 来源的引用变化，再对本次触及的 slice
+    -- 以当前 chunk + 历史 pin 做精确收敛。
+    SELECT COALESCE(array_agg(DISTINCT chunkid),ARRAY[]::bigint[])
+      INTO v_affected_chunkids
+      FROM unnest(v_affected_chunkids) AS affected(chunkid);
+    PERFORM pitr_reconcile_slice_refs(v_affected_chunkids);
 END;
 $$ LANGUAGE plpgsql;
 

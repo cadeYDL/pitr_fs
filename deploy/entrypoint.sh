@@ -28,12 +28,44 @@ apply_schema() {
         log "MVCC schema 内容未变化,跳过重复校准"
         return 0
     fi
-    PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 \
-        -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    PGOPTIONS="-c client_min_messages=warning" \
+        PGPASSWORD="$POSTGRES_PASSWORD" psql --single-transaction \
+        -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
         -v ON_ERROR_STOP=1 -f "$SCHEMA_PATH" >/dev/null
     temporary=/opt/pitr/.schema.applied.$$
     printf '%s\n' "$digest" >"$temporary"
     mv -f "$temporary" /opt/pitr/schema.applied.sha256
+}
+
+reconcile_database_collation() {
+    local versions stored actual reindex_sql refresh_sql
+    versions=$(PGOPTIONS="-c client_min_messages=error" \
+        PGPASSWORD="$POSTGRES_PASSWORD" psql -At -F '|' -h 127.0.0.1 \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+        -c "SELECT COALESCE(datcollversion,''),COALESCE(pg_database_collation_actual_version(oid),'') FROM pg_database WHERE datname=current_database()")
+    stored=${versions%%|*}
+    actual=${versions#*|}
+    [ -n "$actual" ] || return 0
+    [ "$stored" != "$actual" ] || return 0
+
+    log "检测到数据库排序规则版本变化 ($stored -> $actual)，服务启动前重建相关索引..."
+    reindex_sql=$(PGOPTIONS="-c client_min_messages=error" \
+        PGPASSWORD="$POSTGRES_PASSWORD" psql -At -h 127.0.0.1 \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+        -c "SELECT format('REINDEX DATABASE %I',current_database())")
+    refresh_sql=$(PGOPTIONS="-c client_min_messages=error" \
+        PGPASSWORD="$POSTGRES_PASSWORD" psql -At -h 127.0.0.1 \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+        -c "SELECT format('ALTER DATABASE %I REFRESH COLLATION VERSION',current_database())")
+    PGOPTIONS="-c client_min_messages=error" \
+        PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+        -c "$reindex_sql" >/dev/null
+    PGOPTIONS="-c client_min_messages=error" \
+        PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 \
+        -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+        -c "$refresh_sql" >/dev/null
+    log "数据库排序规则索引校准完成"
 }
 
 # 1. 后台拉起 PG (复用官方 entrypoint, 它会处理 initdb + docker-entrypoint-initdb.d)
@@ -47,6 +79,11 @@ until pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2
     sleep 1
 done
 log "PostgreSQL 就绪 (pid=$PG_PID)"
+
+# 从旧基础镜像迁移到固定 PostgreSQL 镜像时，glibc/ICU 排序规则版本可能
+# 变化。此时 PostgreSQL 会在每次连接输出底层 WARNING；趁 pitrd 尚未启动，
+# 原子重建依赖索引并刷新版本，避免把维护细节暴露给普通命令用户。
+reconcile_database_collation
 
 PG_DSN="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}?sslmode=disable"
 

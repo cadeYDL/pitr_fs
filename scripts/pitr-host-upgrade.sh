@@ -2,6 +2,11 @@
 # Linux 宿主机逻辑升级控制器。只切换 pitr/pitrd/schema，不重建容器或数据卷。
 set -euo pipefail
 
+# 升级会重挂载 FUSE。先保存调用者目录并把升级器自身移到稳定目录，避免挂载
+# 切换后 Python/shell 因继承失效 cwd 输出不可理解的 getcwd traceback。
+CALLER_PWD=${PITR_CALLER_PWD:-${PWD:-}}
+cd /
+
 INSTALL_CONFIG=${PITR_INSTALL_CONFIG:-/etc/pitr-fs/install.conf}
 if [ ! -r "$INSTALL_CONFIG" ]; then
     echo "错误: 未找到安装配置 $INSTALL_CONFIG；请先安装 pitr-fs" >&2
@@ -12,12 +17,29 @@ fi
 source "$INSTALL_CONFIG"
 
 CONTAINER=${PITR_CONTAINER:-${SAVED_CONTAINER:-pitrfs}}
+MOUNT_ROOT=${PITR_MOUNT_ROOT:-${SAVED_MOUNT_ROOT:-}}
 RUNTIME_DIR=${PITR_RUNTIME_DIR:-${SAVED_RUNTIME_DIR:-/var/lib/pitr-fs/runtime}}
 HOST_UPGRADER=${PITR_HOST_UPGRADER:-${SAVED_HOST_UPGRADER:-/usr/local/lib/pitr-fs/pitr-host-upgrade}}
 UPDATE_REPOSITORY=${PITR_UPDATE_REPOSITORY:-${SAVED_UPDATE_REPOSITORY:-cadeYDL/pitr_fs}}
 UPDATE_API_URL=${PITR_UPDATE_API_URL:-${SAVED_UPDATE_API_URL:-https://api.github.com}}
 READY_TIMEOUT=${PITR_READY_TIMEOUT:-120}
 DOCKER_COMMAND=(docker)
+
+ensure_safe_upgrade_cwd() {
+    local check_only=$1
+    [ "$check_only" -eq 0 ] || return 0
+    [ -n "$MOUNT_ROOT" ] || return 0
+    case "$CALLER_PWD" in
+        "$MOUNT_ROOT"|"$MOUNT_ROOT"/*)
+            printf '%s\n' \
+                "错误: 当前终端位于 pitr 管理的挂载目录范围中: $CALLER_PWD" \
+                "升级需要重新挂载其中的文件系统，继续执行会让当前 Shell 的工作目录失效。" \
+                "请先执行 cd /（或进入其他非 pitr 目录），再重新运行 pitr upgrade。" \
+                >&2
+            return 2
+            ;;
+    esac
+}
 
 usage() {
     cat <<'EOF'
@@ -295,6 +317,38 @@ target_binary_version() {
         awk '$1=="pitr" { print $2; exit }'
 }
 
+preflight_target_runtime() {
+    local target=$1 pitrd output
+    if [ "$target" = builtin ]; then
+        pitrd=/usr/local/bin/pitrd
+    else
+        pitrd="/opt/pitr/versions/$target/pitrd"
+    fi
+    # 旧逻辑版本没有固定运行时校验参数，回退到这些版本时维持兼容行为。
+    if ! docker_cli exec "$CONTAINER" "$pitrd" --help 2>&1 |
+        grep -Fq -- '--check-compatibility'; then
+        return 0
+    fi
+    if output=$(docker_cli exec "$CONTAINER" sh -c '
+        pitrd=$1
+        pg_dsn="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}?sslmode=disable"
+        exec "$pitrd" --pg-dsn "$pg_dsn" --check-compatibility --log-level warn
+    ' sh "$pitrd" 2>&1); then
+        return 0
+    fi
+    cat >&2 <<EOF
+错误: 目标逻辑版本 $target 与当前容器的 JuiceFS/PostgreSQL 运行时不兼容。
+升级已在停止服务前取消；文件系统没有卸载，当前版本和数据均未切换。
+该版本需要先在对应源码目录执行 ./install.sh install 完成一次容器运行时迁移；
+安装器会保留现有 PostgreSQL、对象数据和缓存卷。迁移前建议先做卷级备份。
+EOF
+    if [ "${PITR_UPGRADE_DEBUG:-0}" = 1 ]; then
+        echo "兼容性原始错误:" >&2
+        printf '%s\n' "$output" >&2
+    fi
+    return 1
+}
+
 unmount_filesystem() {
     local status fuse cli
     status=$(status_output)
@@ -340,12 +394,34 @@ switch_runtime() {
 }
 
 apply_schema() {
-    docker_cli exec "$CONTAINER" sh -c '
+    local output
+    if output=$(docker_cli exec "$CONTAINER" sh -c '
         schema=/etc/pitr/init_pitr.sql
         [ ! -r /opt/pitr/current/init_pitr.sql ] || schema=/opt/pitr/current/init_pitr.sql
-        PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 \
-          -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -f "$schema" >/dev/null
-    '
+        PGOPTIONS="-c client_min_messages=warning" \
+          PGPASSWORD="$POSTGRES_PASSWORD" psql --single-transaction \
+          -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+          -v ON_ERROR_STOP=1 -f "$schema" >/dev/null
+    ' 2>&1); then
+        [ -z "$output" ] || printf '%s\n' "$output" >&2
+        return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eq \
+        'slice|引用|pin|chunk.*冲突|无法校准'; then
+        cat >&2 <<'EOF'
+错误: 检测到历史版本的数据引用索引不一致，数据库升级已原子取消。
+当前逻辑版本和文件数据没有切换；这通常来自旧版本的异步删除/回放计数漂移。
+EOF
+    else
+        echo "错误: 数据库结构升级失败，升级已原子取消" >&2
+    fi
+    if [ "${PITR_UPGRADE_DEBUG:-0}" = 1 ]; then
+        echo "数据库原始错误:" >&2
+        printf '%s\n' "$output" >&2
+    else
+        echo "如需底层诊断，请设置 PITR_UPGRADE_DEBUG=1 后重试" >&2
+    fi
+    return 1
 }
 
 current_schema_digest() {
@@ -460,7 +536,7 @@ perform_switch() {
         fi
         run_root rm -f "$RUNTIME_DIR/upgrade-fallback"
         recover_mount
-        echo "错误: schema 校准失败，已恢复旧逻辑" >&2
+        echo "错误: schema 校准失败，已恢复旧逻辑和原挂载；数据未切换" >&2
         return 1
     fi
     if ! record_schema_digest "$target_schema"; then
@@ -538,6 +614,20 @@ upgrade_main() (
         esac
     fi
 
+    if [ -n "$bundle" ]; then
+        case "$bundle" in
+            /*) ;;
+            *)
+                [ -n "$CALLER_PWD" ] || {
+                    echo "错误: 无法确定相对升级包所基于的调用目录" >&2
+                    return 2
+                }
+                bundle=$(realpath -m -- "$CALLER_PWD/$bundle")
+                ;;
+        esac
+    fi
+    ensure_safe_upgrade_cwd "$check_only" || return $?
+
     work=$(mktemp -d)
     trap 'rm -rf -- "$work"' EXIT
     if [ "$rollback" -eq 0 ]; then
@@ -587,6 +677,9 @@ upgrade_main() (
         echo "错误: 无法读取目标逻辑版本" >&2
         return 1
     }
+
+    echo "==> 预检目标版本与当前容器运行时" >&2
+    preflight_target_runtime "$version" || return 1
 
     confirm_downtime
     echo "==> 切换逻辑版本并恢复挂载" >&2

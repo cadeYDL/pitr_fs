@@ -264,7 +264,8 @@ func TestSQL_TablesExist(t *testing.T) {
 	for _, proc := range []string{"pitr_collapse_commit", "pitr_revert", "pitr_rollback",
 		"pitr_capture_node_change", "pitr_capture_edge_change",
 		"pitr_capture_chunk_change", "pitr_capture_chunk_ref_change",
-		"pitr_scopes_overlap", "pitr_rebuild_slice_index",
+		"pitr_scopes_overlap", "pitr_reconcile_slice_refs",
+		"pitr_rebuild_slice_index",
 		"pitr_rebuild_space_state", "pitr_track_chunk_ref_space"} {
 		n := mustScalarInt(t, conn,
 			"SELECT count(*) FROM pg_proc WHERE proname = $1", proc)
@@ -502,11 +503,115 @@ func TestTrigger_NodeDeleteCapturesChunkBeforeAsyncCleanup(t *testing.T) {
 	if refs != 2 {
 		t.Fatalf("历史 chunk 应增加一个物理 pin,refs=%d", refs)
 	}
+	// JuiceFS 的异步 unlink 会在 auto 窗口关闭后才减少当前引用，因此这次
+	// UPDATE 不会进入 chunk_ref history。旧实现只恢复 chunk 行，随后释放
+	// pin 会把当前文件仍在使用的 slice 错降到 0。
+	mustExec(t, conn, "UPDATE jfs_chunk_ref SET refs=refs-1 WHERE chunkid=900")
 	mustExec(t, conn, "DELETE FROM jfs_chunk WHERE inode=220")
 	mustExec(t, conn, "CALL pitr_revert($1,$2)", "unlinkbase01", "/")
 	if got = mustScalarInt(t, conn,
 		"SELECT count(*) FROM jfs_chunk WHERE inode=220 AND indx=0"); got != 1 {
 		t.Fatalf("异步清理后 revert 应恢复 chunk,实际 %d", got)
+	}
+	refs = mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=900")
+	if refs != 2 {
+		t.Fatalf("恢复后应包含当前引用和历史 pin,refs=%d", refs)
+	}
+	// 淘汰 unlink 版本后只释放历史 pin，当前恢复文件仍保留一个引用。
+	mustExec(t, conn, "UPDATE pitr_txn SET parent_id=1 WHERE parent_id=$1", unlinkID)
+	mustExec(t, conn, "DELETE FROM pitr_txn WHERE id=$1", unlinkID)
+	refs = mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=900")
+	if refs != 1 {
+		t.Fatalf("淘汰历史后应保留当前文件引用,refs=%d", refs)
+	}
+}
+
+func TestSliceIndexRebuildRepairsMissingAndUndercountedRefs(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, `
+		INSERT INTO jfs_node(inode,mode,nlink,length)
+		VALUES (221,33188,1,4)`)
+	mustExec(t, conn, `
+		INSERT INTO jfs_chunk(inode,indx,slices)
+		VALUES (221,0,decode('000000000000000000000385000000040000000000000004','hex'))`)
+	mustExec(t, conn,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (901,4,1)")
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('rebuildref01',1,'/','auto','write:/a',now()) RETURNING id`)
+	// 捕获当前 chunk 形成一份可重建的历史 pin，再模拟旧版本把 refs 行
+	// 完全丢失。
+	execUnderTxn(t, conn, autoID,
+		"UPDATE jfs_chunk SET slices=slices WHERE inode=221 AND indx=0")
+	mustExec(t, conn, "DELETE FROM jfs_chunk_ref WHERE chunkid=901")
+
+	mustExec(t, conn, "SELECT pitr_rebuild_slice_index()")
+	refs := mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=901")
+	if refs != 2 {
+		t.Fatalf("重建后应恢复当前引用+历史 pin,refs=%d", refs)
+	}
+	pins := mustScalarInt(t, conn,
+		"SELECT pins FROM pitr_slice_ref WHERE chunkid=901")
+	if pins != 1 {
+		t.Fatalf("重建后的历史 pin=%d", pins)
+	}
+}
+
+func TestSliceRefReconcileRejectsSizeConflictAtomically(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, `
+		INSERT INTO jfs_chunk(inode,indx,slices)
+		VALUES (222,0,decode('000000000000000000000387000000040000000000000004','hex'))`)
+	mustExec(t, conn,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (903,8,7)")
+	if _, err := conn.Exec(context.Background(),
+		"SELECT pitr_reconcile_slice_refs(NULL)"); err == nil {
+		t.Fatal("同一 slice 的 size 冲突应拒绝校准")
+	}
+	refs := mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=903 AND size=8")
+	if refs != 7 {
+		t.Fatalf("失败校准不应留下中间态,refs=%d", refs)
+	}
+}
+
+func TestVersionReleaseRepairsLegacyMissingRef(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (902,4,1)")
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('release_ref1',1,'/','auto','unlink:/old',now()) RETURNING id`)
+	mustExec(t, conn,
+		"SELECT pitr_pin_chunk_slices($1,decode('000000000000000000000386000000040000000000000004','hex'))", autoID)
+	// 历史独占 slice 的对象可能已经被旧 bug 清掉；clear/prune 至少必须能
+	// 原子移除损坏版本，不能永远卡在“引用行丢失”。
+	mustExec(t, conn, "DELETE FROM jfs_chunk_ref WHERE chunkid=902")
+	mustExec(t, conn, "DELETE FROM pitr_txn WHERE id=$1", autoID)
+	if got := mustScalarInt(t, conn,
+		"SELECT count(*) FROM pitr_slice_ref WHERE chunkid=902"); got != 0 {
+		t.Fatalf("损坏历史释放后仍残留 slice_ref=%d", got)
 	}
 }
 

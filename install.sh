@@ -341,7 +341,8 @@ if [ "\${1:-}" = "upgrade" ]; then
         exit 1
     }
     shift
-    exec env PITR_INSTALL_CONFIG="\$install_config" "\$host_upgrader" "\$@"
+    exec env PITR_INSTALL_CONFIG="\$install_config" \
+        PITR_CALLER_PWD="\${PWD:-}" "\$host_upgrader" "\$@"
 fi
 pitr_args=("\$@")
 if [ "\${1:-}" = "init" ] && [ -n "\${2:-}" ]; then
@@ -406,11 +407,13 @@ install_host_upgrader() {
 #!/usr/bin/env bash
 set -euo pipefail
 runtime_dir=$quoted_runtime
+caller_pwd=\${PITR_CALLER_PWD:-\${PWD:-}}
+cd /
 upgrader="\$runtime_dir/pitr-host-upgrade-builtin"
 if [ -x "\$runtime_dir/current/pitr-host-upgrade" ]; then
     upgrader="\$runtime_dir/current/pitr-host-upgrade"
 fi
-exec "\$upgrader" "\$@"
+exec env PITR_CALLER_PWD="\$caller_pwd" "\$upgrader" "\$@"
 EOF2
     $sudo chmod 0755 "$HOST_UPGRADER"
 }

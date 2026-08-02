@@ -66,7 +66,7 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 	}
 	for _, required := range []string{
 		`if [ "\${1:-}" = "upgrade" ]`,
-		`exec env PITR_INSTALL_CONFIG="\$install_config" "\$host_upgrader" "\$@"`,
+		`PITR_CALLER_PWD="\${PWD:-}" "\$host_upgrader" "\$@"`,
 		`source=$RUNTIME_DIR,target=/opt/pitr`,
 		`install_host_upgrader`,
 		`SAVED_RUNTIME_DIR=%q`,
@@ -111,6 +111,12 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 		`target_schema_digest`,
 		`schema 内容未变化`,
 		`record_schema_digest`,
+		`ensure_safe_upgrade_cwd`,
+		`preflight_target_runtime`,
+		`升级已在停止服务前取消`,
+		`psql --single-transaction`,
+		`client_min_messages=warning`,
+		`数据库升级已原子取消`,
 	} {
 		if !bytes.Contains(upgrader, []byte(required)) {
 			t.Errorf("宿主升级器缺少 %q", required)
@@ -119,6 +125,82 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 	if bytes.Contains(upgrader, []byte("docker rm")) ||
 		bytes.Contains(upgrader, []byte("docker run")) {
 		t.Error("逻辑升级器不应删除或重建容器")
+	}
+}
+
+func TestLogicUpgradeRejectsCallerInsideFuseMount(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	mountRoot := "/pitr/data"
+	if err := os.WriteFile(config,
+		[]byte("SAVED_MOUNT_ROOT="+mountRoot+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+CALLER_PWD="$2/project"
+MOUNT_ROOT="$2"
+ensure_safe_upgrade_cwd 0
+`, "bash", script, mountRoot)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("挂载目录内升级应在停服务前失败: %s", output)
+	}
+	for _, expected := range []string{
+		"当前终端位于 pitr 管理的挂载目录范围中", "请先执行 cd /", mountRoot,
+	} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Errorf("升级提示缺少 %q:\n%s", expected, output)
+		}
+	}
+
+	command = exec.Command("bash", "-c", `
+source "$1"
+CALLER_PWD="$2/project"
+MOUNT_ROOT="$2"
+ensure_safe_upgrade_cwd 1
+`, "bash", script, mountRoot)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	if output, err = command.CombinedOutput(); err != nil {
+		t.Fatalf("--check 不会重挂载，应允许在挂载目录执行: %v\n%s", err, output)
+	}
+}
+
+func TestLogicUpgradeSummarizesSchemaFailureForUsers(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+docker_cli() {
+  printf '%s\n' 'psql: ERROR: 重建 slice 索引时无法安全释放 12289/67108864 的 1 个旧 pin' >&2
+  return 1
+}
+apply_schema
+`, "bash", script)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("模拟 schema 失败应返回非零: %s", output)
+	}
+	for _, expected := range []string{
+		"历史版本的数据引用索引不一致",
+		"当前逻辑版本和文件数据没有切换",
+		"PITR_UPGRADE_DEBUG=1",
+	} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Errorf("schema 失败提示缺少 %q:\n%s", expected, output)
+		}
+	}
+	if bytes.Contains(output, []byte("12289/67108864")) {
+		t.Fatalf("默认错误不应向普通用户暴露底层 slice/pin 细节:\n%s", output)
 	}
 }
 
@@ -335,6 +417,11 @@ func TestEntrypoint_SupervisesLogicRestartWithoutStoppingPostgres(t *testing.T) 
 		`schema.applied.sha256`,
 		`apply_schema 0`,
 		`apply_schema 1`,
+		`psql --single-transaction`,
+		`client_min_messages=warning`,
+		`reconcile_database_collation`,
+		`REINDEX DATABASE %I`,
+		`REFRESH COLLATION VERSION`,
 	} {
 		if !bytes.Contains(entrypoint, []byte(required)) {
 			t.Errorf("entrypoint 缺少无容器重建升级片段 %q", required)
