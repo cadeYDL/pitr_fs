@@ -347,11 +347,15 @@ pitr_args=("\$@")
 if [ "\${1:-}" = "init" ] && [ -n "\${2:-}" ]; then
     pitr_args[1]="\$(realpath -m -- "\$2")"
 fi
-case "\$PWD" in
-    "\$host_mount_root"|"\$host_mount_root"/*) container_workdir="\$PWD" ;;
-    *) container_workdir="\$host_mount_root" ;;
+host_pwd=\${PWD:-}
+case "\$host_pwd" in
+    "\$host_mount_root"|"\$host_mount_root"/*) requested_workdir="\$host_pwd" ;;
+    *) requested_workdir="\$host_mount_root" ;;
 esac
-docker_args=(exec --workdir "\$container_workdir")
+# Docker 在创建 exec 进程前就会解析 --workdir。若回滚刚删除了调用者所在
+# 目录，直接传入旧 PWD 会使 CLI 尚未启动便被 OCI runtime 拒绝。先从始终
+# 存在的挂载根启动，再由容器内 shell 进入目标目录并处理删除竞态。
+docker_args=(exec --workdir "\$host_mount_root")
 if [ -t 0 ] && [ -t 1 ]; then
     docker_args+=(-it)
 fi
@@ -367,10 +371,25 @@ if ! timeout 10 docker info >/dev/null 2>&1; then
     fi
 fi
 exec "\${docker_command[@]}" "\${docker_args[@]}" "$CONTAINER" sh -c '
+requested_workdir=\$1
+host_mount_root=\$2
+shift 2
+container_workdir=\$requested_workdir
+while ! cd "\$container_workdir" 2>/dev/null; do
+    if [ "\$container_workdir" = "\$host_mount_root" ]; then
+        echo "错误: pitr 挂载根目录不可访问: \$host_mount_root" >&2
+        exit 1
+    fi
+    container_workdir=\${container_workdir%/*}
+    [ -n "\$container_workdir" ] || container_workdir=\$host_mount_root
+done
+if [ "\$container_workdir" != "\$requested_workdir" ]; then
+    echo "警告: 当前目录已不存在，改用最近的现存父目录: \$container_workdir" >&2
+fi
 cli=/usr/local/bin/pitr
 [ ! -x /opt/pitr/current/pitr ] || cli=/opt/pitr/current/pitr
 exec "\$cli" "\$@"
-' sh "\${pitr_args[@]}"
+' sh "\$requested_workdir" "\$host_mount_root" "\${pitr_args[@]}"
 EOF2
     $sudo chmod +x "$BIN_LINK"
 }

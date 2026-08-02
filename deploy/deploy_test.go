@@ -420,15 +420,17 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 	for _, required := range []string{
 		`host_mount_root=$quoted_root`,
 		`pitr_args=("\$@")`,
-		`container_workdir="\$PWD"`,
-		`docker_args=(exec --workdir "\$container_workdir")`,
+		`host_pwd=\${PWD:-}`,
+		`requested_workdir="\$host_pwd"`,
+		`docker_args=(exec --workdir "\$host_mount_root")`,
+		`while ! cd "\$container_workdir" 2>/dev/null; do`,
 		`if [ -t 0 ] && [ -t 1 ]; then`,
 		"docker_args+=(-it)",
 		`docker_command=(docker)`,
 		`docker_command=(sudo docker)`,
 		`[ ! -x /opt/pitr/current/pitr ] || cli=/opt/pitr/current/pitr`,
 		`exec "\$cli" "\$@"`,
-		`' sh "\${pitr_args[@]}"`,
+		`' sh "\$requested_workdir" "\$host_mount_root" "\${pitr_args[@]}"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh wrapper 缺少非 TTY 兼容片段 %q", required)
@@ -491,7 +493,7 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 		t.Fatalf("运行 wrapper: %v\n%s", err, output)
 	}
 	for _, expected := range []string{
-		"<exec>", "<--workdir>", "<" + subdir + ">",
+		"<exec>", "<--workdir>", "<" + mountRoot + ">", "<" + subdir + ">",
 		"<test-container>", "<sh>",
 		"/opt/pitr/current/pitr", "<begin>", "<.>",
 	} {
@@ -512,6 +514,94 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	}
 	if !bytes.Contains(output, []byte("<"+subdir+">")) {
 		t.Fatalf("init 相对路径没有解析为宿主绝对路径:\n%s", output)
+	}
+}
+
+func TestInstall_WrapperFallsBackWhenCWDWasDeleted(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\ninstall_main() {\n")
+	index := bytes.Index(content, marker)
+	if index < 0 {
+		t.Fatal("install.sh 未找到主命令 case")
+	}
+	temp := t.TempDir()
+	functions := filepath.Join(temp, "install-functions.sh")
+	if err := os.WriteFile(functions, content[:index], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mountRoot := filepath.Join(temp, "mount")
+	staleDir := filepath.Join(mountRoot, "deleted-cwd")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(temp, "pitr")
+	generate := exec.Command("bash", "-c", `source "$1"; install_wrapper`, "bash", functions)
+	generate.Env = append(os.Environ(),
+		"PITR_MOUNT_ROOT="+mountRoot,
+		"PITR_BIN="+wrapper,
+		"PITR_CONTAINER=test-container",
+	)
+	if output, err := generate.CombinedOutput(); err != nil {
+		t.Fatalf("生成 wrapper: %v\n%s", err, output)
+	}
+	fakeCLI := filepath.Join(temp, "fake-pitr")
+	fakeCLIContent := "#!/bin/sh\nprintf 'cwd=%s\\n' \"$(pwd -P)\"\nprintf 'arg=<%s>\\n' \"$@\"\n"
+	if err := os.WriteFile(fakeCLI, []byte(fakeCLIContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapperContent, err := os.ReadFile(wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapperContent = bytes.ReplaceAll(wrapperContent,
+		[]byte("/usr/local/bin/pitr"), []byte(fakeCLI))
+	if err := os.WriteFile(wrapper, wrapperContent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(temp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeDocker := filepath.Join(bin, "docker")
+	fakeDockerScript := `#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  info) exit 0 ;;
+  exec)
+    shift
+    test "$1" = --workdir
+    initial_workdir=$2
+    shift 2
+    shift
+    cd "$initial_workdir"
+    exec "$@"
+    ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "-c", `
+cd "$1"
+rmdir "$1"
+exec "$2" version
+`, "bash", staleDir, wrapper)
+	command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("已删除 cwd 中运行 wrapper: %v\n%s", err, output)
+	}
+	for _, expected := range []string{
+		"当前目录已不存在", "cwd=" + mountRoot, "arg=<version>",
+	} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Errorf("wrapper 输出缺少 %q:\n%s", expected, output)
+		}
 	}
 }
 
