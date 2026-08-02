@@ -314,18 +314,19 @@ func newRecoverCmd() *cobra.Command {
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
+			rows := [][]string{{"状态", "卷", "挂载点", "JuiceFS/错误"}}
 			for _, volume := range resp.GetVolumes() {
 				if volume.GetError() != "" {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-						"failed %s @ %s: %s\n",
-						volume.GetName(), volume.GetFuseMount(), volume.GetError())
+					rows = append(rows, []string{
+						"失败", volume.GetName(), volume.GetFuseMount(), volume.GetError(),
+					})
 				} else {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-						"recovered %s @ %s (jfs=%s)\n",
-						volume.GetName(), volume.GetFuseMount(), volume.GetJfsMount())
+					rows = append(rows, []string{
+						"已恢复", volume.GetName(), volume.GetFuseMount(), volume.GetJfsMount(),
+					})
 				}
 			}
-			return nil
+			return writeAlignedTable(cmd.OutOrStdout(), rows)
 		},
 	}
 }
@@ -410,18 +411,21 @@ func newStatusCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"connected to pitrd %s, %d volumes, %d open writes\n",
 				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetOpenWrites())
+			rows := [][]string{{
+				"卷", "JuiceFS", "挂载点", "保留策略", "版本上限",
+				"空间上限", "预留比例", "已占用", "可回收",
+			}}
 			for _, volume := range resp.GetVolumes() {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"%s\tjfs=%s\tfuse=%s\tretention=%s\thistory-limit=%d\tmax-space=%s\treserve=%d%%\tretained=%s\treclaimable=%s\n",
-					volume.GetName(), volume.GetJfsMount(),
-					volume.GetFuseMount(), volume.GetRetention(),
-					volume.GetHistoryLimit(),
+				rows = append(rows, []string{
+					volume.GetName(), volume.GetJfsMount(), volume.GetFuseMount(),
+					volume.GetRetention(), fmt.Sprintf("%d", volume.GetHistoryLimit()),
 					txn.FormatSpaceLimit(volume.GetMaxSpaceBytes()),
-					volume.GetSpaceReservePercent(),
+					fmt.Sprintf("%d%%", volume.GetSpaceReservePercent()),
 					txn.FormatSpaceBytes(volume.GetRetainedSpaceBytes()),
-					txn.FormatSpaceBytes(volume.GetReclaimableSpaceBytes()))
+					txn.FormatSpaceBytes(volume.GetReclaimableSpaceBytes()),
+				})
 			}
-			return nil
+			return writeAlignedTable(cmd.OutOrStdout(), rows)
 		},
 	}
 }
@@ -454,23 +458,28 @@ func newSpaceCmd() *cobra.Command {
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"max=%s reserve=%d%% high=%s retained=%s reclaimable=%s\n",
-				txn.FormatSpaceLimit(response.GetMaxSpaceBytes()),
-				response.GetReservePercent(),
-				txn.FormatSpaceBytes(response.GetHighWatermarkBytes()),
-				txn.FormatSpaceBytes(response.GetRetainedBytes()),
-				txn.FormatSpaceBytes(response.GetReclaimableBytes()))
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(),
-				"VERSION\tRELEASE_IF_DELETED\tPINNED\tCLOSED_AT")
+			if err := writeAlignedTable(cmd.OutOrStdout(), [][]string{
+				{"空间上限", "预留比例", "裁剪水位", "已占用", "可回收"},
+				{
+					txn.FormatSpaceLimit(response.GetMaxSpaceBytes()),
+					fmt.Sprintf("%d%%", response.GetReservePercent()),
+					txn.FormatSpaceBytes(response.GetHighWatermarkBytes()),
+					txn.FormatSpaceBytes(response.GetRetainedBytes()),
+					txn.FormatSpaceBytes(response.GetReclaimableBytes()),
+				},
+			}); err != nil {
+				return err
+			}
+			rows := [][]string{{"版本号", "删除后预计释放", "版本引用", "完成时间"}}
 			for _, version := range response.GetVersions() {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n",
+				rows = append(rows, []string{
 					version.GetVersionHash(),
 					txn.FormatSpaceBytes(version.GetEstimatedReleaseBytes()),
 					txn.FormatSpaceBytes(version.GetPinnedBytes()),
-					version.GetClosedAt())
+					version.GetClosedAt(),
+				})
 			}
-			return nil
+			return writeAlignedTable(cmd.OutOrStdout(), rows)
 		},
 	}
 	c.Flags().IntVarP(&limit, "limit", "n", 20, "最多显示的最老版本数")
@@ -481,10 +490,12 @@ func newConfigCmd() *cobra.Command {
 	const configHelp = `查看或设置全局运行时配置。
 
 支持的配置项：
-  retention      verbose|compact|archive；archive 必须配合 --window
-  history-limit  1..100000，最多保留的版本数
-  max-space      unlimited、0 或容量值（如 100GiB）
-  space-reserve  1..99%，达到可用空间高水位后优先淘汰老版本`
+  retention      预留的三档策略名；当前自动模式尚未按三档执行
+  history-limit  1..100000，版本数量硬上限
+  max-space      unlimited、0 或容量值；支持 B/KB/MB/GB/TB 和 KiB/MiB/GiB/TiB
+  space-reserve  1..99%，20% 表示达到 max-space 的 80% 后继续淘汰老版本
+
+history-limit 与空间水位同时生效，最终由更严格的约束决定保留数量。`
 	listConfig := func(cmd *cobra.Command, _ []string) error {
 		client, err := dialDaemon(cmd)
 		if err != nil {
@@ -508,20 +519,25 @@ func newConfigCmd() *cobra.Command {
 			maxSpace = txn.FormatSpaceLimit(volume.GetMaxSpaceBytes())
 			spaceReserve = fmt.Sprintf("%d%%", volume.GetSpaceReservePercent())
 		}
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
-			"配置项\t当前值\t默认值\t取值范围\t说明")
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"retention\t%s\tcompact\tverbose|compact|archive\t版本保留策略；archive 需 --window\n",
-			retention)
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"history-limit\t%s\t100\t1..100000\t最多保留的版本数\n",
-			historyLimit)
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"max-space\t%s\tunlimited\tunlimited|0|容量值\t允许用户实际占用的最大空间\n",
-			maxSpace)
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"space-reserve\t%s\t20%%\t1..99%%\t临近空间比例，优先淘汰老版本\n",
-			spaceReserve)
+		if err := writeAlignedTable(cmd.OutOrStdout(), [][]string{
+			{"配置项", "当前值", "默认值", "取值范围", "说明"},
+			{"retention", retention, "compact", "verbose|compact|archive",
+				"预留策略名；当前自动模式尚未按三档执行"},
+			{"history-limit", historyLimit, "100", "1..100000",
+				"版本数量硬上限，超出后从最老版本开始删除"},
+			{"max-space", maxSpace, "unlimited", "unlimited|0|容量值",
+				"当前文件与历史版本仍引用的数据空间预算（近似值）"},
+			{"space-reserve", spaceReserve, "20%", "1..99%",
+				"预留比例；20% 表示占用达到 max-space 的 80% 后继续删除老版本"},
+		}); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprint(cmd.OutOrStdout(), `
+retention 预期语义：verbose=保留每次写版本；compact=压缩业务改动的中间版本；archive=仅保留 --window 内版本。
+当前实现：自动模式下 retention 尚未接入裁剪，实际由 history-limit 和空间水位控制。
+容量单位：KB/MB/GB/TB 按 1000，KiB/MiB/GiB/TiB 按 1024；不写单位按 B；0/unlimited 表示不限。
+裁剪关系：先满足 history-limit，再在已配置 max-space 且超过“100% 减去 space-reserve”的水位时继续删除最老版本；最终以更严格的约束为准。
+`)
 		return nil
 	}
 	c := &cobra.Command{
@@ -699,6 +715,12 @@ func newLogsCmd() *cobra.Command {
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
+			rows := [][]string{{"版本号", "操作", "说明"}}
+			if long {
+				rows = [][]string{{
+					"版本号", "POSIX 操作", "原始命令", "操作时间", "操作人", "内容变更",
+				}}
+			}
 			for _, entry := range resp.GetEntries() {
 				transaction := entry.GetTransaction()
 				if long {
@@ -724,22 +746,21 @@ func newLogsCmd() *cobra.Command {
 					if change == "" {
 						change = "-"
 					}
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-						"%s\t%s\t%s\t%s\t%s\t%s\n",
+					rows = append(rows, []string{
 						transaction.GetVersionHash(), posixOp, processCommand,
-						timestamp, actor, change)
+						timestamp, actor, change,
+					})
 					continue
 				}
-				if transaction.GetMessage() == "" {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s   %s\n",
-						transaction.GetVersionHash(), transaction.GetCommand())
-				} else {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s   %s   # %s\n",
-						transaction.GetVersionHash(), transaction.GetCommand(),
-						transaction.GetMessage())
+				message := transaction.GetMessage()
+				if message == "" {
+					message = "-"
 				}
+				rows = append(rows, []string{
+					transaction.GetVersionHash(), transaction.GetCommand(), message,
+				})
 			}
-			return nil
+			return writeAlignedTable(cmd.OutOrStdout(), rows)
 		},
 	}
 	c.Flags().IntVarP(&limit, "number", "n", 20, "最多返回多少条")

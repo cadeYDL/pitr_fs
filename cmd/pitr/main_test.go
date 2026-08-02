@@ -268,17 +268,17 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		want string
 	}{
 		{[]string{"--socket", socket, "status"}, "connected to pitrd test, 1 volumes"},
-		{[]string{"--socket", socket, "status"}, "history-limit=100"},
-		{[]string{"--socket", socket, "space", "/workspace"}, "max=100.00 GiB reserve=20% high=80.00 GiB"},
-		{[]string{"--socket", socket, "space", "/workspace"}, "012345abcdef\t1.00 GiB\t2.00 GiB"},
-		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef   commit   # done"},
+		{[]string{"--socket", socket, "status"}, "保留策略  版本上限"},
+		{[]string{"--socket", socket, "space", "/workspace"}, "删除后预计释放"},
+		{[]string{"--socket", socket, "space", "/workspace"}, "012345abcdef  1.00 GiB"},
+		{[]string{"--socket", socket, "logs", "/workspace/proj", "-n", "2"}, "012345abcdef  commit"},
 		{[]string{"--socket", socket, "logs", "/workspace/proj", "-l", "-n", "1"},
-			"012345abcdef\twrite(\"/workspace/proj/a\", offset=0, total=2, calls=1)\techo 12345..."},
+			"POSIX 操作"},
 		{[]string{"--socket", socket, "diff", "111111111111", "222222222222", "--path", "/workspace/proj"}, "nodes=2 edges=3 chunks=4"},
 		{[]string{"--socket", socket, "revert", "111111111111", "--path", "/workspace/proj"}, "reverted to 111111111111 at 2026-07-31T06:23:17.842Z; applied 9 history rows; new version fedcba654321"},
 		{[]string{"--socket", socket, "revert", "111111111111", "--dry-run"}, "dry-run: target 111111111111 at 2026-07-31T06:23:17.842Z; would apply 9 history rows"},
 		{[]string{"--socket", socket, "revert", "--at", "2026-07-31T14:23:17+08:00"}, "reverted to 111111111111"},
-		{[]string{"--socket", socket, "recover", "/workspace"}, "recovered default @ /workspace"},
+		{[]string{"--socket", socket, "recover", "/workspace"}, "已恢复  default  /workspace  /jfs"},
 		{[]string{"--socket", socket, "init", "/workspace"}, "initialized default @ /workspace"},
 		{[]string{"--socket", socket, "umount", "/workspace"}, "unmounted /workspace"},
 		{[]string{"--socket", socket, "mount", "/workspace"}, "mounted default @ /workspace"},
@@ -286,9 +286,10 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "config", "set", "history-limit", "42"}, "set history-limit=42"},
 		{[]string{"--socket", socket, "config", "set", "max-space", "100GiB"}, "set max-space=100GiB"},
 		{[]string{"--socket", socket, "config", "set", "space-reserve", "15%"}, "set space-reserve=15%"},
-		{[]string{"--socket", socket, "config"}, "配置项\t当前值\t默认值\t取值范围\t说明"},
-		{[]string{"--socket", socket, "config"}, "history-limit\t100\t100\t1..100000"},
-		{[]string{"--socket", socket, "config", "list"}, "max-space\t100.00 GiB\tunlimited"},
+		{[]string{"--socket", socket, "config"}, "预留策略名；当前自动模式尚未按三档执行"},
+		{[]string{"--socket", socket, "config"}, "history-limit"},
+		{[]string{"--socket", socket, "config", "list"}, "容量单位：KB/MB/GB/TB 按 1000"},
+		{[]string{"--socket", socket, "config", "list"}, "最终以更严格的约束为准"},
 		{[]string{"config", "--help"}, "space-reserve  1..99%"},
 		{[]string{"--socket", socket, "clear", "--global", "--yes"}, "cleared 8 versions and 21 history rows"},
 	}
@@ -299,6 +300,26 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		}
 		if !strings.Contains(got, tc.want) {
 			t.Fatalf("%v 输出不包含 %q:\n%s", tc.args, tc.want, got)
+		}
+	}
+}
+
+func TestCLI_FieldListsUseUnifiedAlignedRenderer(t *testing.T) {
+	socket := startFakePitrd(t)
+	commands := [][]string{
+		{"--socket", socket, "status"},
+		{"--socket", socket, "space", "/workspace"},
+		{"--socket", socket, "config", "list"},
+		{"--socket", socket, "logs", "/workspace/proj", "-l"},
+		{"--socket", socket, "recover", "/workspace"},
+	}
+	for _, args := range commands {
+		output, err := executeCLI(t, args...)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if strings.ContainsRune(output, '\t') {
+			t.Fatalf("%v 仍依赖 tabstop 对齐：\n%s", args, output)
 		}
 	}
 }
