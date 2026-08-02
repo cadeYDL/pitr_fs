@@ -5,6 +5,10 @@ set -euo pipefail
 
 log() { echo "[pitr] $*"; }
 
+# schema 摘要和逻辑升级运行时都保存在这里。全新安装没有宿主机升级脚本
+# 预先创建目录，entrypoint 必须自行保证基础目录存在。
+mkdir -p /opt/pitr
+
 runtime_file() {
     local name=$1
     if [ -e "/opt/pitr/current/$name" ]; then
@@ -45,6 +49,16 @@ done
 log "PostgreSQL 就绪 (pid=$PG_PID)"
 
 PG_DSN="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}?sslmode=disable"
+
+# 已有卷必须在任何 pitr schema/trigger 变更前完成只读 ABI 校验。使用镜像
+# 内置 pitrd 而不是可热切换的逻辑版本，保证校验器与固定 JuiceFS 二进制匹配。
+if juicefs status "$PG_DSN" >/dev/null 2>&1; then
+    log "校验已有 JuiceFS/PostgreSQL 兼容契约..."
+    /usr/local/bin/pitrd \
+        --pg-dsn "$PG_DSN" \
+        --check-compatibility \
+        --log-level warn
+fi
 
 # 3. 幂等再跑一次建表 (补丁生效, 不依赖 initdb.d 是否执行过)
 log "校准 MVCC schema..."

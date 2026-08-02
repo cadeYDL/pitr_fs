@@ -936,6 +936,53 @@ func TestDockerfileDoesNotBakeDatabasePassword(t *testing.T) {
 	}
 }
 
+func TestDockerfilePinsJuiceFSAndPostgreSQLABI(t *testing.T) {
+	root := repoRoot(t)
+	dockerfile, err := os.ReadFile(filepath.Join(root, "deploy/Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(dockerfile)
+	for _, required := range []string{
+		"JUICEFS_VERSION=v1.3.0",
+		"30190ca1094d26e85f19a979ca51b0ea19af1eaa",
+		"git apply --check /tmp/juicefs.patch",
+		"JUICEFS_PATCH_REVISION=pitrfs.1",
+		"version.revision=${JUICEFS_PATCH_REVISION}-30190ca",
+		"postgres:16.14-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55",
+		"golang:1.25@sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980",
+	} {
+		if !strings.Contains(content, required) {
+			t.Errorf("Dockerfile 缺少固定运行时约束 %q", required)
+		}
+	}
+	if strings.Contains(content, "d.juicefs.com/install") {
+		t.Error("Dockerfile 不得通过安装脚本获取浮动 JuiceFS 版本")
+	}
+
+	entrypoint, err := os.ReadFile(filepath.Join(root, "deploy/entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(entrypoint, []byte("mkdir -p /opt/pitr")) {
+		t.Error("全新容器启动前必须创建运行时状态目录")
+	}
+	for _, required := range []string{
+		`if juicefs status "$PG_DSN"`,
+		`/usr/local/bin/pitrd`,
+		`--check-compatibility`,
+		`log "校准 MVCC schema..."`,
+	} {
+		if !bytes.Contains(entrypoint, []byte(required)) {
+			t.Errorf("entrypoint 缺少 schema 变更前 ABI 校验 %q", required)
+		}
+	}
+	if bytes.Index(entrypoint, []byte("--check-compatibility")) >
+		bytes.Index(entrypoint, []byte(`log "校准 MVCC schema..."`)) {
+		t.Error("已有卷 ABI 校验必须发生在 schema 校准之前")
+	}
+}
+
 func TestEntrypoint_GracefullyStopsPostgres(t *testing.T) {
 	root := repoRoot(t)
 	content, err := os.ReadFile(filepath.Join(root, "deploy/entrypoint.sh"))

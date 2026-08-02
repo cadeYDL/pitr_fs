@@ -43,7 +43,7 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" \
     -e POSTGRES_PASSWORD=x -e POSTGRES_DB=postgres \
     -p 127.0.0.1:$PORT:5432 \
-    postgres:16 >/dev/null
+    postgres:16.14-bookworm >/dev/null
 
 until docker exec "$CONTAINER" psql -h 127.0.0.1 -U postgres -d postgres \
     -qtAX -c "SELECT 1" >/dev/null 2>&1; do sleep 0.5; done

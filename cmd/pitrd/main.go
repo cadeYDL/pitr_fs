@@ -21,6 +21,7 @@ import (
 
 	pb "pitr_fs/api/pitrd/v1"
 	"pitr_fs/internal/buildinfo"
+	juicefsabi "pitr_fs/internal/juicefsabi/v1"
 	pitrmount "pitr_fs/internal/mount"
 	"pitr_fs/internal/pg"
 	"pitr_fs/internal/proxy"
@@ -39,6 +40,7 @@ var (
 	flagGCInterval time.Duration
 	flagGCThreads  int
 	flagJFSCache   int
+	flagCheckABI   bool
 )
 
 func main() {
@@ -63,6 +65,8 @@ gRPC 控制面 unix socket。`,
 	root.Flags().IntVar(&flagGCThreads, "gc-threads", 4, "JuiceFS GC 对象删除并发数")
 	root.Flags().IntVar(&flagJFSCache, "jfs-cache-size", 1024,
 		"JuiceFS 本地缓存上限(MiB)")
+	root.Flags().BoolVar(&flagCheckABI, "check-compatibility", false,
+		"只读校验固定 JuiceFS/PostgreSQL ABI 后退出")
 	root.SetContext(ctx)
 
 	if err := root.Execute(); err != nil {
@@ -100,6 +104,17 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		MetaURL:      dsn,
 		MountPoint:   flagJFSMount,
 		CacheSizeMiB: flagJFSCache,
+	}
+	if err := juicefsabi.ValidateBinary(cmd.Context(), jfs.Binary); err != nil {
+		return fmt.Errorf("校验 JuiceFS 运行时: %w", err)
+	}
+	if err := juicefsabi.ValidateMetadata(cmd.Context(), db); err != nil {
+		return fmt.Errorf("校验 JuiceFS 元数据 ABI: %w", err)
+	}
+	slog.Info("JuiceFS compatibility contract verified",
+		"contract", juicefsabi.Contract())
+	if flagCheckABI {
+		return nil
 	}
 	if err := jfs.Start(cmd.Context()); err != nil {
 		return fmt.Errorf("挂载 JuiceFS: %w", err)

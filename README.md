@@ -27,6 +27,8 @@ pitr-fs 是运行在 JuiceFS 之上的时间回溯文件系统。它透明拦截
 - 支持目录范围 `diff`、服务恢复以及 Go/Python SDK。
 - 支持带 SHA256 校验的本地逻辑升级包；升级只重启 `pitrd`/FUSE，不重建
   容器、PostgreSQL 或数据卷，并可回退到上一个逻辑版本。
+- 固定使用 JuiceFS v1.3.0 LTS 和 PostgreSQL 16.14；启动时校验二进制补丁
+  标记、MetaVersion、内部字段类型和唯一键，不在未知元数据结构上运行。
 
 内容摘要是有界诊断信息，不是完整 diff：每个文件最多读取前 4 KiB，一个
 写窗口最多保留 3 个 64 B 样本；二进制文件只显示类型和大小。进程命令从
@@ -123,7 +125,10 @@ pitr status
 不支持的内核会收到明确错误，不会降级到无法保证升级写入原子性的缓存写模式。
 
 用户不需要单独安装、初始化或配置 JuiceFS 和 PostgreSQL：它们由 pitr-fs 镜像
-在内部管理。
+在内部管理。镜像不会运行 JuiceFS 的在线安装脚本，也不会在构建时获取
+`latest`：JuiceFS 固定到 v1.3.0 的指定 commit，PostgreSQL 固定到 16.14
+镜像摘要。首次从源码构建镜像时 JuiceFS 编译耗时较长，后续由 Docker 层缓存；
+发布产物应由 CI 预构建，普通用户安装时只拉取并校验固定镜像或二进制。
 
 安装只启动服务，不会擅自占用用户目录。默认允许挂载到 `/pitr` 的子目录；
 可在首次安装时通过 `PITR_MOUNT_ROOT=/自定义根目录` 修改。挂载根不能是 `/`。
@@ -261,6 +266,13 @@ pitr upgrade --rollback
 源码执行一次 `./install.sh install`；安装器会写入稳定的宿主分发器，此后升级包
 会连同升级器自身一起更新，普通逻辑升级不再重建容器。基础镜像、PostgreSQL 或
 JuiceFS 自身升级仍属于完整容器升级，不在 `pitr upgrade` 的范围内。
+
+从早期“构建时下载 latest JuiceFS”的安装迁移到本版本时，需要在源码目录重新
+执行一次 `./install.sh install`，不能只执行 `pitr upgrade`。安装器会重建容器，
+但继续挂载原 PostgreSQL、对象数据和缓存卷；开始前仍建议完成卷级备份。迁移入口
+会在应用任何 pitr schema 之前只读校验 JuiceFS/PostgreSQL ABI，不兼容时直接
+停止。JuiceFS 1.4.0、MetaVersion 1 创建的旧测试卷已经完成读取、继续写入和历史
+回滚验证；使用其他版本或特殊元数据功能的卷仍应先在副本上验收。
 
 恢复服务、卸载或彻底清理：
 
@@ -506,6 +518,28 @@ JuiceFS 读缓存通过 `PITR_JFS_CACHE_SIZE` 限制，默认 1024 MiB，并存�
 累计到 GC 请求。空间水位与版本数上限同时生效，任何一项超限都会触发裁剪；
 空间策略允许最终删除全部用户版本，但永远不会为了配额删除当前文件内容。
 如果当前文件本身已经超过高水位，系统会报告超限，删除历史也无法继续降低。
+
+### 固定运行时与内部 ABI
+
+pitr-fs 为恢复内容必须访问 JuiceFS 的 `jfs_node`、`jfs_edge`、`jfs_chunk`、
+`jfs_chunk_ref` 和 `jfs_delslices`。这些属于 JuiceFS 内部实现，而不是公共稳定
+API，因此所有依赖集中在 `internal/juicefsabi/v1` 契约中。`pitrd` 在挂载前
+检查以下条件，任意一项不满足都会直接拒绝启动：
+
+- JuiceFS 是固定 v1.3.0 commit 构建，且带 `pitrfs.1` 补丁标记；
+- PostgreSQL 主版本为 16，镜像构建固定到 16.14；
+- JuiceFS `MetaVersion=1`；
+- pitr-fs 使用的字段类型、唯一键和 24/12 字节 slice 编码契约保持不变。
+
+固定 JuiceFS 补丁只在 `doCompactChunk` 的 PostgreSQL 事务中设置
+`pitr.internal_op=compact`，不改变表结构、slice 编码和对象命名。版本触发器
+据此跳过物理 Compaction，避免回滚把已经压缩的 slice 布局恢复成碎片状态；
+引用计数和空间统计仍照常更新。源码、固定 commit、补丁与升级审核规则见
+[`third_party/juicefs/README.md`](third_party/juicefs/README.md)。
+
+`pitr upgrade` 只更新 pitr/pitrd/schema 逻辑，不替换 JuiceFS、PostgreSQL 或
+容器基础镜像。只有遇到阻断性上游问题并完成新的 ABI、迁移和回归测试后，才会
+考虑升级这些基础运行时。
 
 ## 后续演进设想
 

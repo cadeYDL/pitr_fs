@@ -1,0 +1,32 @@
+From 6d63ae97d8f9e649337b5bcc8458e5b61acebd79 Mon Sep 17 00:00:00 2001
+From: pitr-fs maintainers <noreply@pitr-fs.local>
+Date: Sat, 2 Aug 2026 00:00:00 +0800
+Subject: [PATCH] meta: mark PostgreSQL chunk compaction transactions
+
+pitr-fs captures JuiceFS metadata changes through PostgreSQL triggers. Mark
+physical chunk compaction explicitly so it is not mistaken for a user write
+when an automatic version window is open.
+---
+ pkg/meta/sql.go | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/pkg/meta/sql.go b/pkg/meta/sql.go
+index 348273f..11917f1 100644
+--- a/pkg/meta/sql.go
++++ b/pkg/meta/sql.go
+@@ -3187,6 +3187,13 @@ func (m *dbMeta) cleanupDelayedSlices(ctx Context, edge int64, limit int) (int,
+ 
+ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
+ 	st := errno(m.txn(func(s *xorm.Session) error {
++		// pitr-fs 只支持 PostgreSQL。事务内标记让元数据触发器准确区分
++		// 物理 Compaction 与用户写入，事务结束后 PostgreSQL 自动清除。
++		if m.Name() == "postgres" {
++			if _, err := s.Exec("SELECT set_config('pitr.internal_op', 'compact', true)"); err != nil {
++				return err
++			}
++		}
+ 		var c2 = chunk{Inode: inode, Indx: indx}
+ 		_, err := s.ForUpdate().MustCols("indx").Get(&c2)
+ 		if err != nil {
+-- 
+2.50.1

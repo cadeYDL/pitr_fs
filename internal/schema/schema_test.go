@@ -52,7 +52,7 @@ func runWithDocker(m *testing.M) (int, error) {
 	// 测试仅支持 Linux，直接通过 Docker bridge 地址连接隔离 PostgreSQL。
 	out, err := exec.Command("docker", "run", "-d", "--name", name,
 		"-e", "POSTGRES_PASSWORD=x", "-e", "POSTGRES_DB=postgres",
-		"postgres:16").CombinedOutput()
+		"postgres:16.14-bookworm").CombinedOutput()
 	if err != nil {
 		return 1, fmt.Errorf("docker run: %w: %s", err, out)
 	}
@@ -390,6 +390,52 @@ func TestTrigger_OpenAutoFallback(t *testing.T) {
 		"SELECT count(*) FROM pitr_node_history WHERE txn_id=$1 AND inode=211", autoID)
 	if got != 0 {
 		t.Fatalf("auto 窗口关闭后不应继续捕获,实际 %d", got)
+	}
+}
+
+// JuiceFS Compaction 可能与用户写窗口重叠。固定 JuiceFS 补丁会在它自己的
+// PostgreSQL 事务设置 pitr.internal_op=compact；这类物理重写不能进入用户
+// 版本，否则 revert 会恢复更碎片化的 slice 布局。
+func TestTrigger_CompactOperationBypassesOpenAuto(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn, `
+		INSERT INTO jfs_chunk(inode,indx,slices)
+		VALUES (215,0,decode('000000000000000000000385000000040000000000000004','hex'))`)
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn(version_hash,parent_id,scope_path,state,command)
+		VALUES ('compact00001',1,'/a','auto','write:/a/f') RETURNING id`)
+
+	tx, err := conn.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(),
+		"SELECT set_config('pitr.internal_op','compact',true)"); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE jfs_chunk
+		   SET slices=decode('000000000000000000000386000000040000000000000004','hex')
+		 WHERE inode=215 AND indx=0`); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatal(err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got := mustScalarInt(t, conn, `
+		SELECT count(*) FROM pitr_chunk_history
+		 WHERE txn_id=$1 AND inode=215 AND indx=0`, autoID)
+	if got != 0 {
+		t.Fatalf("Compaction 不应进入开放 auto 版本，实际捕获 %d 条", got)
 	}
 }
 

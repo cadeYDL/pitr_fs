@@ -30,7 +30,7 @@ echo "==> 1/5 启动 PG"
 docker run -d --name pitr-bench-pg \
     -e POSTGRES_USER=pitr -e POSTGRES_PASSWORD=pitr -e POSTGRES_DB=postgres \
     -p 127.0.0.1:55433:5432 \
-    postgres:16 >/dev/null
+    postgres:16.14-bookworm >/dev/null
 
 until docker exec pitr-bench-pg pg_isready -U pitr >/dev/null 2>&1; do sleep 1; done
 

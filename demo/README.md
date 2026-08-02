@@ -21,7 +21,7 @@
 
 - 本地已装 Docker
 - 本地已装 `curl`
-- Linux / macOS 均可
+- Linux（pitr-fs 服务端不支持 macOS 或 Windows）
 
 ## 1. 起 PostgreSQL 容器
 
@@ -31,7 +31,7 @@ docker run -d --name pitr-demo-pg \
   -e POSTGRES_PASSWORD=pitr \
   -e POSTGRES_DB=pitr_fs \
   -p 127.0.0.1:55432:5432 \
-  postgres:16
+  postgres:16.14-bookworm
 
 # 等就绪
 until docker exec pitr-demo-pg pg_isready -U pitr -d pitr_fs >/dev/null 2>&1; do
@@ -40,14 +40,21 @@ done
 echo "PG ready"
 ```
 
-## 2. 安装 JuiceFS 客户端(如未装)
+## 2. 准备固定 JuiceFS 客户端
+
+该目录是早期机制 Demo，不是生产安装入口。为避免元数据结构漂移，运行时必须
+使用主项目镜像中固定的 JuiceFS v1.3.0 `pitrfs.1` 构建，不能通过官方在线
+安装脚本下载 `latest`。普通用户应直接按根目录 README 使用 `install.sh`，无需
+执行本 Demo。
+
+开发者确需运行 Demo 时，可从已经构建的项目镜像复制固定客户端：
 
 ```bash
-# Linux
-curl -sSL https://d.juicefs.com/install | sh -
-
-# macOS 建议用 Homebrew: brew install juicefs
-juicefs --version
+container_id="$(docker create pitr-fs:latest)"
+docker cp "$container_id:/usr/local/bin/juicefs" /tmp/juicefs
+docker rm "$container_id"
+sudo install -m 0755 /tmp/juicefs /usr/local/bin/juicefs
+juicefs version
 ```
 
 ## 3. 格式化 JuiceFS 卷 + 挂载

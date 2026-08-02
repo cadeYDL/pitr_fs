@@ -219,13 +219,18 @@ UPDATE pitr_txn
 --   2. GUC 为空时,归到最近的、尚未关闭的 auto 版本。Phase 3 的代理层保证
 --      单 daemon 内一次只开放一个 auto 窗口,JuiceFS 独立进程的写事务便可
 --      通过这个窗口获得稳定 txn_id;
---   3. 两者都不存在时视为 JuiceFS 内部操作,不记录历史。
+--   3. 固定 JuiceFS 补丁在 Compaction 事务设置 pitr.internal_op=compact，
+--      即使此时存在开放 auto 窗口也不捕获，避免版本回退撤销物理压缩；
+--   4. 以上归属都不存在时视为其他 JuiceFS 内部操作,不记录历史。
 
 CREATE OR REPLACE FUNCTION pitr_current_txn() RETURNS bigint AS $$
 DECLARE
     v_txn text := current_setting('pitr.current_txn', true);
 BEGIN
     IF current_setting('pitr.suppress_capture', true) = 'on' THEN
+        RETURN NULL;
+    END IF;
+    IF current_setting('pitr.internal_op', true) = 'compact' THEN
         RETURN NULL;
     END IF;
     IF v_txn IS NULL OR v_txn = '' THEN

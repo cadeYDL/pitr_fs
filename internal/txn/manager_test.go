@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 	name := fmt.Sprintf("pitr-txn-test-%d", os.Getpid())
 	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name,
 		"-e", "POSTGRES_PASSWORD=x", "-e", "POSTGRES_DB=pitr_txn_test",
-		"postgres:16").CombinedOutput()
+		"postgres:16.14-bookworm").CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动 PostgreSQL: %v: %s\n", err, out)
 		os.Exit(1)
