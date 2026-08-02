@@ -70,6 +70,9 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 		`source=$RUNTIME_DIR,target=/opt/pitr`,
 		`install_host_upgrader`,
 		`SAVED_RUNTIME_DIR=%q`,
+		`SAVED_UPDATE_REPOSITORY=%q`,
+		`pitr-host-upgrade-builtin`,
+		`current/pitr-host-upgrade`,
 		`prepare_schema_marker`,
 	} {
 		if !bytes.Contains(install, []byte(required)) {
@@ -86,7 +89,14 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 		"请确保当前没有任何写入操作",
 		"非交互升级必须显式指定 --yes",
 		`/run/pitr/discard-open-writes`,
-		`--bundle <本地升级包>`,
+		`--bundle PATH`,
+		`pitr upgrade [版本]`,
+		`download_release_bundle`,
+		`release_asset_from_json`,
+		`asset.get("digest") or ""`,
+		`--proto '=https'`,
+		`PITR_UPDATE_REPOSITORY`,
+		`pitr-host-upgrade init_pitr.sql`,
 		`upgrade-fallback`,
 		`request_restart`,
 		`文件系统未能安全卸载，逻辑版本未切换`,
@@ -102,6 +112,89 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 	if bytes.Contains(upgrader, []byte("docker rm")) ||
 		bytes.Contains(upgrader, []byte("docker run")) {
 		t.Error("逻辑升级器不应删除或重建容器")
+	}
+}
+
+func TestLogicUpgrade_SelectsNewestPublishedReleaseIncludingPrerelease(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	metadata := filepath.Join(temp, "releases.json")
+	fixture := `[
+  {"tag_name":"v1.0.0","draft":false,"prerelease":false,
+   "published_at":"2026-01-01T00:00:00Z","assets":[]},
+  {"tag_name":"dev-new","draft":false,"prerelease":true,
+   "published_at":"2026-08-02T00:00:00Z","assets":[
+     {"name":"pitr-fs_dev-new_linux_arm64.tar.gz","state":"uploaded",
+      "browser_download_url":"https://github.com/example/release/dev-new.tar.gz",
+      "digest":"sha256:` + digest + `"}]},
+  {"tag_name":"ignored-draft","draft":true,"prerelease":false,
+   "published_at":"2027-01-01T00:00:00Z","assets":[]}
+]`
+	if err := os.WriteFile(metadata, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+release_asset_from_json "$2" "" arm64
+`, "bash", script, metadata)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("解析最新 Release: %v\n%s", err, output)
+	}
+	want := "dev-new\nhttps://github.com/example/release/dev-new.tar.gz\nsha256:" + digest + "\n"
+	if string(output) != want {
+		t.Fatalf("release info=%q want=%q", output, want)
+	}
+}
+
+func TestLogicUpgrade_RejectsReleaseWithoutGitHubDigest(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadata := filepath.Join(temp, "release.json")
+	fixture := `{"tag_name":"dev-unsafe","draft":false,
+"published_at":"2026-08-02T00:00:00Z","assets":[
+{"name":"pitr-fs_dev-unsafe_linux_amd64.tar.gz","state":"uploaded",
+"browser_download_url":"https://github.com/example/unsafe.tar.gz","digest":null}]}`
+	if err := os.WriteFile(metadata, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+release_asset_from_json "$2" dev-unsafe amd64
+`, "bash", script, metadata)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	if output, err := command.CombinedOutput(); err == nil ||
+		!bytes.Contains(output, []byte("缺少 GitHub SHA256 摘要")) {
+		t.Fatalf("缺少摘要应失败: err=%v output=%s", err, output)
+	}
+}
+
+func TestBuildUpgradeBundleSupportsLinuxArchitecturesAndSelfUpdate(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root,
+		"scripts", "build-upgrade-bundle.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`PITR_GOARCH`, `GOOS=linux GOARCH="$goarch"`,
+		`pitr-host-upgrade`, `goarch=%s`,
+	} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("升级包构建器缺少 %q", required)
+		}
 	}
 }
 
@@ -147,6 +240,58 @@ test -s "$RUNTIME_DIR/schema.applied.sha256"
 `, "bash", functions, fakeDocker, runtimeDir)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("stopped 容器 schema marker 回退失败: %v\n%s", err, output)
+	}
+}
+
+func TestInstall_HostUpgradeDispatcherFollowsCurrentRuntime(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\ninstall_main() {\n")
+	index := bytes.Index(content, marker)
+	if index < 0 {
+		t.Fatal("install.sh 未找到主命令 case")
+	}
+	temp := t.TempDir()
+	functions := filepath.Join(temp, "install-functions.sh")
+	if err := os.WriteFile(functions, content[:index], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := filepath.Join(temp, "runtime with space")
+	versionDir := filepath.Join(runtimeDir, "versions", "dev-test")
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	currentHelper := filepath.Join(versionDir, "pitr-host-upgrade")
+	if err := os.WriteFile(currentHelper,
+		[]byte("#!/bin/sh\nprintf 'current:%s\\n' \"$1\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("versions/dev-test", filepath.Join(runtimeDir, "current")); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := filepath.Join(temp, "bin", "pitr-host-upgrade")
+	if err := os.Mkdir(filepath.Dir(dispatcher), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	generate := exec.Command("bash", "-c", `
+source "$1"
+RUNTIME_DIR=$2
+HOST_UPGRADER=$3
+SCRIPT_DIR=$4
+install_host_upgrader
+`, "bash", functions, runtimeDir, dispatcher, root)
+	if output, err := generate.CombinedOutput(); err != nil {
+		t.Fatalf("生成宿主升级分发器: %v\n%s", err, output)
+	}
+	output, err := exec.Command(dispatcher, "v1.2.3").CombinedOutput()
+	if err != nil {
+		t.Fatalf("执行宿主升级分发器: %v\n%s", err, output)
+	}
+	if string(output) != "current:v1.2.3\n" {
+		t.Fatalf("分发器未使用 current 升级器: %q", output)
 	}
 }
 

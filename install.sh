@@ -21,6 +21,8 @@ CACHE_VOLUME_MANAGED="${SAVED_CACHE_VOLUME_MANAGED:-}"
 BLOCK_PATH="${PITR_BLOCK_PATH:-${SAVED_BLOCK_PATH:-}}"
 RUNTIME_DIR="${PITR_RUNTIME_DIR:-${SAVED_RUNTIME_DIR:-/var/lib/pitr-fs/runtime}}"
 HOST_UPGRADER="${PITR_HOST_UPGRADER:-${SAVED_HOST_UPGRADER:-/usr/local/lib/pitr-fs/pitr-host-upgrade}}"
+UPDATE_REPOSITORY="${PITR_UPDATE_REPOSITORY:-${SAVED_UPDATE_REPOSITORY:-cadeYDL/pitr_fs}}"
+UPDATE_API_URL="${PITR_UPDATE_API_URL:-${SAVED_UPDATE_API_URL:-https://api.github.com}}"
 READY_TIMEOUT="${PITR_READY_TIMEOUT:-120}"
 DOCKER_COMMAND=(docker)
 
@@ -46,6 +48,8 @@ usage() {
   PITR_JFS_CACHE_SIZE JuiceFS 本地缓存上限 MiB (默认 1024)
   PITR_BLOCK_PATH  用户已挂载的块存储目录；为空时使用本地 Docker volume
   PITR_RUNTIME_DIR pitr/pitrd 版本化逻辑目录 (默认 /var/lib/pitr-fs/runtime)
+  PITR_UPDATE_REPOSITORY 自动升级使用的 GitHub owner/repo (默认 cadeYDL/pitr_fs)
+  PITR_UPDATE_API_URL GitHub Release API 地址 (默认 https://api.github.com)
   PITR_STORAGE     JuiceFS 存储后端 (默认 file); s3/minio/oss/cos/...
   PITR_BUCKET      存储 bucket URL / 本地路径 (默认容器内 /data)
   PITR_GC_INTERVAL 对象 GC 合并执行间隔 (默认 10m; 0 停用)
@@ -115,6 +119,14 @@ validate_mount_root() {
     case "$HOST_UPGRADER" in
         /*) ;;
         *) echo "错误: PITR_HOST_UPGRADER 必须是绝对路径: $HOST_UPGRADER" >&2; exit 1 ;;
+    esac
+    if [[ ! "$UPDATE_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+        echo "错误: PITR_UPDATE_REPOSITORY 必须是 owner/repo: $UPDATE_REPOSITORY" >&2
+        exit 1
+    fi
+    case "$UPDATE_API_URL" in
+        https://*) ;;
+        *) echo "错误: PITR_UPDATE_API_URL 必须使用 HTTPS: $UPDATE_API_URL" >&2; exit 1 ;;
     esac
 }
 
@@ -364,10 +376,24 @@ EOF2
 }
 
 install_host_upgrader() {
-    local sudo
+    local sudo quoted_runtime
+    sudo=$(sudo_if_needed "$RUNTIME_DIR/pitr-host-upgrade-builtin")
+    $sudo install -m 0755 "$SCRIPT_DIR/scripts/pitr-host-upgrade.sh" \
+        "$RUNTIME_DIR/pitr-host-upgrade-builtin"
     sudo=$(sudo_if_needed "$HOST_UPGRADER")
     $sudo install -d -m 0755 "$(dirname "$HOST_UPGRADER")"
-    $sudo install -m 0755 "$SCRIPT_DIR/scripts/pitr-host-upgrade.sh" "$HOST_UPGRADER"
+    printf -v quoted_runtime '%q' "$RUNTIME_DIR"
+    $sudo tee "$HOST_UPGRADER" >/dev/null <<EOF2
+#!/usr/bin/env bash
+set -euo pipefail
+runtime_dir=$quoted_runtime
+upgrader="\$runtime_dir/pitr-host-upgrade-builtin"
+if [ -x "\$runtime_dir/current/pitr-host-upgrade" ]; then
+    upgrader="\$runtime_dir/current/pitr-host-upgrade"
+fi
+exec "\$upgrader" "\$@"
+EOF2
+    $sudo chmod 0755 "$HOST_UPGRADER"
 }
 
 write_install_config() {
@@ -388,6 +414,8 @@ write_install_config() {
         printf 'SAVED_BLOCK_PATH=%q\n' "$BLOCK_PATH"
         printf 'SAVED_RUNTIME_DIR=%q\n' "$RUNTIME_DIR"
         printf 'SAVED_HOST_UPGRADER=%q\n' "$HOST_UPGRADER"
+        printf 'SAVED_UPDATE_REPOSITORY=%q\n' "$UPDATE_REPOSITORY"
+        printf 'SAVED_UPDATE_API_URL=%q\n' "$UPDATE_API_URL"
     } | $sudo tee "$INSTALL_CONFIG" >/dev/null
     $sudo chmod 0644 "$INSTALL_CONFIG"
 }

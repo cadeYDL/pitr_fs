@@ -221,15 +221,26 @@ cat quickstart/test.txt
 pitr version
 ```
 
-项目尚未发布稳定 Release，`pitr upgrade` 当前不会自动跟踪不稳定的 `main`。
-可在 Linux 构建并使用本地逻辑升级包：
+默认从 GitHub Releases 下载最新已发布版本；dev/test Pre-release 使用明确的
+`dev-*`/`test-*` 版本号，不会伪装成正式版本。也可以指定不可变版本，或继续
+使用本地离线包：
 
 ```bash
+pitr upgrade --check
+pitr upgrade
+pitr upgrade dev-0123456789ab
+
+# 离线升级
 mkdir -p dist
 PITR_VERSION=dev-test ./scripts/build-upgrade-bundle.sh dist/pitr-dev-test.tar.gz
 pitr upgrade --bundle dist/pitr-dev-test.tar.gz --check
 pitr upgrade --bundle dist/pitr-dev-test.tar.gz
 ```
+
+远端升级会根据 Linux CPU 自动选择 `amd64` 或 `arm64` 资产，先校验 GitHub
+Release API 提供的 SHA256 摘要，再校验包内每个文件。默认仓库是
+`cadeYDL/pitr_fs`；私有镜像或 fork 可在安装时设置
+`PITR_UPDATE_REPOSITORY=owner/repo`，私有仓库可临时通过 `GITHUB_TOKEN` 下载。
 
 实际升级前会提示：文件系统服务和挂载将短暂中断，请先确保没有写入。交互确认后，
 升级器先原子冻结写入口；冻结后的创建、覆盖、删除、重命名等操作会直接返回
@@ -245,8 +256,9 @@ pitr upgrade --bundle dist/pitr-dev-test.tar.gz
 pitr upgrade --rollback
 ```
 
-老安装首次启用版本化逻辑目录时，需要先使用包含该能力的新版源码执行一次
-`./install.sh install`；此后普通逻辑升级不再重建容器。基础镜像、PostgreSQL 或
+老安装首次启用版本化逻辑目录或自动下载升级器时，需要先使用包含该能力的新版
+源码执行一次 `./install.sh install`；安装器会写入稳定的宿主分发器，此后升级包
+会连同升级器自身一起更新，普通逻辑升级不再重建容器。基础镜像、PostgreSQL 或
 JuiceFS 自身升级仍属于完整容器升级，不在 `pitr upgrade` 的范围内。
 
 恢复服务、卸载或彻底清理：

@@ -150,11 +150,11 @@ func newVersionCmd() *cobra.Command {
 
 func newUpgradeCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "upgrade",
+		Use:   "upgrade [版本]",
 		Short: "升级或回退 pitr/pitrd 逻辑版本",
 		Long: `升级由 Linux 宿主机安装的 pitr wrapper 执行。
-默认不会跟踪未发布的 main；当前请使用经过校验的本地升级包。`,
-		Args: cobra.NoArgs,
+		省略版本时下载最新 GitHub Release，也可指定版本或使用本地升级包。`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(*cobra.Command, []string) error {
 			return errors.New("upgrade 只能通过 Linux 宿主机安装的 pitr wrapper 执行")
 		},

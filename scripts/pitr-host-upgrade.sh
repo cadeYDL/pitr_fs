@@ -13,23 +13,28 @@ source "$INSTALL_CONFIG"
 
 CONTAINER=${PITR_CONTAINER:-${SAVED_CONTAINER:-pitrfs}}
 RUNTIME_DIR=${PITR_RUNTIME_DIR:-${SAVED_RUNTIME_DIR:-/var/lib/pitr-fs/runtime}}
+HOST_UPGRADER=${PITR_HOST_UPGRADER:-${SAVED_HOST_UPGRADER:-/usr/local/lib/pitr-fs/pitr-host-upgrade}}
+UPDATE_REPOSITORY=${PITR_UPDATE_REPOSITORY:-${SAVED_UPDATE_REPOSITORY:-cadeYDL/pitr_fs}}
+UPDATE_API_URL=${PITR_UPDATE_API_URL:-${SAVED_UPDATE_API_URL:-https://api.github.com}}
 READY_TIMEOUT=${PITR_READY_TIMEOUT:-120}
 DOCKER_COMMAND=(docker)
 
 usage() {
     cat <<'EOF'
 用法:
+  pitr upgrade [版本] [--check] [--yes]
   pitr upgrade --bundle <升级包.tar.gz> [--check] [--yes]
   pitr upgrade --rollback [--yes]
 
 选项:
+  版本           下载指定 GitHub Release；省略时下载最新已发布版本
   --bundle PATH  使用本地、带 SHA256 校验的逻辑升级包
   --check        只校验升级包，不停止服务
   --rollback     回退到上一个逻辑版本
   --yes          非交互确认服务中断
   -h, --help     显示帮助
 
-当前尚未发布稳定 Release；无 --bundle 时不会自动跟踪 main。
+dev/test Pre-release 与正式版本使用不同版本号，但都属于“已发布版本”。
 EOF
 }
 
@@ -64,10 +69,11 @@ validate_bundle() {
     local bundle=$1 work=$2 listed expected version binary_version
     [ -f "$bundle" ] || { echo "错误: 升级包不存在: $bundle" >&2; return 1; }
     listed=$(tar -tzf "$bundle" | LC_ALL=C sort)
-    expected=$(printf '%s\n' BUILD-INFO SHA256SUMS VERSION init_pitr.sql pitr pitrd |
+    expected=$(printf '%s\n' BUILD-INFO SHA256SUMS VERSION init_pitr.sql \
+        pitr pitr-host-upgrade pitrd |
         LC_ALL=C sort)
     [ "$listed" = "$expected" ] || {
-        echo "错误: 升级包只能包含 pitr、pitrd、schema 和校验清单" >&2
+        echo "错误: 升级包只能包含 pitr、pitrd、宿主升级器、schema 和校验清单" >&2
         return 1
     }
     if tar -tvzf "$bundle" | awk '$1 !~ /^-/ { exit 1 }'; then
@@ -77,7 +83,7 @@ validate_bundle() {
         return 1
     fi
     tar -xzf "$bundle" -C "$work" --no-same-owner --no-same-permissions -- \
-        pitr pitrd init_pitr.sql VERSION BUILD-INFO SHA256SUMS
+        pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO SHA256SUMS
     (cd "$work" && sha256sum -c SHA256SUMS >/dev/null) || {
         echo "错误: 升级包 SHA256 校验失败" >&2
         return 1
@@ -90,7 +96,7 @@ validate_bundle() {
     case "$version" in
         ''|*[!A-Za-z0-9._+-]*) echo "错误: VERSION 包含非法字符" >&2; return 1 ;;
     esac
-    chmod 0755 "$work/pitr" "$work/pitrd"
+    chmod 0755 "$work/pitr" "$work/pitrd" "$work/pitr-host-upgrade"
     binary_version=$("$work/pitr" version --client-only |
         awk '$1=="pitr" { print $2; exit }')
     [ "$binary_version" = "$version" ] || {
@@ -98,6 +104,121 @@ validate_bundle() {
         return 1
     }
     printf '%s\n' "$version"
+}
+
+release_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) echo "错误: 暂不支持当前 CPU 架构: $(uname -m)" >&2; return 1 ;;
+    esac
+}
+
+# 输出三行: tag、asset URL、GitHub 计算的 sha256 摘要。
+release_asset_from_json() {
+    local metadata=$1 requested=$2 arch=$3
+    python3 - "$metadata" "$requested" "$arch" <<'PY'
+import json
+import re
+import sys
+
+path, requested, arch = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+if isinstance(payload, list):
+    releases = [release for release in payload if not release.get("draft")]
+    if not releases:
+        raise SystemExit("错误: 仓库尚无已发布版本")
+    release = max(releases, key=lambda item: item.get("published_at") or "")
+elif isinstance(payload, dict) and payload.get("tag_name"):
+    release = payload
+else:
+    message = payload.get("message", "响应格式无效") if isinstance(payload, dict) else "响应格式无效"
+    raise SystemExit(f"错误: 无法解析 GitHub Release: {message}")
+
+tag = release.get("tag_name", "")
+if requested and tag != requested:
+    raise SystemExit(f"错误: 请求版本 {requested}，GitHub 返回 {tag or '<空>'}")
+if not re.fullmatch(r"[A-Za-z0-9._+-]+", tag):
+    raise SystemExit(f"错误: Release 版本号包含非法字符: {tag!r}")
+
+expected = f"pitr-fs_{tag}_linux_{arch}.tar.gz"
+asset = next((item for item in release.get("assets", [])
+              if item.get("name") == expected and item.get("state") == "uploaded"), None)
+if asset is None:
+    raise SystemExit(f"错误: Release {tag} 缺少 {expected}")
+url = asset.get("browser_download_url", "")
+digest = asset.get("digest") or ""
+if not url.startswith("https://"):
+    raise SystemExit("错误: Release 资产下载地址不是 HTTPS")
+if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+    raise SystemExit(f"错误: Release 资产 {expected} 缺少 GitHub SHA256 摘要")
+print(tag)
+print(url)
+print(digest.lower())
+PY
+}
+
+download_release_bundle() {
+    local requested=$1 work=$2 arch metadata endpoint asset_url digest tag bundle actual
+    local auth_config
+    local -a curl_headers release_info
+    arch=$(release_arch) || return 1
+    metadata="$work/release.json"
+    if [[ ! "$UPDATE_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+        echo "错误: PITR_UPDATE_REPOSITORY 必须是 owner/repo: $UPDATE_REPOSITORY" >&2
+        return 1
+    fi
+    case "$UPDATE_API_URL" in
+        https://*) ;;
+        *) echo "错误: PITR_UPDATE_API_URL 必须使用 HTTPS: $UPDATE_API_URL" >&2; return 1 ;;
+    esac
+    if [ -n "$requested" ]; then
+        endpoint="$UPDATE_API_URL/repos/$UPDATE_REPOSITORY/releases/tags/$requested"
+    else
+        # /releases/latest 会排除 Pre-release；这里按 published_at 选最新已发布项。
+        endpoint="$UPDATE_API_URL/repos/$UPDATE_REPOSITORY/releases?per_page=100"
+    fi
+    curl_headers=(-H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28')
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        if [[ ! "$GITHUB_TOKEN" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "错误: GITHUB_TOKEN 格式无效" >&2
+            return 1
+        fi
+        auth_config="$work/curl-auth.conf"
+        (umask 077; printf 'header = "Authorization: Bearer %s"\n' \
+            "$GITHUB_TOKEN" >"$auth_config")
+        curl_headers+=(--config "$auth_config")
+    fi
+    if ! curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 "${curl_headers[@]}" \
+        -o "$metadata" "$endpoint"; then
+        echo "错误: 获取 GitHub Release 失败: ${requested:-latest}" >&2
+        return 1
+    fi
+    mapfile -t release_info < <(
+        release_asset_from_json "$metadata" "$requested" "$arch"
+    )
+    [ "${#release_info[@]}" -eq 3 ] || return 1
+    tag=${release_info[0]}
+    asset_url=${release_info[1]}
+    digest=${release_info[2]}
+    bundle="$work/pitr-fs_${tag}_linux_${arch}.tar.gz"
+    if ! curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 "${curl_headers[@]}" \
+        -o "$bundle" "$asset_url"; then
+        echo "错误: 下载 Release 资产失败: $asset_url" >&2
+        return 1
+    fi
+    actual=$(sha256sum "$bundle" | awk '{print $1}')
+    if [ "$actual" != "${digest#sha256:}" ]; then
+        echo "错误: GitHub Release 资产 SHA256 校验失败" >&2
+        return 1
+    fi
+    echo "已下载 $UPDATE_REPOSITORY 的 ${tag} (linux/$arch)" >&2
+    printf '%s\n' "$bundle"
 }
 
 confirm_downtime() {
@@ -281,7 +402,8 @@ install_version() {
     else
         local staging="$RUNTIME_DIR/versions/.${version}.$$"
         run_root install -d -m 0755 "$staging"
-        run_root install -m 0755 "$work/pitr" "$work/pitrd" "$staging/"
+        run_root install -m 0755 "$work/pitr" "$work/pitrd" \
+            "$work/pitr-host-upgrade" "$staging/"
         run_root install -m 0644 "$work/init_pitr.sql" "$work/VERSION" \
             "$work/BUILD-INFO" "$work/SHA256SUMS" "$staging/"
         run_root mv "$staging" "$destination"
@@ -361,77 +483,102 @@ perform_switch() {
     return 1
 }
 
-bundle=""
-rollback=0
-check_only=0
-assume_yes=0
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --bundle)
-            [ "$#" -ge 2 ] || { echo "错误: --bundle 缺少路径" >&2; exit 2; }
-            bundle=$2; shift 2 ;;
-        --rollback) rollback=1; shift ;;
-        --check) check_only=1; shift ;;
-        --yes) assume_yes=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "错误: 未知参数 $1" >&2; usage >&2; exit 2 ;;
-    esac
-done
+upgrade_main() (
+    local bundle="" requested_version="" rollback=0 check_only=0 assume_yes=0
+    local work version old old_expected expected
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --bundle)
+                [ "$#" -ge 2 ] || { echo "错误: --bundle 缺少路径" >&2; return 2; }
+                bundle=$2; shift 2 ;;
+            --rollback) rollback=1; shift ;;
+            --check) check_only=1; shift ;;
+            --yes) assume_yes=1; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) echo "错误: 未知参数 $1" >&2; usage >&2; return 2 ;;
+            *)
+                [ -z "$requested_version" ] || {
+                    echo "错误: 只能指定一个版本" >&2
+                    return 2
+                }
+                requested_version=$1
+                shift
+                ;;
+        esac
+    done
 
-if [ "$rollback" -eq 1 ] && { [ -n "$bundle" ] || [ "$check_only" -eq 1 ]; }; then
-    echo "错误: --rollback 不能与 --bundle/--check 同时使用" >&2
-    exit 2
-fi
-if [ "$rollback" -eq 0 ] && [ -z "$bundle" ]; then
-    echo "错误: 暂无稳定 Release，不会自动跟踪 main；请使用 --bundle <本地升级包>" >&2
-    exit 2
-fi
-
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
-if [ "$rollback" -eq 0 ]; then
-    version=$(validate_bundle "$bundle" "$work")
-    if [ "$check_only" -eq 1 ]; then
-        echo "升级包校验通过: $version"
-        exit 0
+    if [ "$rollback" -eq 1 ] && {
+        [ -n "$bundle" ] || [ -n "$requested_version" ] || [ "$check_only" -eq 1 ];
+    }; then
+        echo "错误: --rollback 不能与版本、--bundle/--check 同时使用" >&2
+        return 2
     fi
-fi
+    if [ -n "$bundle" ] && [ -n "$requested_version" ]; then
+        echo "错误: 指定版本不能与 --bundle 同时使用" >&2
+        return 2
+    fi
+    if [ -n "$requested_version" ]; then
+        case "$requested_version" in
+            *[!A-Za-z0-9._+-]*)
+                echo "错误: 版本号包含非法字符: $requested_version" >&2
+                return 2
+                ;;
+        esac
+    fi
 
-configure_docker
-ensure_upgrade_capable
-confirm_downtime
-run_root install -d -m 0755 "$RUNTIME_DIR" "$RUNTIME_DIR/versions"
-old=$(runtime_name)
-old_expected=$(daemon_version)
-[ -n "$old_expected" ] || {
-    echo "错误: 无法读取当前 pitrd 版本" >&2
-    exit 1
-}
+    work=$(mktemp -d)
+    trap 'rm -rf -- "$work"' EXIT
+    if [ "$rollback" -eq 0 ]; then
+        if [ -z "$bundle" ]; then
+            bundle=$(download_release_bundle "$requested_version" "$work") || return 1
+        fi
+        version=$(validate_bundle "$bundle" "$work") || return 1
+        if [ "$check_only" -eq 1 ]; then
+            echo "升级包校验通过: $version"
+            return 0
+        fi
+    fi
 
-if [ "$rollback" -eq 1 ]; then
-    [ -r "$RUNTIME_DIR/previous" ] || {
-        echo "错误: 没有可回退的上一个逻辑版本" >&2
-        exit 1
+    configure_docker
+    ensure_upgrade_capable
+    run_root install -d -m 0755 "$RUNTIME_DIR" "$RUNTIME_DIR/versions"
+    old=$(runtime_name)
+    old_expected=$(daemon_version)
+    [ -n "$old_expected" ] || {
+        echo "错误: 无法读取当前 pitrd 版本" >&2
+        return 1
     }
-    version=$(cat "$RUNTIME_DIR/previous")
-    case "$version" in
-        builtin) ;;
-        ''|*[!A-Za-z0-9._+-]*|"$old")
-            echo "错误: 回退目标无效: $version" >&2; exit 1 ;;
-    esac
-else
-    [ "$version" != "$old" ] || {
-        echo "当前已经是逻辑版本 $version"
-        exit 0
+
+    if [ "$rollback" -eq 1 ]; then
+        [ -r "$RUNTIME_DIR/previous" ] || {
+            echo "错误: 没有可回退的上一个逻辑版本" >&2
+            return 1
+        }
+        version=$(cat "$RUNTIME_DIR/previous")
+        case "$version" in
+            builtin) ;;
+            ''|*[!A-Za-z0-9._+-]*|"$old")
+                echo "错误: 回退目标无效: $version" >&2; return 1 ;;
+        esac
+    else
+        [ "$version" != "$old" ] || {
+            echo "当前已经是逻辑版本 $version"
+            return 0
+        }
+        install_version "$work" "$version"
+    fi
+
+    expected=$(target_binary_version "$version")
+    [ -n "$expected" ] || {
+        echo "错误: 无法读取目标逻辑版本" >&2
+        return 1
     }
-    install_version "$work" "$version"
+
+    confirm_downtime
+    perform_switch "$version" "$old" "$expected" "$old_expected"
+    echo "逻辑版本已从 $old 切换到 $version；容器、PostgreSQL 和数据卷未重建"
+)
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    upgrade_main "$@"
 fi
-
-expected=$(target_binary_version "$version")
-[ -n "$expected" ] || {
-    echo "错误: 无法读取目标逻辑版本" >&2
-    exit 1
-}
-
-perform_switch "$version" "$old" "$expected" "$old_expected"
-echo "逻辑版本已从 $old 切换到 $version；容器、PostgreSQL 和数据卷未重建"

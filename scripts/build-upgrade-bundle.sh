@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 构建只包含 pitr/pitrd/schema 的离线逻辑升级包；不会发布 Release。
+# 构建 pitr/pitrd/schema/宿主升级器的 Linux 离线逻辑升级包；不会发布 Release。
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -29,6 +29,11 @@ case "$version" in
         ;;
 esac
 build_date=${PITR_BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+goarch=${PITR_GOARCH:-$(go env GOARCH)}
+case "$goarch" in
+    amd64|arm64) ;;
+    *) echo "错误: PITR_GOARCH 仅支持 amd64/arm64: $goarch" >&2; exit 2 ;;
+esac
 output=$(realpath -m -- "$1")
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
@@ -36,16 +41,23 @@ trap 'rm -rf -- "$work"' EXIT
 ldflags="-s -w -X pitr_fs/internal/buildinfo.Version=$version -X pitr_fs/internal/buildinfo.Commit=$commit -X pitr_fs/internal/buildinfo.BuildDate=$build_date"
 (
     cd "$REPO_ROOT"
-    CGO_ENABLED=0 go build -trimpath -ldflags="$ldflags" -o "$work/pitr" ./cmd/pitr
-    CGO_ENABLED=0 go build -trimpath -ldflags="$ldflags" -o "$work/pitrd" ./cmd/pitrd
+    CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+        go build -trimpath -ldflags="$ldflags" -o "$work/pitr" ./cmd/pitr
+    CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+        go build -trimpath -ldflags="$ldflags" -o "$work/pitrd" ./cmd/pitrd
 )
 install -m 0644 "$REPO_ROOT/internal/schema/init_pitr.sql" "$work/init_pitr.sql"
+install -m 0755 "$REPO_ROOT/scripts/pitr-host-upgrade.sh" "$work/pitr-host-upgrade"
 printf '%s\n' "$version" >"$work/VERSION"
-printf 'commit=%s\nbuild_date=%s\n' "$commit" "$build_date" >"$work/BUILD-INFO"
+printf 'commit=%s\nbuild_date=%s\ngoarch=%s\n' \
+    "$commit" "$build_date" "$goarch" >"$work/BUILD-INFO"
 (
     cd "$work"
-    sha256sum pitr pitrd init_pitr.sql VERSION BUILD-INFO >SHA256SUMS
-    tar -czf "$output" pitr pitrd init_pitr.sql VERSION BUILD-INFO SHA256SUMS
+    sha256sum pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO \
+        >SHA256SUMS
+    tar -czf "$output" pitr pitrd pitr-host-upgrade init_pitr.sql \
+        VERSION BUILD-INFO SHA256SUMS
 )
 echo "已生成逻辑升级包: $output"
 echo "版本: $version"
+echo "架构: linux/$goarch"
