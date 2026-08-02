@@ -237,7 +237,8 @@ pitr upgrade --bundle dist/pitr-dev-test.tar.gz --check
 pitr upgrade --bundle dist/pitr-dev-test.tar.gz
 ```
 
-远端升级会根据 Linux CPU 自动选择 `amd64` 或 `arm64` 资产，先校验 GitHub
+远端升级会根据 Linux CPU 自动选择 `amd64` 或 `arm64` 资产；交互式终端会显示
+构建包下载进度条，脚本和 CI 中则只输出阶段日志。下载完成后先校验 GitHub
 Release API 提供的 SHA256 摘要，再校验包内每个文件。默认仓库是
 `cadeYDL/pitr_fs`；私有镜像或 fork 可在安装时设置
 `PITR_UPDATE_REPOSITORY=owner/repo`，私有仓库可临时通过 `GITHUB_TOKEN` 下载。

@@ -163,7 +163,7 @@ PY
 download_release_bundle() {
     local requested=$1 work=$2 arch metadata endpoint asset_url digest tag bundle actual
     local auth_config
-    local -a curl_headers curl_retry release_info
+    local -a curl_headers curl_retry download_output release_info
     arch=$(release_arch) || return 1
     metadata="$work/release.json"
     if [[ ! "$UPDATE_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
@@ -196,6 +196,7 @@ download_release_bundle() {
             "$GITHUB_TOKEN" >"$auth_config")
         curl_headers+=(--config "$auth_config")
     fi
+    echo "==> 获取 GitHub Release 信息: ${requested:-最新版本}" >&2
     if ! curl --fail --silent --show-error --location \
         --proto '=https' --tlsv1.2 "${curl_retry[@]}" "${curl_headers[@]}" \
         -o "$metadata" "$endpoint"; then
@@ -210,7 +211,14 @@ download_release_bundle() {
     asset_url=${release_info[1]}
     digest=${release_info[2]}
     bundle="$work/pitr-fs_${tag}_linux_${arch}.tar.gz"
-    if ! curl --fail --silent --show-error --location \
+    if [ -t 2 ]; then
+        download_output=(--progress-bar)
+    else
+        # CI、重定向和脚本调用不输出动态控制字符，只保留阶段与错误日志。
+        download_output=(--silent)
+    fi
+    echo "==> 下载 ${tag} (linux/$arch)" >&2
+    if ! curl --fail --show-error --location "${download_output[@]}" \
         --proto '=https' --tlsv1.2 "${curl_retry[@]}" "${curl_headers[@]}" \
         -o "$bundle" "$asset_url"; then
         echo "错误: 下载 Release 资产失败: $asset_url" >&2
@@ -536,6 +544,7 @@ upgrade_main() (
         if [ -z "$bundle" ]; then
             bundle=$(download_release_bundle "$requested_version" "$work") || return 1
         fi
+        echo "==> 校验升级包" >&2
         version=$(validate_bundle "$bundle" "$work") || return 1
         if [ "$check_only" -eq 1 ]; then
             echo "升级包校验通过: $version"
@@ -569,6 +578,7 @@ upgrade_main() (
             echo "当前已经是逻辑版本 $version"
             return 0
         }
+        echo "==> 准备逻辑版本 $version" >&2
         install_version "$work" "$version"
     fi
 
@@ -579,6 +589,7 @@ upgrade_main() (
     }
 
     confirm_downtime
+    echo "==> 切换逻辑版本并恢复挂载" >&2
     perform_switch "$version" "$old" "$expected" "$old_expected"
     echo "逻辑版本已从 $old 切换到 $version；容器、PostgreSQL 和数据卷未重建"
 )
