@@ -349,6 +349,30 @@ EOF
     return 1
 }
 
+detach_host_fuse() {
+    local fuse=$1 target fstype
+    if ! mountpoint -q -- "$fuse"; then
+        return 0
+    fi
+    target=$(findmnt -rn -T "$fuse" -o TARGET | head -n 1)
+    fstype=$(findmnt -rn -T "$fuse" -o FSTYPE | head -n 1)
+    if [ "$(realpath -m -- "$target")" != "$(realpath -m -- "$fuse")" ] ||
+        [ "$fstype" != fuse.pitrfs ]; then
+        echo "错误: 拒绝卸载非 pitrfs 挂载点 $fuse (target=$target type=$fstype)" >&2
+        return 1
+    fi
+    # 容器内的 lazy unmount 不一定会传播到宿主 mount namespace。此时旧
+    # FUSE endpoint 会留在宿主，下一版 pitrd 看到 EEXIST/ENOTCONN 后重启。
+    if ! run_root umount -l -- "$fuse"; then
+        echo "错误: 宿主机残留的 pitrfs 挂载未能卸载: $fuse" >&2
+        return 1
+    fi
+    if mountpoint -q -- "$fuse"; then
+        echo "错误: 宿主机 pitrfs 挂载仍未断开: $fuse" >&2
+        return 1
+    fi
+}
+
 unmount_filesystem() {
     local status fuse cli
     status=$(status_output)
@@ -361,6 +385,10 @@ unmount_filesystem() {
         return 1
     fi
     if ! docker_cli exec "$CONTAINER" "$cli" umount "$fuse" >/dev/null; then
+        docker_cli exec "$CONTAINER" rm -f /run/pitr/discard-open-writes || true
+        return 1
+    fi
+    if ! detach_host_fuse "$fuse"; then
         docker_cli exec "$CONTAINER" rm -f /run/pitr/discard-open-writes || true
         return 1
     fi

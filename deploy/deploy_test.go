@@ -113,6 +113,9 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 		`record_schema_digest`,
 		`ensure_safe_upgrade_cwd`,
 		`preflight_target_runtime`,
+		`detach_host_fuse`,
+		`run_root umount -l -- "$fuse"`,
+		`拒绝卸载非 pitrfs 挂载点`,
 		`升级已在停止服务前取消`,
 		`psql --single-transaction`,
 		`client_min_messages=warning`,
@@ -125,6 +128,73 @@ func TestLogicUpgrade_IsHostControlledAndKeepsContainer(t *testing.T) {
 	if bytes.Contains(upgrader, []byte("docker rm")) ||
 		bytes.Contains(upgrader, []byte("docker run")) {
 		t.Error("逻辑升级器不应删除或重建容器")
+	}
+}
+
+func TestLogicUpgrade_DetachesHostFuseAfterContainerUnmount(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+mounted=1
+mountpoint() { [ "$mounted" -eq 1 ]; }
+findmnt() {
+  case " $* " in
+    *" FSTYPE "*) printf '%s\n' fuse.pitrfs ;;
+    *) printf '%s\n' /pitr/data ;;
+  esac
+}
+run_root() {
+  printf 'root:'
+  printf '<%s>' "$@"
+  printf '\n'
+  mounted=0
+}
+detach_host_fuse /pitr/data
+`, "bash", script)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("宿主 FUSE 清理失败: %v\n%s", err, output)
+	}
+	if !bytes.Contains(output, []byte("root:<umount><-l><--></pitr/data>")) {
+		t.Fatalf("未执行限定目标的宿主 lazy unmount:\n%s", output)
+	}
+}
+
+func TestLogicUpgrade_RefusesUnexpectedHostMount(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+mountpoint() { return 0; }
+findmnt() {
+  case " $* " in
+    *" FSTYPE "*) printf '%s\n' ext4 ;;
+    *) printf '%s\n' /pitr/data ;;
+  esac
+}
+run_root() { echo "不应执行卸载"; return 99; }
+detach_host_fuse /pitr/data
+`, "bash", script)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("非 pitrfs 挂载应被拒绝: %s", output)
+	}
+	if !bytes.Contains(output, []byte("拒绝卸载非 pitrfs 挂载点")) ||
+		bytes.Contains(output, []byte("不应执行卸载")) {
+		t.Fatalf("错误保护不完整:\n%s", output)
 	}
 }
 
