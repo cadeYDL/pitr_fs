@@ -583,6 +583,8 @@ func TestInstall_WrapperSupportsNonTTY(t *testing.T) {
 		`host_mount_root=$quoted_root`,
 		`pitr_args=("\$@")`,
 		`host_pwd=\${PWD:-}`,
+		`caller_uid=\$(id -u)`,
+		`--env "PITR_CALLER_UID=\$caller_uid"`,
 		`requested_workdir="\$host_pwd"`,
 		`docker_args=(exec --workdir "\$host_mount_root")`,
 		`while ! cd "\$container_workdir" 2>/dev/null; do`,
@@ -750,6 +752,10 @@ case "${1:-}" in
     test "$1" = --workdir
     initial_workdir=$2
     shift 2
+    while [ "${1:-}" = --env ]; do
+      export "$2"
+      shift 2
+    done
     shift
     cd "$initial_workdir"
     exec "$@"

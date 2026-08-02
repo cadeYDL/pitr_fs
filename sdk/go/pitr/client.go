@@ -429,6 +429,67 @@ type ClearResult struct {
 	HistoryDeleted  int64
 }
 
+type SquashResult struct {
+	BaseVersion      string
+	EndVersion       string
+	VersionsMerged   int64
+	VersionsDeleted  int64
+	HistoryBefore    int64
+	HistoryAfter     int64
+	HistoryDeleted   int64
+	FirstOperationAt time.Time
+	EndClosedAt      time.Time
+	DryRun           bool
+	Transaction      Transaction
+}
+
+// Squash 将 (baseVersion,endVersion] 压缩到保留的 endVersion。
+// dryRun=true 时 confirm 必须为 false；实际执行时必须显式 confirm=true。
+func (c *Client) Squash(
+	ctx context.Context,
+	baseVersion, endVersion, message string,
+	dryRun, confirm bool,
+) (SquashResult, error) {
+	if strings.TrimSpace(baseVersion) == "" ||
+		strings.TrimSpace(endVersion) == "" || strings.TrimSpace(message) == "" {
+		return SquashResult{}, errors.New("squash 的 base、end 和 message 均不能为空")
+	}
+	if dryRun == confirm {
+		return SquashResult{}, errors.New("dryRun 与 confirm 必须且只能有一个为 true")
+	}
+	response, err := c.rpc.Squash(ctx, &pb.SquashRequest{
+		BaseVersion: baseVersion,
+		EndVersion:  endVersion,
+		Message:     message,
+		DryRun:      dryRun,
+		Confirm:     confirm,
+	})
+	if err != nil {
+		return SquashResult{}, fmt.Errorf("squash %s..%s: %w",
+			baseVersion, endVersion, err)
+	}
+	result := SquashResult{
+		BaseVersion:     response.GetBaseVersion(),
+		EndVersion:      response.GetEndVersion(),
+		VersionsMerged:  response.GetVersionsMerged(),
+		VersionsDeleted: response.GetVersionsDeleted(),
+		HistoryBefore:   response.GetHistoryBefore(),
+		HistoryAfter:    response.GetHistoryAfter(),
+		HistoryDeleted:  response.GetHistoryDeleted(),
+		DryRun:          response.GetDryRun(),
+		Transaction:     transactionFromPB(response.GetTransaction()),
+	}
+	if value, parseErr := time.Parse(time.RFC3339Nano,
+		response.GetFirstOperationAt()); parseErr == nil {
+		result.FirstOperationAt = value
+	}
+	if value, parseErr := time.Parse(time.RFC3339Nano,
+		response.GetEndClosedAt()); parseErr == nil {
+		result.EndClosedAt = value
+	}
+	return result, nil
+}
+
 // Clear permanently removes global version history while preserving current files.
 func (c *Client) Clear(ctx context.Context, confirm bool) (ClearResult, error) {
 	if !confirm {

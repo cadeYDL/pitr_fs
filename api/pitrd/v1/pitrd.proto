@@ -23,6 +23,7 @@ service Pitrd {
   rpc Recover(RecoverRequest) returns (RecoverResponse);
   rpc ConfigSet(ConfigSetRequest) returns (ConfigSetResponse);
   rpc Clear(ClearRequest) returns (ClearResponse);
+  rpc Squash(SquashRequest) returns (SquashResponse);
   rpc Space(SpaceRequest) returns (SpaceResponse);
 }
 
@@ -204,6 +205,32 @@ message ClearRequest {
 message ClearResponse {
   int64 versions_deleted = 1;
   int64 history_deleted = 2;
+}
+
+message SquashRequest {
+  string base_version = 1;
+  string end_version = 2;
+  string message = 3;
+  bool dry_run = 4;
+  bool confirm = 5;
+  int64 actor_uid = 6;
+  int64 actor_gid = 7;
+  int64 actor_pid = 8;
+  string actor_name = 9;
+}
+
+message SquashResponse {
+  string base_version = 1;
+  string end_version = 2;
+  int64 versions_merged = 3;
+  int64 versions_deleted = 4;
+  int64 history_before = 5;
+  int64 history_after = 6;
+  int64 history_deleted = 7;
+  string first_operation_at = 8;
+  string end_closed_at = 9;
+  bool dry_run = 10;
+  Transaction transaction = 11;
 }
 
 message SpaceRequest {

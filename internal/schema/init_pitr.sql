@@ -127,6 +127,15 @@ CREATE TABLE IF NOT EXISTS pitr_slice_pin (
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- squash 释放并重建同一个 end 版本时，旧 delslices bundle 需要迁移到
+-- 独立 ID，才能立即用规范的 8e18+txn_id 重新建立历史 pin。单独序列保证
+-- 同一个 end 被多次扩大范围 squash 时也不会碰撞。
+CREATE SEQUENCE IF NOT EXISTS pitr_gc_bundle_id_seq AS bigint
+    START WITH 7000000000000000000
+    MINVALUE 7000000000000000000
+    MAXVALUE 7999999999999999999
+    NO CYCLE;
+
 CREATE TABLE IF NOT EXISTS pitr_slice_ref (
     chunkid      bigint PRIMARY KEY,
     size         integer NOT NULL CHECK (size > 0),

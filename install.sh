@@ -352,6 +352,10 @@ if [ "\${1:-}" = "init" ] && [ -n "\${2:-}" ]; then
     esac
 fi
 host_pwd=\${PWD:-}
+caller_uid=\$(id -u)
+caller_gid=\$(id -g)
+caller_pid=\$\$
+caller_name=\$(id -un)
 case "\$host_pwd" in
     "\$host_mount_root"|"\$host_mount_root"/*) requested_workdir="\$host_pwd" ;;
     *) requested_workdir="\$host_mount_root" ;;
@@ -360,6 +364,11 @@ esac
 # 目录，直接传入旧 PWD 会使 CLI 尚未启动便被 OCI runtime 拒绝。先从始终
 # 存在的挂载根启动，再由容器内 shell 进入目标目录并处理删除竞态。
 docker_args=(exec --workdir "\$host_mount_root")
+docker_args+=(
+    --env "PITR_CALLER_UID=\$caller_uid"
+    --env "PITR_CALLER_GID=\$caller_gid"
+    --env "PITR_CALLER_PID=\$caller_pid"
+    --env "PITR_CALLER_NAME=\$caller_name")
 if [ -t 0 ] && [ -t 1 ]; then
     docker_args+=(-it)
 fi

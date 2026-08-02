@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -110,6 +112,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newDiffCmd())
 	root.AddCommand(newRevertCmd())
+	root.AddCommand(newSquashCmd())
 	root.AddCommand(newClearCmd())
 
 	return root
@@ -716,11 +719,14 @@ func newLogsCmd() *cobra.Command {
 					}
 					processCommand := shortenForLog(
 						transaction.GetProcessCommand(), 10)
-					if processCommand == "" {
+					if transaction.GetCommand() == "squash" {
+						processCommand = "-"
+					} else if processCommand == "" {
 						processCommand = "<unknown>"
 					}
 					operationTime := transaction.GetCreatedAt()
-					if transaction.GetClosedAt() != nil {
+					if transaction.GetCommand() != "squash" &&
+						transaction.GetClosedAt() != nil {
 						operationTime = transaction.GetClosedAt()
 					}
 					timestamp := ""
@@ -916,4 +922,92 @@ func newClearCmd() *cobra.Command {
 	c.Flags().BoolVar(&global, "global", false, "清空整个卷(当前唯一支持的维度)")
 	c.Flags().BoolVar(&yes, "yes", false, "确认永久删除历史")
 	return c
+}
+
+func newSquashCmd() *cobra.Command {
+	var message string
+	var dryRun, yes bool
+	command := &cobra.Command{
+		Use:   "squash <base-version> <end-version>",
+		Short: "把一段连续版本压缩为一条业务变更记录",
+		Long: `保留 base 和 end 版本号，删除两者之间的版本，并把
+(base,end] 的净变更记录到 end。回滚时间语义仍使用 end 原本的完成时间。`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if message == "" {
+				return errors.New("必须通过 -m 提供压缩后的变更概述")
+			}
+			if dryRun == yes {
+				return errors.New("必须且只能指定 --dry-run 或 --yes")
+			}
+			client, err := dialDaemon(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.close()
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			defer cancel()
+			actorUID, actorGID, actorPID, actorName := squashActor()
+			response, err := client.rpc.Squash(ctx, &pb.SquashRequest{
+				BaseVersion: args[0],
+				EndVersion:  args[1],
+				Message:     message,
+				DryRun:      dryRun,
+				Confirm:     yes,
+				ActorUid:    actorUID,
+				ActorGid:    actorGID,
+				ActorPid:    actorPID,
+				ActorName:   actorName,
+			})
+			if err != nil {
+				return friendlyRPCError(cmd, err)
+			}
+			mode := "预览"
+			if !response.GetDryRun() {
+				mode = "完成"
+			}
+			rows := [][]string{
+				{"项目", "结果"},
+				{"状态", mode},
+				{"保留范围", response.GetBaseVersion() + " -> " + response.GetEndVersion()},
+				{"合并版本", strconv.FormatInt(response.GetVersionsMerged(), 10)},
+				{"删除版本", strconv.FormatInt(response.GetVersionsDeleted(), 10)},
+				{"历史记录", fmt.Sprintf("%d -> %d（删除 %d）",
+					response.GetHistoryBefore(), response.GetHistoryAfter(),
+					response.GetHistoryDeleted())},
+				{"日志时间", response.GetFirstOperationAt()},
+				{"回滚时间", response.GetEndClosedAt()},
+			}
+			return writeAlignedTable(cmd.OutOrStdout(), rows)
+		},
+	}
+	command.Flags().StringVarP(&message, "message", "m", "", "压缩后的业务变更概述")
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "仅预览压缩范围和影响")
+	command.Flags().BoolVar(&yes, "yes", false, "确认永久删除中间版本")
+	return command
+}
+
+func squashActor() (int64, int64, int64, string) {
+	uid := envInt64("PITR_CALLER_UID", int64(os.Getuid()))
+	gid := envInt64("PITR_CALLER_GID", int64(os.Getgid()))
+	pid := envInt64("PITR_CALLER_PID", int64(os.Getppid()))
+	name := os.Getenv("PITR_CALLER_NAME")
+	if name == "" {
+		if current, err := user.Current(); err == nil {
+			name = current.Username
+		}
+	}
+	return uid, gid, pid, name
+}
+
+func envInt64(key string, fallback int64) int64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

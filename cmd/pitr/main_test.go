@@ -30,7 +30,7 @@ func TestPitrCLI_Help(t *testing.T) {
 	got := buf.String()
 	for _, sub := range []string{
 		"daemon", "init", "recover", "mount", "umount", "status", "config",
-		"logs", "diff", "revert", "clear", "version", "upgrade",
+		"logs", "diff", "revert", "squash", "clear", "version", "upgrade",
 	} {
 		if !bytes.Contains([]byte(got), []byte(sub)) {
 			t.Errorf("--help 输出未包含子命令 %q", sub)
@@ -136,7 +136,7 @@ func (fakePitrd) Status(context.Context, *pb.StatusRequest) (*pb.StatusResponse,
 		OpenWrites:      0,
 		Volumes: []*pb.VolumeStatus{{
 			Name: "default", JfsMount: "/jfs", FuseMount: "/workspace",
-			HistoryLimit: 100,
+			HistoryLimit:  100,
 			MaxSpaceBytes: 100 << 30, SpaceReservePercent: 20,
 			RetainedSpaceBytes: 60 << 30, ReclaimableSpaceBytes: 4 << 30,
 		}},
@@ -182,6 +182,25 @@ func (fakePitrd) Revert(context.Context, *pb.RevertRequest) (*pb.RevertResponse,
 
 func (fakePitrd) Clear(context.Context, *pb.ClearRequest) (*pb.ClearResponse, error) {
 	return &pb.ClearResponse{VersionsDeleted: 8, HistoryDeleted: 21}, nil
+}
+
+func (fakePitrd) Squash(
+	_ context.Context,
+	req *pb.SquashRequest,
+) (*pb.SquashResponse, error) {
+	return &pb.SquashResponse{
+		BaseVersion:      req.GetBaseVersion(),
+		EndVersion:       req.GetEndVersion(),
+		VersionsMerged:   3,
+		VersionsDeleted:  2,
+		HistoryBefore:    12,
+		HistoryAfter:     5,
+		HistoryDeleted:   7,
+		FirstOperationAt: "2026-07-31T06:23:17Z",
+		EndClosedAt:      "2026-07-31T06:24:17Z",
+		DryRun:           req.GetDryRun(),
+		Transaction:      fakeTxn("committed", "squash", req.GetMessage()),
+	}, nil
 }
 
 func (fakePitrd) Space(context.Context, *pb.SpaceRequest) (*pb.SpaceResponse, error) {
@@ -291,6 +310,8 @@ func TestCLI_ControlCommands_E2E(t *testing.T) {
 		{[]string{"--socket", socket, "config", "list"}, "最终以更严格的约束为准"},
 		{[]string{"config", "--help"}, "space-reserve  1..99%"},
 		{[]string{"--socket", socket, "clear", "--global", "--yes"}, "cleared 8 versions and 21 history rows"},
+		{[]string{"--socket", socket, "squash", "111111111111", "222222222222", "-m", "发布功能", "--dry-run"}, "预览"},
+		{[]string{"--socket", socket, "squash", "111111111111", "222222222222", "-m", "发布功能", "--yes"}, "12 -> 5（删除 7）"},
 	}
 	for _, tc := range cases {
 		got, err := executeCLI(t, tc.args...)

@@ -79,6 +79,20 @@ class FakePitrd(rpc.PitrdServicer):
     def Clear(self, request, context):  # noqa: N802
         return pb.ClearResponse(versions_deleted=4, history_deleted=12)
 
+    def Squash(self, request, context):  # noqa: N802
+        return pb.SquashResponse(
+            base_version=request.base_version,
+            end_version=request.end_version,
+            versions_merged=3,
+            versions_deleted=2,
+            history_before=8,
+            history_after=3,
+            history_deleted=5,
+            first_operation_at="2026-07-31T10:00:00Z",
+            end_closed_at="2026-07-31T10:01:00Z",
+            dry_run=request.dry_run,
+        )
+
     def Space(self, request, context):  # noqa: N802
         return pb.SpaceResponse(
             max_space_bytes=100 << 30,
@@ -190,3 +204,22 @@ def test_config_and_clear(pitrd):
         with pytest.raises(ValueError, match="confirm=True"):
             client.clear()
         assert client.clear(confirm=True) == (4, 12)
+
+
+def test_squash(pitrd):
+    socket, _ = pitrd
+    with Client(socket) as client:
+        preview = client.squash(
+            "111111111111", "222222222222", "发布功能", dry_run=True
+        )
+        assert preview.dry_run is True
+        assert preview.versions_merged == 3
+        assert preview.history_deleted == 5
+        with pytest.raises(ValueError, match="必须且只能"):
+            client.squash(
+                "111111111111",
+                "222222222222",
+                "发布功能",
+                dry_run=False,
+                confirm=False,
+            )

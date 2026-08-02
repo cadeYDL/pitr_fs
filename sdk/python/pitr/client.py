@@ -55,6 +55,20 @@ class DiffStats:
 
 
 @dataclass(frozen=True)
+class SquashResult:
+    base_version: str
+    end_version: str
+    versions_merged: int
+    versions_deleted: int
+    history_before: int
+    history_after: int
+    history_deleted: int
+    first_operation_at: str
+    end_closed_at: str
+    dry_run: bool
+
+
+@dataclass(frozen=True)
 class Volume:
     name: str
     jfs_mount: str
@@ -396,3 +410,40 @@ class Client:
             timeout=timeout,
         )
         return response.versions_deleted, response.history_deleted
+
+    def squash(
+        self,
+        base_version: str,
+        end_version: str,
+        message: str,
+        *,
+        dry_run: bool = True,
+        confirm: bool = False,
+        timeout: float | None = None,
+    ) -> SquashResult:
+        if not base_version.strip() or not end_version.strip() or not message.strip():
+            raise ValueError("squash 的 base、end 和 message 均不能为空")
+        if dry_run == confirm:
+            raise ValueError("dry_run 与 confirm 必须且只能有一个为 True")
+        response = self._stub.Squash(
+            pb.SquashRequest(
+                base_version=base_version,
+                end_version=end_version,
+                message=message,
+                dry_run=dry_run,
+                confirm=confirm,
+            ),
+            timeout=timeout,
+        )
+        return SquashResult(
+            base_version=response.base_version,
+            end_version=response.end_version,
+            versions_merged=response.versions_merged,
+            versions_deleted=response.versions_deleted,
+            history_before=response.history_before,
+            history_after=response.history_after,
+            history_deleted=response.history_deleted,
+            first_operation_at=response.first_operation_at,
+            end_closed_at=response.end_closed_at,
+            dry_run=response.dry_run,
+        )

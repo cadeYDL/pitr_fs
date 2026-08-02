@@ -100,6 +100,11 @@ class PitrdStub:
                 request_serializer=pitrd__pb2.ClearRequest.SerializeToString,
                 response_deserializer=pitrd__pb2.ClearResponse.FromString,
                 _registered_method=True)
+        self.Squash = channel.unary_unary(
+                '/pitrd.v1.Pitrd/Squash',
+                request_serializer=pitrd__pb2.SquashRequest.SerializeToString,
+                response_deserializer=pitrd__pb2.SquashResponse.FromString,
+                _registered_method=True)
         self.Space = channel.unary_unary(
                 '/pitrd.v1.Pitrd/Space',
                 request_serializer=pitrd__pb2.SpaceRequest.SerializeToString,
@@ -188,6 +193,12 @@ class PitrdServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Squash(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Space(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -261,6 +272,11 @@ def add_PitrdServicer_to_server(servicer, server):
                     servicer.Clear,
                     request_deserializer=pitrd__pb2.ClearRequest.FromString,
                     response_serializer=pitrd__pb2.ClearResponse.SerializeToString,
+            ),
+            'Squash': grpc.unary_unary_rpc_method_handler(
+                    servicer.Squash,
+                    request_deserializer=pitrd__pb2.SquashRequest.FromString,
+                    response_serializer=pitrd__pb2.SquashResponse.SerializeToString,
             ),
             'Space': grpc.unary_unary_rpc_method_handler(
                     servicer.Space,
@@ -619,6 +635,33 @@ class Pitrd:
             '/pitrd.v1.Pitrd/Clear',
             pitrd__pb2.ClearRequest.SerializeToString,
             pitrd__pb2.ClearResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Squash(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pitrd.v1.Pitrd/Squash',
+            pitrd__pb2.SquashRequest.SerializeToString,
+            pitrd__pb2.SquashResponse.FromString,
             options,
             channel_credentials,
             insecure,

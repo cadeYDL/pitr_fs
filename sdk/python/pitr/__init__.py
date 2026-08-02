@@ -5,6 +5,7 @@ from .client import (
     DiffStats,
     LogEntry,
     RevertResult,
+    SquashResult,
     Transaction,
     Volume,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "DiffStats",
     "LogEntry",
     "RevertResult",
+    "SquashResult",
     "Transaction",
     "Volume",
 ]

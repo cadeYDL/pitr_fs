@@ -33,6 +33,7 @@ const (
 	Pitrd_Recover_FullMethodName   = "/pitrd.v1.Pitrd/Recover"
 	Pitrd_ConfigSet_FullMethodName = "/pitrd.v1.Pitrd/ConfigSet"
 	Pitrd_Clear_FullMethodName     = "/pitrd.v1.Pitrd/Clear"
+	Pitrd_Squash_FullMethodName    = "/pitrd.v1.Pitrd/Squash"
 	Pitrd_Space_FullMethodName     = "/pitrd.v1.Pitrd/Space"
 )
 
@@ -53,6 +54,7 @@ type PitrdClient interface {
 	Recover(ctx context.Context, in *RecoverRequest, opts ...grpc.CallOption) (*RecoverResponse, error)
 	ConfigSet(ctx context.Context, in *ConfigSetRequest, opts ...grpc.CallOption) (*ConfigSetResponse, error)
 	Clear(ctx context.Context, in *ClearRequest, opts ...grpc.CallOption) (*ClearResponse, error)
+	Squash(ctx context.Context, in *SquashRequest, opts ...grpc.CallOption) (*SquashResponse, error)
 	Space(ctx context.Context, in *SpaceRequest, opts ...grpc.CallOption) (*SpaceResponse, error)
 }
 
@@ -194,6 +196,16 @@ func (c *pitrdClient) Clear(ctx context.Context, in *ClearRequest, opts ...grpc.
 	return out, nil
 }
 
+func (c *pitrdClient) Squash(ctx context.Context, in *SquashRequest, opts ...grpc.CallOption) (*SquashResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SquashResponse)
+	err := c.cc.Invoke(ctx, Pitrd_Squash_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *pitrdClient) Space(ctx context.Context, in *SpaceRequest, opts ...grpc.CallOption) (*SpaceResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SpaceResponse)
@@ -221,6 +233,7 @@ type PitrdServer interface {
 	Recover(context.Context, *RecoverRequest) (*RecoverResponse, error)
 	ConfigSet(context.Context, *ConfigSetRequest) (*ConfigSetResponse, error)
 	Clear(context.Context, *ClearRequest) (*ClearResponse, error)
+	Squash(context.Context, *SquashRequest) (*SquashResponse, error)
 	Space(context.Context, *SpaceRequest) (*SpaceResponse, error)
 	mustEmbedUnimplementedPitrdServer()
 }
@@ -270,6 +283,9 @@ func (UnimplementedPitrdServer) ConfigSet(context.Context, *ConfigSetRequest) (*
 }
 func (UnimplementedPitrdServer) Clear(context.Context, *ClearRequest) (*ClearResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Clear not implemented")
+}
+func (UnimplementedPitrdServer) Squash(context.Context, *SquashRequest) (*SquashResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Squash not implemented")
 }
 func (UnimplementedPitrdServer) Space(context.Context, *SpaceRequest) (*SpaceResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Space not implemented")
@@ -529,6 +545,24 @@ func _Pitrd_Clear_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Pitrd_Squash_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SquashRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PitrdServer).Squash(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Pitrd_Squash_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PitrdServer).Squash(ctx, req.(*SquashRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Pitrd_Space_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SpaceRequest)
 	if err := dec(in); err != nil {
@@ -605,6 +639,10 @@ var Pitrd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Clear",
 			Handler:    _Pitrd_Clear_Handler,
+		},
+		{
+			MethodName: "Squash",
+			Handler:    _Pitrd_Squash_Handler,
 		},
 		{
 			MethodName: "Space",

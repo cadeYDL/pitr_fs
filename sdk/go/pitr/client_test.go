@@ -104,6 +104,24 @@ func (*fakeServer) Clear(
 	}, nil
 }
 
+func (*fakeServer) Squash(
+	_ context.Context,
+	request *pb.SquashRequest,
+) (*pb.SquashResponse, error) {
+	return &pb.SquashResponse{
+		BaseVersion:      request.GetBaseVersion(),
+		EndVersion:       request.GetEndVersion(),
+		VersionsMerged:   3,
+		VersionsDeleted:  2,
+		HistoryBefore:    8,
+		HistoryAfter:     3,
+		HistoryDeleted:   5,
+		FirstOperationAt: "2026-07-31T10:00:00Z",
+		EndClosedAt:      "2026-07-31T10:01:00Z",
+		DryRun:           request.GetDryRun(),
+	}, nil
+}
+
 func (*fakeServer) Space(
 	context.Context,
 	*pb.SpaceRequest,
@@ -260,5 +278,26 @@ func TestGoSDK_ConfigAndClear(t *testing.T) {
 	}
 	if cleared.VersionsDeleted != 4 || cleared.HistoryDeleted != 12 {
 		t.Fatalf("clear=%+v", cleared)
+	}
+}
+
+func TestGoSDK_Squash(t *testing.T) {
+	client, err := Dial(startUnixServer(t, &fakeServer{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	preview, err := client.Squash(context.Background(),
+		"111111111111", "222222222222", "发布功能", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preview.DryRun || preview.VersionsMerged != 3 ||
+		preview.HistoryDeleted != 5 || preview.FirstOperationAt.IsZero() {
+		t.Fatalf("preview=%+v", preview)
+	}
+	if _, err := client.Squash(context.Background(),
+		"111111111111", "222222222222", "发布功能", false, false); err == nil {
+		t.Fatal("squash without dry-run or confirmation should fail")
 	}
 }

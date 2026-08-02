@@ -223,6 +223,88 @@ func TestServer_ManualTransactionsDisabled(t *testing.T) {
 	}
 }
 
+func TestServer_SquashPreviewAndExecute(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	var rootHash string
+	if err := f.db.QueryRow(ctx,
+		"SELECT trim(version_hash) FROM pitr_txn WHERE state='root'").Scan(
+		&rootHash); err != nil {
+		t.Fatal(err)
+	}
+	var endHash string
+	for index := 0; index < 3; index++ {
+		id, err := f.mgr.OpenStandaloneVersion(ctx, "/workspace/file",
+			fmt.Sprintf("write-%d", index), txn.VersionMetadata{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.mgr.CloseStandaloneVersion(ctx, id, "write", "change"); err != nil {
+			t.Fatal(err)
+		}
+		version, err := f.mgr.FindByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		endHash = version.VersionHash
+	}
+
+	preview, err := f.client.Squash(ctx, &pb.SquashRequest{
+		BaseVersion: rootHash,
+		EndVersion:  endHash,
+		Message:     "发布功能",
+		DryRun:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preview.GetDryRun() || preview.GetVersionsMerged() != 3 ||
+		preview.GetVersionsDeleted() != 2 || preview.GetTransaction() != nil {
+		t.Fatalf("unexpected preview: %+v", preview)
+	}
+	f.quiesceMu.Lock()
+	if len(f.quiesce) != 0 {
+		t.Fatalf("dry-run should not quiesce: %v", f.quiesce)
+	}
+	f.quiesceMu.Unlock()
+
+	result, err := f.client.Squash(ctx, &pb.SquashRequest{
+		BaseVersion: rootHash,
+		EndVersion:  endHash,
+		Message:     "发布功能",
+		Confirm:     true,
+		ActorUid:    1000,
+		ActorName:   "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := result.GetTransaction()
+	if result.GetDryRun() || transaction.GetVersionHash() != endHash ||
+		transaction.GetCommand() != "squash" ||
+		transaction.GetChangeSummary() != "发布功能" ||
+		transaction.GetActorUid() != 1000 || transaction.GetActorName() != "tester" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	f.quiesceMu.Lock()
+	defer f.quiesceMu.Unlock()
+	if len(f.quiesce) != 2 || !f.quiesce[0] || f.quiesce[1] {
+		t.Fatalf("quiesce sequence=%v", f.quiesce)
+	}
+}
+
+func TestServer_SquashRequiresPreviewOrConfirmation(t *testing.T) {
+	f := setupServer(t)
+	_, err := f.client.Squash(context.Background(), &pb.SquashRequest{
+		BaseVersion: "000000000000",
+		EndVersion:  "111111111111",
+		Message:     "x",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+}
+
 func TestServer_AutomaticVersion_E2E(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()

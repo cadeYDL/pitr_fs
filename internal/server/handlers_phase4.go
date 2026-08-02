@@ -130,6 +130,86 @@ func (s *Server) Clear(
 	}, nil
 }
 
+func (s *Server) Squash(
+	ctx context.Context,
+	req *pb.SquashRequest,
+) (*pb.SquashResponse, error) {
+	baseVersion := strings.TrimSpace(req.GetBaseVersion())
+	endVersion := strings.TrimSpace(req.GetEndVersion())
+	message := strings.TrimSpace(req.GetMessage())
+	if !revert.ValidVersionHash(baseVersion) ||
+		!revert.ValidVersionHash(endVersion) {
+		return nil, status.Error(codes.InvalidArgument,
+			"base_version 和 end_version 必须是 12 位十六进制版本号")
+	}
+	if message == "" {
+		return nil, status.Error(codes.InvalidArgument, "message 不能为空；请使用 -m")
+	}
+	if req.GetDryRun() && req.GetConfirm() {
+		return nil, status.Error(codes.InvalidArgument,
+			"--dry-run 与 --yes 不能同时使用")
+	}
+	if !req.GetDryRun() && !req.GetConfirm() {
+		return nil, status.Error(codes.InvalidArgument,
+			"squash 会永久删除中间版本；请先使用 --dry-run 预览，再添加 --yes 执行")
+	}
+
+	if !req.GetDryRun() {
+		s.lifecycleMu.Lock()
+		defer s.lifecycleMu.Unlock()
+		if s.cfg.QuiesceFunc != nil {
+			s.cfg.QuiesceFunc(true)
+			defer s.cfg.QuiesceFunc(false)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			open, err := s.mgr.CountOpenWrites(ctx)
+			if err != nil {
+				return nil, rpcError(err)
+			}
+			if open == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"冻结新写入后仍有 %d 个写操作尚未关闭；squash 未执行", open)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
+			case <-time.After(25 * time.Millisecond):
+			}
+		}
+	}
+
+	stats, err := s.mgr.Squash(ctx, txn.SquashOptions{
+		BaseHash:  baseVersion,
+		EndHash:   endVersion,
+		Message:   message,
+		DryRun:    req.GetDryRun(),
+		ActorUID:  req.GetActorUid(),
+		ActorGID:  req.GetActorGid(),
+		ActorPID:  req.GetActorPid(),
+		ActorName: req.GetActorName(),
+	})
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return &pb.SquashResponse{
+		BaseVersion:      stats.BaseVersionHash,
+		EndVersion:       stats.EndVersionHash,
+		VersionsMerged:   stats.VersionsMerged,
+		VersionsDeleted:  stats.VersionsDeleted,
+		HistoryBefore:    stats.HistoryBefore,
+		HistoryAfter:     stats.HistoryAfter,
+		HistoryDeleted:   stats.HistoryDeleted,
+		FirstOperationAt: stats.FirstOperationAt.Format(time.RFC3339Nano),
+		EndClosedAt:      stats.EndClosedAt.Format(time.RFC3339Nano),
+		DryRun:           stats.DryRun,
+		Transaction:      transactionPB(stats.Transaction),
+	}, nil
+}
+
 // Recover 是 daemon 层的无损校验。pitrd 启动顺序已经恢复两层 mount;RPC
 // 只确认目标卷元数据和挂载状态,绝不调用 juicefs format。
 func (s *Server) Recover(

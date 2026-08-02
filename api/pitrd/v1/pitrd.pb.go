@@ -1817,6 +1817,238 @@ func (x *ClearResponse) GetHistoryDeleted() int64 {
 	return 0
 }
 
+type SquashRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BaseVersion   string                 `protobuf:"bytes,1,opt,name=base_version,json=baseVersion,proto3" json:"base_version,omitempty"`
+	EndVersion    string                 `protobuf:"bytes,2,opt,name=end_version,json=endVersion,proto3" json:"end_version,omitempty"`
+	Message       string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	DryRun        bool                   `protobuf:"varint,4,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	Confirm       bool                   `protobuf:"varint,5,opt,name=confirm,proto3" json:"confirm,omitempty"`
+	ActorUid      int64                  `protobuf:"varint,6,opt,name=actor_uid,json=actorUid,proto3" json:"actor_uid,omitempty"`
+	ActorGid      int64                  `protobuf:"varint,7,opt,name=actor_gid,json=actorGid,proto3" json:"actor_gid,omitempty"`
+	ActorPid      int64                  `protobuf:"varint,8,opt,name=actor_pid,json=actorPid,proto3" json:"actor_pid,omitempty"`
+	ActorName     string                 `protobuf:"bytes,9,opt,name=actor_name,json=actorName,proto3" json:"actor_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SquashRequest) Reset() {
+	*x = SquashRequest{}
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SquashRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SquashRequest) ProtoMessage() {}
+
+func (x *SquashRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SquashRequest.ProtoReflect.Descriptor instead.
+func (*SquashRequest) Descriptor() ([]byte, []int) {
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *SquashRequest) GetBaseVersion() string {
+	if x != nil {
+		return x.BaseVersion
+	}
+	return ""
+}
+
+func (x *SquashRequest) GetEndVersion() string {
+	if x != nil {
+		return x.EndVersion
+	}
+	return ""
+}
+
+func (x *SquashRequest) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *SquashRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+func (x *SquashRequest) GetConfirm() bool {
+	if x != nil {
+		return x.Confirm
+	}
+	return false
+}
+
+func (x *SquashRequest) GetActorUid() int64 {
+	if x != nil {
+		return x.ActorUid
+	}
+	return 0
+}
+
+func (x *SquashRequest) GetActorGid() int64 {
+	if x != nil {
+		return x.ActorGid
+	}
+	return 0
+}
+
+func (x *SquashRequest) GetActorPid() int64 {
+	if x != nil {
+		return x.ActorPid
+	}
+	return 0
+}
+
+func (x *SquashRequest) GetActorName() string {
+	if x != nil {
+		return x.ActorName
+	}
+	return ""
+}
+
+type SquashResponse struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	BaseVersion      string                 `protobuf:"bytes,1,opt,name=base_version,json=baseVersion,proto3" json:"base_version,omitempty"`
+	EndVersion       string                 `protobuf:"bytes,2,opt,name=end_version,json=endVersion,proto3" json:"end_version,omitempty"`
+	VersionsMerged   int64                  `protobuf:"varint,3,opt,name=versions_merged,json=versionsMerged,proto3" json:"versions_merged,omitempty"`
+	VersionsDeleted  int64                  `protobuf:"varint,4,opt,name=versions_deleted,json=versionsDeleted,proto3" json:"versions_deleted,omitempty"`
+	HistoryBefore    int64                  `protobuf:"varint,5,opt,name=history_before,json=historyBefore,proto3" json:"history_before,omitempty"`
+	HistoryAfter     int64                  `protobuf:"varint,6,opt,name=history_after,json=historyAfter,proto3" json:"history_after,omitempty"`
+	HistoryDeleted   int64                  `protobuf:"varint,7,opt,name=history_deleted,json=historyDeleted,proto3" json:"history_deleted,omitempty"`
+	FirstOperationAt string                 `protobuf:"bytes,8,opt,name=first_operation_at,json=firstOperationAt,proto3" json:"first_operation_at,omitempty"`
+	EndClosedAt      string                 `protobuf:"bytes,9,opt,name=end_closed_at,json=endClosedAt,proto3" json:"end_closed_at,omitempty"`
+	DryRun           bool                   `protobuf:"varint,10,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	Transaction      *Transaction           `protobuf:"bytes,11,opt,name=transaction,proto3" json:"transaction,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *SquashResponse) Reset() {
+	*x = SquashResponse{}
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SquashResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SquashResponse) ProtoMessage() {}
+
+func (x *SquashResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SquashResponse.ProtoReflect.Descriptor instead.
+func (*SquashResponse) Descriptor() ([]byte, []int) {
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *SquashResponse) GetBaseVersion() string {
+	if x != nil {
+		return x.BaseVersion
+	}
+	return ""
+}
+
+func (x *SquashResponse) GetEndVersion() string {
+	if x != nil {
+		return x.EndVersion
+	}
+	return ""
+}
+
+func (x *SquashResponse) GetVersionsMerged() int64 {
+	if x != nil {
+		return x.VersionsMerged
+	}
+	return 0
+}
+
+func (x *SquashResponse) GetVersionsDeleted() int64 {
+	if x != nil {
+		return x.VersionsDeleted
+	}
+	return 0
+}
+
+func (x *SquashResponse) GetHistoryBefore() int64 {
+	if x != nil {
+		return x.HistoryBefore
+	}
+	return 0
+}
+
+func (x *SquashResponse) GetHistoryAfter() int64 {
+	if x != nil {
+		return x.HistoryAfter
+	}
+	return 0
+}
+
+func (x *SquashResponse) GetHistoryDeleted() int64 {
+	if x != nil {
+		return x.HistoryDeleted
+	}
+	return 0
+}
+
+func (x *SquashResponse) GetFirstOperationAt() string {
+	if x != nil {
+		return x.FirstOperationAt
+	}
+	return ""
+}
+
+func (x *SquashResponse) GetEndClosedAt() string {
+	if x != nil {
+		return x.EndClosedAt
+	}
+	return ""
+}
+
+func (x *SquashResponse) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+func (x *SquashResponse) GetTransaction() *Transaction {
+	if x != nil {
+		return x.Transaction
+	}
+	return nil
+}
+
 type SpaceRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
@@ -1827,7 +2059,7 @@ type SpaceRequest struct {
 
 func (x *SpaceRequest) Reset() {
 	*x = SpaceRequest{}
-	mi := &file_pitrd_v1_pitrd_proto_msgTypes[28]
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1839,7 +2071,7 @@ func (x *SpaceRequest) String() string {
 func (*SpaceRequest) ProtoMessage() {}
 
 func (x *SpaceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pitrd_v1_pitrd_proto_msgTypes[28]
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1852,7 +2084,7 @@ func (x *SpaceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpaceRequest.ProtoReflect.Descriptor instead.
 func (*SpaceRequest) Descriptor() ([]byte, []int) {
-	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{28}
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *SpaceRequest) GetPath() string {
@@ -1881,7 +2113,7 @@ type SpaceVersion struct {
 
 func (x *SpaceVersion) Reset() {
 	*x = SpaceVersion{}
-	mi := &file_pitrd_v1_pitrd_proto_msgTypes[29]
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1893,7 +2125,7 @@ func (x *SpaceVersion) String() string {
 func (*SpaceVersion) ProtoMessage() {}
 
 func (x *SpaceVersion) ProtoReflect() protoreflect.Message {
-	mi := &file_pitrd_v1_pitrd_proto_msgTypes[29]
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1906,7 +2138,7 @@ func (x *SpaceVersion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpaceVersion.ProtoReflect.Descriptor instead.
 func (*SpaceVersion) Descriptor() ([]byte, []int) {
-	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{29}
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *SpaceVersion) GetVersionHash() string {
@@ -1951,7 +2183,7 @@ type SpaceResponse struct {
 
 func (x *SpaceResponse) Reset() {
 	*x = SpaceResponse{}
-	mi := &file_pitrd_v1_pitrd_proto_msgTypes[30]
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1963,7 +2195,7 @@ func (x *SpaceResponse) String() string {
 func (*SpaceResponse) ProtoMessage() {}
 
 func (x *SpaceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pitrd_v1_pitrd_proto_msgTypes[30]
+	mi := &file_pitrd_v1_pitrd_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1976,7 +2208,7 @@ func (x *SpaceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpaceResponse.ProtoReflect.Descriptor instead.
 func (*SpaceResponse) Descriptor() ([]byte, []int) {
-	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{30}
+	return file_pitrd_v1_pitrd_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *SpaceResponse) GetMaxSpaceBytes() int64 {
@@ -2165,7 +2397,33 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\aconfirm\x18\x03 \x01(\bR\aconfirm\"c\n" +
 	"\rClearResponse\x12)\n" +
 	"\x10versions_deleted\x18\x01 \x01(\x03R\x0fversionsDeleted\x12'\n" +
-	"\x0fhistory_deleted\x18\x02 \x01(\x03R\x0ehistoryDeleted\"8\n" +
+	"\x0fhistory_deleted\x18\x02 \x01(\x03R\x0ehistoryDeleted\"\x96\x02\n" +
+	"\rSquashRequest\x12!\n" +
+	"\fbase_version\x18\x01 \x01(\tR\vbaseVersion\x12\x1f\n" +
+	"\vend_version\x18\x02 \x01(\tR\n" +
+	"endVersion\x12\x18\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\x12\x17\n" +
+	"\adry_run\x18\x04 \x01(\bR\x06dryRun\x12\x18\n" +
+	"\aconfirm\x18\x05 \x01(\bR\aconfirm\x12\x1b\n" +
+	"\tactor_uid\x18\x06 \x01(\x03R\bactorUid\x12\x1b\n" +
+	"\tactor_gid\x18\a \x01(\x03R\bactorGid\x12\x1b\n" +
+	"\tactor_pid\x18\b \x01(\x03R\bactorPid\x12\x1d\n" +
+	"\n" +
+	"actor_name\x18\t \x01(\tR\tactorName\"\xc1\x03\n" +
+	"\x0eSquashResponse\x12!\n" +
+	"\fbase_version\x18\x01 \x01(\tR\vbaseVersion\x12\x1f\n" +
+	"\vend_version\x18\x02 \x01(\tR\n" +
+	"endVersion\x12'\n" +
+	"\x0fversions_merged\x18\x03 \x01(\x03R\x0eversionsMerged\x12)\n" +
+	"\x10versions_deleted\x18\x04 \x01(\x03R\x0fversionsDeleted\x12%\n" +
+	"\x0ehistory_before\x18\x05 \x01(\x03R\rhistoryBefore\x12#\n" +
+	"\rhistory_after\x18\x06 \x01(\x03R\fhistoryAfter\x12'\n" +
+	"\x0fhistory_deleted\x18\a \x01(\x03R\x0ehistoryDeleted\x12,\n" +
+	"\x12first_operation_at\x18\b \x01(\tR\x10firstOperationAt\x12\"\n" +
+	"\rend_closed_at\x18\t \x01(\tR\vendClosedAt\x12\x17\n" +
+	"\adry_run\x18\n" +
+	" \x01(\bR\x06dryRun\x127\n" +
+	"\vtransaction\x18\v \x01(\v2\x15.pitrd.v1.TransactionR\vtransaction\"8\n" +
 	"\fSpaceRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\"\xa9\x01\n" +
@@ -2180,7 +2438,7 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x14high_watermark_bytes\x18\x03 \x01(\x03R\x12highWatermarkBytes\x12%\n" +
 	"\x0eretained_bytes\x18\x04 \x01(\x03R\rretainedBytes\x12+\n" +
 	"\x11reclaimable_bytes\x18\x05 \x01(\x03R\x10reclaimableBytes\x122\n" +
-	"\bversions\x18\x06 \x03(\v2\x16.pitrd.v1.SpaceVersionR\bversions2\xcf\x06\n" +
+	"\bversions\x18\x06 \x03(\v2\x16.pitrd.v1.SpaceVersionR\bversions2\x8c\a\n" +
 	"\x05Pitrd\x125\n" +
 	"\x04Init\x12\x15.pitrd.v1.InitRequest\x1a\x16.pitrd.v1.InitResponse\x128\n" +
 	"\x05Mount\x12\x16.pitrd.v1.MountRequest\x1a\x17.pitrd.v1.MountResponse\x129\n" +
@@ -2194,7 +2452,8 @@ const file_pitrd_v1_pitrd_proto_rawDesc = "" +
 	"\x04Diff\x12\x15.pitrd.v1.DiffRequest\x1a\x16.pitrd.v1.DiffResponse\x12>\n" +
 	"\aRecover\x12\x18.pitrd.v1.RecoverRequest\x1a\x19.pitrd.v1.RecoverResponse\x12D\n" +
 	"\tConfigSet\x12\x1a.pitrd.v1.ConfigSetRequest\x1a\x1b.pitrd.v1.ConfigSetResponse\x128\n" +
-	"\x05Clear\x12\x16.pitrd.v1.ClearRequest\x1a\x17.pitrd.v1.ClearResponse\x128\n" +
+	"\x05Clear\x12\x16.pitrd.v1.ClearRequest\x1a\x17.pitrd.v1.ClearResponse\x12;\n" +
+	"\x06Squash\x12\x17.pitrd.v1.SquashRequest\x1a\x18.pitrd.v1.SquashResponse\x128\n" +
 	"\x05Space\x12\x16.pitrd.v1.SpaceRequest\x1a\x17.pitrd.v1.SpaceResponseB\x19Z\x17pitr_fs/api/pitrd/v1;v1b\x06proto3"
 
 var (
@@ -2209,7 +2468,7 @@ func file_pitrd_v1_pitrd_proto_rawDescGZIP() []byte {
 	return file_pitrd_v1_pitrd_proto_rawDescData
 }
 
-var file_pitrd_v1_pitrd_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_pitrd_v1_pitrd_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_pitrd_v1_pitrd_proto_goTypes = []any{
 	(*InitRequest)(nil),           // 0: pitrd.v1.InitRequest
 	(*InitResponse)(nil),          // 1: pitrd.v1.InitResponse
@@ -2239,58 +2498,63 @@ var file_pitrd_v1_pitrd_proto_goTypes = []any{
 	(*ConfigSetResponse)(nil),     // 25: pitrd.v1.ConfigSetResponse
 	(*ClearRequest)(nil),          // 26: pitrd.v1.ClearRequest
 	(*ClearResponse)(nil),         // 27: pitrd.v1.ClearResponse
-	(*SpaceRequest)(nil),          // 28: pitrd.v1.SpaceRequest
-	(*SpaceVersion)(nil),          // 29: pitrd.v1.SpaceVersion
-	(*SpaceResponse)(nil),         // 30: pitrd.v1.SpaceResponse
-	(*timestamppb.Timestamp)(nil), // 31: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),         // 32: google.protobuf.Empty
+	(*SquashRequest)(nil),         // 28: pitrd.v1.SquashRequest
+	(*SquashResponse)(nil),        // 29: pitrd.v1.SquashResponse
+	(*SpaceRequest)(nil),          // 30: pitrd.v1.SpaceRequest
+	(*SpaceVersion)(nil),          // 31: pitrd.v1.SpaceVersion
+	(*SpaceResponse)(nil),         // 32: pitrd.v1.SpaceResponse
+	(*timestamppb.Timestamp)(nil), // 33: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),         // 34: google.protobuf.Empty
 }
 var file_pitrd_v1_pitrd_proto_depIdxs = []int32{
 	6,  // 0: pitrd.v1.InitResponse.volume:type_name -> pitrd.v1.VolumeStatus
 	6,  // 1: pitrd.v1.MountResponse.volume:type_name -> pitrd.v1.VolumeStatus
 	6,  // 2: pitrd.v1.StatusResponse.volumes:type_name -> pitrd.v1.VolumeStatus
-	31, // 3: pitrd.v1.Transaction.created_at:type_name -> google.protobuf.Timestamp
-	31, // 4: pitrd.v1.Transaction.closed_at:type_name -> google.protobuf.Timestamp
+	33, // 3: pitrd.v1.Transaction.created_at:type_name -> google.protobuf.Timestamp
+	33, // 4: pitrd.v1.Transaction.closed_at:type_name -> google.protobuf.Timestamp
 	8,  // 5: pitrd.v1.BeginResponse.transaction:type_name -> pitrd.v1.Transaction
 	8,  // 6: pitrd.v1.CommitResponse.transaction:type_name -> pitrd.v1.Transaction
 	8,  // 7: pitrd.v1.RollbackResponse.transaction:type_name -> pitrd.v1.Transaction
 	8,  // 8: pitrd.v1.LogEntry.transaction:type_name -> pitrd.v1.Transaction
 	16, // 9: pitrd.v1.LogsResponse.entries:type_name -> pitrd.v1.LogEntry
 	6,  // 10: pitrd.v1.RecoverResponse.volumes:type_name -> pitrd.v1.VolumeStatus
-	29, // 11: pitrd.v1.SpaceResponse.versions:type_name -> pitrd.v1.SpaceVersion
-	0,  // 12: pitrd.v1.Pitrd.Init:input_type -> pitrd.v1.InitRequest
-	2,  // 13: pitrd.v1.Pitrd.Mount:input_type -> pitrd.v1.MountRequest
-	4,  // 14: pitrd.v1.Pitrd.Umount:input_type -> pitrd.v1.UmountRequest
-	5,  // 15: pitrd.v1.Pitrd.Status:input_type -> pitrd.v1.StatusRequest
-	9,  // 16: pitrd.v1.Pitrd.Begin:input_type -> pitrd.v1.BeginRequest
-	11, // 17: pitrd.v1.Pitrd.Commit:input_type -> pitrd.v1.CommitRequest
-	13, // 18: pitrd.v1.Pitrd.Rollback:input_type -> pitrd.v1.RollbackRequest
-	15, // 19: pitrd.v1.Pitrd.Logs:input_type -> pitrd.v1.LogsRequest
-	18, // 20: pitrd.v1.Pitrd.Revert:input_type -> pitrd.v1.RevertRequest
-	20, // 21: pitrd.v1.Pitrd.Diff:input_type -> pitrd.v1.DiffRequest
-	22, // 22: pitrd.v1.Pitrd.Recover:input_type -> pitrd.v1.RecoverRequest
-	24, // 23: pitrd.v1.Pitrd.ConfigSet:input_type -> pitrd.v1.ConfigSetRequest
-	26, // 24: pitrd.v1.Pitrd.Clear:input_type -> pitrd.v1.ClearRequest
-	28, // 25: pitrd.v1.Pitrd.Space:input_type -> pitrd.v1.SpaceRequest
-	1,  // 26: pitrd.v1.Pitrd.Init:output_type -> pitrd.v1.InitResponse
-	3,  // 27: pitrd.v1.Pitrd.Mount:output_type -> pitrd.v1.MountResponse
-	32, // 28: pitrd.v1.Pitrd.Umount:output_type -> google.protobuf.Empty
-	7,  // 29: pitrd.v1.Pitrd.Status:output_type -> pitrd.v1.StatusResponse
-	10, // 30: pitrd.v1.Pitrd.Begin:output_type -> pitrd.v1.BeginResponse
-	12, // 31: pitrd.v1.Pitrd.Commit:output_type -> pitrd.v1.CommitResponse
-	14, // 32: pitrd.v1.Pitrd.Rollback:output_type -> pitrd.v1.RollbackResponse
-	17, // 33: pitrd.v1.Pitrd.Logs:output_type -> pitrd.v1.LogsResponse
-	19, // 34: pitrd.v1.Pitrd.Revert:output_type -> pitrd.v1.RevertResponse
-	21, // 35: pitrd.v1.Pitrd.Diff:output_type -> pitrd.v1.DiffResponse
-	23, // 36: pitrd.v1.Pitrd.Recover:output_type -> pitrd.v1.RecoverResponse
-	25, // 37: pitrd.v1.Pitrd.ConfigSet:output_type -> pitrd.v1.ConfigSetResponse
-	27, // 38: pitrd.v1.Pitrd.Clear:output_type -> pitrd.v1.ClearResponse
-	30, // 39: pitrd.v1.Pitrd.Space:output_type -> pitrd.v1.SpaceResponse
-	26, // [26:40] is the sub-list for method output_type
-	12, // [12:26] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	8,  // 11: pitrd.v1.SquashResponse.transaction:type_name -> pitrd.v1.Transaction
+	31, // 12: pitrd.v1.SpaceResponse.versions:type_name -> pitrd.v1.SpaceVersion
+	0,  // 13: pitrd.v1.Pitrd.Init:input_type -> pitrd.v1.InitRequest
+	2,  // 14: pitrd.v1.Pitrd.Mount:input_type -> pitrd.v1.MountRequest
+	4,  // 15: pitrd.v1.Pitrd.Umount:input_type -> pitrd.v1.UmountRequest
+	5,  // 16: pitrd.v1.Pitrd.Status:input_type -> pitrd.v1.StatusRequest
+	9,  // 17: pitrd.v1.Pitrd.Begin:input_type -> pitrd.v1.BeginRequest
+	11, // 18: pitrd.v1.Pitrd.Commit:input_type -> pitrd.v1.CommitRequest
+	13, // 19: pitrd.v1.Pitrd.Rollback:input_type -> pitrd.v1.RollbackRequest
+	15, // 20: pitrd.v1.Pitrd.Logs:input_type -> pitrd.v1.LogsRequest
+	18, // 21: pitrd.v1.Pitrd.Revert:input_type -> pitrd.v1.RevertRequest
+	20, // 22: pitrd.v1.Pitrd.Diff:input_type -> pitrd.v1.DiffRequest
+	22, // 23: pitrd.v1.Pitrd.Recover:input_type -> pitrd.v1.RecoverRequest
+	24, // 24: pitrd.v1.Pitrd.ConfigSet:input_type -> pitrd.v1.ConfigSetRequest
+	26, // 25: pitrd.v1.Pitrd.Clear:input_type -> pitrd.v1.ClearRequest
+	28, // 26: pitrd.v1.Pitrd.Squash:input_type -> pitrd.v1.SquashRequest
+	30, // 27: pitrd.v1.Pitrd.Space:input_type -> pitrd.v1.SpaceRequest
+	1,  // 28: pitrd.v1.Pitrd.Init:output_type -> pitrd.v1.InitResponse
+	3,  // 29: pitrd.v1.Pitrd.Mount:output_type -> pitrd.v1.MountResponse
+	34, // 30: pitrd.v1.Pitrd.Umount:output_type -> google.protobuf.Empty
+	7,  // 31: pitrd.v1.Pitrd.Status:output_type -> pitrd.v1.StatusResponse
+	10, // 32: pitrd.v1.Pitrd.Begin:output_type -> pitrd.v1.BeginResponse
+	12, // 33: pitrd.v1.Pitrd.Commit:output_type -> pitrd.v1.CommitResponse
+	14, // 34: pitrd.v1.Pitrd.Rollback:output_type -> pitrd.v1.RollbackResponse
+	17, // 35: pitrd.v1.Pitrd.Logs:output_type -> pitrd.v1.LogsResponse
+	19, // 36: pitrd.v1.Pitrd.Revert:output_type -> pitrd.v1.RevertResponse
+	21, // 37: pitrd.v1.Pitrd.Diff:output_type -> pitrd.v1.DiffResponse
+	23, // 38: pitrd.v1.Pitrd.Recover:output_type -> pitrd.v1.RecoverResponse
+	25, // 39: pitrd.v1.Pitrd.ConfigSet:output_type -> pitrd.v1.ConfigSetResponse
+	27, // 40: pitrd.v1.Pitrd.Clear:output_type -> pitrd.v1.ClearResponse
+	29, // 41: pitrd.v1.Pitrd.Squash:output_type -> pitrd.v1.SquashResponse
+	32, // 42: pitrd.v1.Pitrd.Space:output_type -> pitrd.v1.SpaceResponse
+	28, // [28:43] is the sub-list for method output_type
+	13, // [13:28] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_pitrd_v1_pitrd_proto_init() }
@@ -2306,7 +2570,7 @@ func file_pitrd_v1_pitrd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pitrd_v1_pitrd_proto_rawDesc), len(file_pitrd_v1_pitrd_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   31,
+			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -412,6 +412,20 @@ pitr revert --at '2026-07-31T18:30:00+08:00' --path ./project
 pitr revert --at '2026-07-31T10:30:00Z' --dry-run
 ```
 
+把一段连续的底层写操作压缩为一条业务变更记录：
+
+```bash
+# base 自身保留；实际合并范围是 (base,end]
+pitr squash <base版本号> <end版本号> -m '发布用户登录功能' --dry-run
+pitr squash <base版本号> <end版本号> -m '发布用户登录功能' --yes
+```
+
+`squash` 保留 base 和 end 两个版本号，永久删除中间版本，并让 end 表示从
+base 到 end 的净变化。长日志中操作显示为 `squash`、原始命令显示为 `-`、
+操作时间使用被压缩的第一个操作时间、内容变化使用 `-m`。按时间回滚仍使用
+end 原本的完成时间，因此不会改变 `revert --at` 的边界。建议先用
+`--dry-run` 预览；实际执行必须显式添加 `--yes`。
+
 比较版本、清空历史和手动卸载/重新挂载：
 
 ```bash
