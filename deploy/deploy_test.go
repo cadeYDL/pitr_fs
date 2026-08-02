@@ -677,6 +677,18 @@ func TestInstall_WrapperMapsHostCWD(t *testing.T) {
 	if !bytes.Contains(output, []byte("<"+subdir+">")) {
 		t.Fatalf("init 相对路径没有解析为宿主绝对路径:\n%s", output)
 	}
+
+	command = exec.Command(wrapper, "init", "--help")
+	command.Dir = subdir
+	command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	output, err = command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("运行 init --help wrapper: %v\n%s", err, output)
+	}
+	if !bytes.Contains(output, []byte("<--help>")) ||
+		bytes.Contains(output, []byte("<"+filepath.Join(subdir, "--help")+">")) {
+		t.Fatalf("init --help 被误当作路径解析:\n%s", output)
+	}
 }
 
 func TestInstall_WrapperFallsBackWhenCWDWasDeleted(t *testing.T) {

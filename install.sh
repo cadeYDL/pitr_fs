@@ -346,7 +346,10 @@ if [ "\${1:-}" = "upgrade" ]; then
 fi
 pitr_args=("\$@")
 if [ "\${1:-}" = "init" ] && [ -n "\${2:-}" ]; then
-    pitr_args[1]="\$(realpath -m -- "\$2")"
+    case "\$2" in
+        -h|--help) ;;
+        *) pitr_args[1]="\$(realpath -m -- "\$2")" ;;
+    esac
 fi
 host_pwd=\${PWD:-}
 case "\$host_pwd" in
