@@ -52,41 +52,25 @@ func TestPitrCLI_VersionClientOnly(t *testing.T) {
 	}
 }
 
-func TestPitrCLI_CompletionHelpIsChinese(t *testing.T) {
-	for _, args := range [][]string{
-		{"completion", "--help"},
-		{"completion", "bash", "--help"},
-	} {
-		root := newRoot()
-		buf := new(bytes.Buffer)
-		root.SetOut(buf)
-		root.SetErr(buf)
-		root.SetArgs(args)
-		if err := root.Execute(); err != nil {
-			t.Fatalf("%v: %v", args, err)
-		}
-		output := buf.String()
-		if !strings.Contains(output, "生成") ||
-			!strings.Contains(output, "自动补全脚本") {
-			t.Fatalf("%v 未输出中文说明：\n%s", args, output)
-		}
-		if strings.Contains(output, "Generate the autocompletion") {
-			t.Fatalf("%v 仍包含英文说明：\n%s", args, output)
-		}
-	}
-}
-
-func TestPitrCLI_CompletionWritesToConfiguredOutput(t *testing.T) {
+func TestPitrCLI_DoesNotExposeUnrelatedCompletionCommand(t *testing.T) {
 	root := newRoot()
 	buf := new(bytes.Buffer)
 	root.SetOut(buf)
 	root.SetErr(buf)
-	root.SetArgs([]string{"completion", "bash"})
+	root.SetArgs([]string{"--help"})
 	if err := root.Execute(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("execute --help: %v", err)
 	}
-	if !strings.Contains(buf.String(), "bash completion V2 for pitr") {
-		t.Fatal("completion 脚本未写入命令配置的输出流")
+	if strings.Contains(buf.String(), "completion") {
+		t.Fatalf("--help 不应暴露 completion 子命令：\n%s", buf.String())
+	}
+
+	root = newRoot()
+	root.SetOut(new(bytes.Buffer))
+	root.SetErr(new(bytes.Buffer))
+	root.SetArgs([]string{"completion"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("completion 子命令应不存在")
 	}
 }
 
