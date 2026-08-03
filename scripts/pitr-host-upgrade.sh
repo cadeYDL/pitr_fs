@@ -87,11 +87,44 @@ docker_cli() {
     "${DOCKER_COMMAND[@]}" "$@"
 }
 
+contract_file_value() {
+    local file=$1 key=$2 value
+    value=$(awk -F= -v key="$key" '
+        $1==key && $2 ~ /^[0-9]+$/ { value=$2; count++ }
+        END { if (count==1) print value; else exit 1 }
+    ' "$file") || return 1
+    printf '%s\n' "$value"
+}
+
+validate_contract_file() {
+    local file=$1 revision min_logic listed expected
+    [ -r "$file" ] || { echo "错误: 升级包缺少 SCHEMA-COMPAT" >&2; return 1; }
+    listed=$(cut -d= -f1 "$file" | LC_ALL=C sort)
+    expected=$(printf '%s\n' min_logic_revision schema_revision | LC_ALL=C sort)
+    [ "$listed" = "$expected" ] || {
+        echo "错误: SCHEMA-COMPAT 只能包含 schema_revision 和 min_logic_revision" >&2
+        return 1
+    }
+    revision=$(contract_file_value "$file" schema_revision) || {
+        echo "错误: SCHEMA-COMPAT 的 schema_revision 无效" >&2
+        return 1
+    }
+    min_logic=$(contract_file_value "$file" min_logic_revision) || {
+        echo "错误: SCHEMA-COMPAT 的 min_logic_revision 无效" >&2
+        return 1
+    }
+    [ "$revision" -gt 0 ] && [ "$min_logic" -gt 0 ] && \
+        [ "$min_logic" -le "$revision" ] || {
+        echo "错误: SCHEMA-COMPAT 的兼容范围无效" >&2
+        return 1
+    }
+}
+
 validate_bundle() {
     local bundle=$1 work=$2 listed expected version binary_version
     [ -f "$bundle" ] || { echo "错误: 升级包不存在: $bundle" >&2; return 1; }
     listed=$(tar -tzf "$bundle" | LC_ALL=C sort)
-    expected=$(printf '%s\n' BUILD-INFO SHA256SUMS VERSION init_pitr.sql \
+    expected=$(printf '%s\n' BUILD-INFO SCHEMA-COMPAT SHA256SUMS VERSION init_pitr.sql \
         pitr pitr-host-upgrade pitrd |
         LC_ALL=C sort)
     [ "$listed" = "$expected" ] || {
@@ -105,11 +138,12 @@ validate_bundle() {
         return 1
     fi
     tar -xzf "$bundle" -C "$work" --no-same-owner --no-same-permissions -- \
-        pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO SHA256SUMS
+        pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT VERSION BUILD-INFO SHA256SUMS
     (cd "$work" && sha256sum -c SHA256SUMS >/dev/null) || {
         echo "错误: 升级包 SHA256 校验失败" >&2
         return 1
     }
+    validate_contract_file "$work/SCHEMA-COMPAT" || return 1
     [ "$(wc -l <"$work/VERSION")" -eq 1 ] || {
         echo "错误: VERSION 格式无效" >&2
         return 1
@@ -421,15 +455,54 @@ switch_runtime() {
     fi
 }
 
+runtime_contract_value() {
+    local target=$1 key=$2 file
+    if [ "$target" = builtin ]; then
+        docker_cli exec "$CONTAINER" cat /etc/pitr/SCHEMA-COMPAT |
+            awk -F= -v key="$key" '
+                $1==key && $2 ~ /^[0-9]+$/ { value=$2; count++ }
+                END { if (count==1) print value; else exit 1 }
+            '
+        return
+    fi
+    file="$RUNTIME_DIR/versions/$target/SCHEMA-COMPAT"
+    contract_file_value "$file" "$key"
+}
+
+schema_rollback_safe() {
+    local old=$1 target=$2 old_revision target_min
+    old_revision=$(runtime_contract_value "$old" schema_revision) || return 1
+    target_min=$(runtime_contract_value "$target" min_logic_revision) || return 1
+    [ "$old_revision" -ge "$target_min" ]
+}
+
 apply_schema() {
     local output
     if output=$(docker_cli exec "$CONTAINER" sh -c '
         schema=/etc/pitr/init_pitr.sql
+        contract=/etc/pitr/SCHEMA-COMPAT
+        cli=/usr/local/bin/pitr
         [ ! -r /opt/pitr/current/init_pitr.sql ] || schema=/opt/pitr/current/init_pitr.sql
-        PGOPTIONS="-c client_min_messages=warning" \
-          PGPASSWORD="$POSTGRES_PASSWORD" psql --single-transaction \
-          -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-          -v ON_ERROR_STOP=1 -f "$schema" >/dev/null
+        [ ! -r /opt/pitr/current/SCHEMA-COMPAT ] || contract=/opt/pitr/current/SCHEMA-COMPAT
+        [ ! -x /opt/pitr/current/pitr ] || cli=/opt/pitr/current/pitr
+        revision=$(awk -F= '\''$1=="schema_revision" { print $2 }'\'' "$contract")
+        min_logic=$(awk -F= '\''$1=="min_logic_revision" { print $2 }'\'' "$contract")
+        digest=$(sha256sum "$schema" | awk '\''{ print $1 }'\'')
+        logic_version=$("$cli" version --client-only |
+            awk '\''$1=="pitr" { print $2; exit }'\'')
+        case "$revision" in ""|*[!0-9]*) exit 64 ;; esac
+        case "$min_logic" in ""|*[!0-9]*) exit 64 ;; esac
+        case "$logic_version" in ""|*[!0-9A-Za-z._+-]*) exit 64 ;; esac
+        [ "$revision" -gt 0 ] && [ "$min_logic" -gt 0 ] &&
+            [ "$min_logic" -le "$revision" ] || exit 64
+        {
+            cat "$schema"
+            printf "%s\n" \
+              "INSERT INTO pitr_schema_state(singleton,schema_revision,min_logic_revision,digest,logic_version,applied_at) VALUES (true,$revision,$min_logic,'\''$digest'\'','\''$logic_version'\'',clock_timestamp()) ON CONFLICT (singleton) DO UPDATE SET schema_revision=EXCLUDED.schema_revision,min_logic_revision=EXCLUDED.min_logic_revision,digest=EXCLUDED.digest,logic_version=EXCLUDED.logic_version,applied_at=EXCLUDED.applied_at;"
+        } | PGOPTIONS="-c client_min_messages=warning" \
+            PGPASSWORD="$POSTGRES_PASSWORD" psql --single-transaction \
+            -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 >/dev/null
     ' 2>&1); then
         [ -z "$output" ] || printf '%s\n' "$output" >&2
         return 0
@@ -454,6 +527,19 @@ EOF
 
 current_schema_digest() {
     docker_cli exec "$CONTAINER" sh -c '
+        table=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -At \
+          -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+          -v ON_ERROR_STOP=1 -c "SELECT to_regclass('\''public.pitr_schema_state'\'')")
+        if [ "$table" = pitr_schema_state ]; then
+            digest=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -At \
+              -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+              -v ON_ERROR_STOP=1 -c \
+              "SELECT digest FROM pitr_schema_state WHERE singleton")
+            if [ -n "$digest" ]; then
+                printf "%s\n" "$digest"
+                exit 0
+            fi
+        fi
         schema=/etc/pitr/init_pitr.sql
         [ ! -r /opt/pitr/current/init_pitr.sql ] || schema=/opt/pitr/current/init_pitr.sql
         sha256sum "$schema"
@@ -520,7 +606,7 @@ install_version() {
         run_root install -d -m 0755 "$staging"
         run_root install -m 0755 "$work/pitr" "$work/pitrd" \
             "$work/pitr-host-upgrade" "$staging/"
-        run_root install -m 0644 "$work/init_pitr.sql" "$work/VERSION" \
+        run_root install -m 0644 "$work/init_pitr.sql" "$work/SCHEMA-COMPAT" "$work/VERSION" \
             "$work/BUILD-INFO" "$work/SHA256SUMS" "$staging/"
         run_root mv "$staging" "$destination"
     fi
@@ -532,6 +618,7 @@ install_version() {
 
 perform_switch() {
     local target=$1 old=$2 expected=$3 old_expected=$4 old_schema target_schema
+    local rollback_safe=0
     old_schema=$(current_schema_digest) || {
         echo "错误: 无法计算当前 schema 摘要" >&2
         return 1
@@ -540,17 +627,15 @@ perform_switch() {
         echo "错误: 无法计算目标 schema 摘要" >&2
         return 1
     }
+    if [ "$old_schema" = "$target_schema" ] || schema_rollback_safe "$old" "$target"; then
+        rollback_safe=1
+    fi
     if ! unmount_filesystem; then
         echo "错误: 文件系统未能安全卸载，逻辑版本未切换" >&2
         return 1
     fi
-    if ! printf '%s\n' "$old" |
-        run_root tee "$RUNTIME_DIR/upgrade-fallback" >/dev/null; then
-        recover_mount
-        return 1
-    fi
+    run_root rm -f "$RUNTIME_DIR/upgrade-fallback"
     if ! switch_runtime "$target" "$old"; then
-        run_root rm -f "$RUNTIME_DIR/upgrade-fallback"
         recover_mount
         echo "错误: 无法切换逻辑运行目录，已恢复挂载" >&2
         return 1
@@ -568,17 +653,24 @@ perform_switch() {
         return 1
     fi
     if ! record_schema_digest "$target_schema"; then
-        switch_runtime "$old" "$target" || true
-        run_root rm -f "$RUNTIME_DIR/upgrade-fallback"
-        recover_mount
-        echo "错误: 无法持久化 schema 版本，已恢复旧逻辑" >&2
-        return 1
+        echo "警告: 无法更新宿主 schema 摘要缓存；数据库内账本已成功提交" >&2
+    fi
+    if [ "$rollback_safe" -eq 1 ]; then
+        if ! printf '%s\n' "$old" |
+            run_root tee "$RUNTIME_DIR/upgrade-fallback" >/dev/null; then
+            echo "错误: 无法建立安全回退标记，升级保持停止状态" >&2
+            return 1
+        fi
     fi
     if ! request_restart; then
-        switch_runtime "$old" "$target" || true
         run_root rm -f "$RUNTIME_DIR/upgrade-fallback"
-        recover_mount
-        echo "错误: 无法请求 pitrd 重启，已恢复旧逻辑" >&2
+        if [ "$rollback_safe" -eq 1 ]; then
+            switch_runtime "$old" "$target" || true
+            recover_mount
+            echo "错误: 无法请求 pitrd 重启，已恢复旧逻辑" >&2
+        else
+            echo "严重错误: 新 schema 已提交，但旧逻辑未声明兼容；服务保持停止，未执行不安全的二进制回退" >&2
+        fi
         return 1
     fi
     if wait_version "$expected"; then
@@ -587,7 +679,14 @@ perform_switch() {
         return 0
     fi
 
-    echo "错误: 新版 pitrd 未通过健康检查，正在回退到 $old" >&2
+    if [ "$rollback_safe" -ne 1 ]; then
+        run_root rm -f "$RUNTIME_DIR/upgrade-fallback"
+        echo "严重错误: 新版 pitrd 未通过健康检查。数据库 schema 已提交，旧逻辑未声明兼容，因此服务保持停止且不会自动回退。" >&2
+        echo "数据未删除；请保留当前现场并使用兼容该 schema 的逻辑版本恢复。" >&2
+        return 1
+    fi
+
+    echo "错误: 新版 pitrd 未通过健康检查，schema 契约允许回退到 $old" >&2
     switch_runtime "$old" "$target"
     request_restart || true
     if ! wait_version "$old_expected"; then

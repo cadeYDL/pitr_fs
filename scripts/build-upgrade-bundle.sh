@@ -47,15 +47,16 @@ ldflags="-s -w -X pitr_fs/internal/buildinfo.Version=$version -X pitr_fs/interna
         go build -trimpath -ldflags="$ldflags" -o "$work/pitrd" ./cmd/pitrd
 )
 install -m 0644 "$REPO_ROOT/internal/schema/init_pitr.sql" "$work/init_pitr.sql"
+install -m 0644 "$REPO_ROOT/SCHEMA-COMPAT" "$work/SCHEMA-COMPAT"
 install -m 0755 "$REPO_ROOT/scripts/pitr-host-upgrade.sh" "$work/pitr-host-upgrade"
 printf '%s\n' "$version" >"$work/VERSION"
 printf 'commit=%s\nbuild_date=%s\ngoarch=%s\n' \
     "$commit" "$build_date" "$goarch" >"$work/BUILD-INFO"
 (
     cd "$work"
-    sha256sum pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO \
+    sha256sum pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT VERSION BUILD-INFO \
         >SHA256SUMS
-    tar -czf "$output" pitr pitrd pitr-host-upgrade init_pitr.sql \
+    tar -czf "$output" pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT \
         VERSION BUILD-INFO SHA256SUMS
 )
 echo "已生成逻辑升级包: $output"

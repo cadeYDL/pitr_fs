@@ -13,25 +13,81 @@ runtime_file() {
     local name=$1
     if [ -e "/opt/pitr/current/$name" ]; then
         printf '/opt/pitr/current/%s\n' "$name"
-    elif [ "$name" = init_pitr.sql ]; then
-        printf '/etc/pitr/init_pitr.sql\n'
     else
-        printf '/usr/local/bin/%s\n' "$name"
+        case "$name" in
+            init_pitr.sql|SCHEMA-COMPAT) printf '/etc/pitr/%s\n' "$name" ;;
+            *) printf '/usr/local/bin/%s\n' "$name" ;;
+        esac
     fi
 }
 
+contract_value() {
+    local file=$1 key=$2 value
+    value=$(awk -F= -v key="$key" '
+        $1==key && $2 ~ /^[0-9]+$/ { value=$2; count++ }
+        END { if (count==1) print value; else exit 1 }
+    ' "$file") || return 1
+    printf '%s\n' "$value"
+}
+
 apply_schema() {
-    local force=${1:-0} digest applied temporary
+    local force=${1:-0} digest applied temporary contract revision min_logic
+    local logic_version schema_table
     digest=$(sha256sum "$SCHEMA_PATH" | awk '{print $1}')
-    applied=$(cat /opt/pitr/schema.applied.sha256 2>/dev/null || true)
+    contract=$(runtime_file SCHEMA-COMPAT)
+    revision=$(contract_value "$contract" schema_revision) || {
+        log "schema 兼容契约损坏: $contract"
+        return 1
+    }
+    min_logic=$(contract_value "$contract" min_logic_revision) || {
+        log "schema 兼容契约损坏: $contract"
+        return 1
+    }
+    [ "$min_logic" -le "$revision" ] || {
+        log "schema 兼容契约非法: min_logic_revision > schema_revision"
+        return 1
+    }
+    logic_version=$($(runtime_file pitr) version --client-only |
+        awk '$1=="pitr" { print $2; exit }')
+    [ -n "$logic_version" ] || return 1
+
+    # 外部摘要只保留作运维提示；是否跳过完全由数据库内账本决定。
+    schema_table=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -At \
+        -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -v ON_ERROR_STOP=1 -c "SELECT to_regclass('public.pitr_schema_state')")
+    applied=""
+    if [ "$schema_table" = pitr_schema_state ]; then
+        applied=$(PGPASSWORD="$POSTGRES_PASSWORD" psql -At \
+            -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 -c \
+            "SELECT digest FROM pitr_schema_state WHERE singleton" || true)
+    fi
     if [ "$force" -eq 0 ] && [ "$digest" = "$applied" ]; then
         log "MVCC schema 内容未变化,跳过重复校准"
         return 0
     fi
-    PGOPTIONS="-c client_min_messages=warning" \
+    {
+        cat "$SCHEMA_PATH"
+        cat <<'SQL'
+INSERT INTO pitr_schema_state(
+    singleton,schema_revision,min_logic_revision,digest,logic_version,applied_at
+) VALUES (
+    true,:schema_revision,:min_logic_revision,:'schema_digest',:'logic_version',
+    clock_timestamp()
+)
+ON CONFLICT (singleton) DO UPDATE
+   SET schema_revision=EXCLUDED.schema_revision,
+       min_logic_revision=EXCLUDED.min_logic_revision,
+       digest=EXCLUDED.digest,
+       logic_version=EXCLUDED.logic_version,
+       applied_at=EXCLUDED.applied_at;
+SQL
+    } | PGOPTIONS="-c client_min_messages=warning" \
         PGPASSWORD="$POSTGRES_PASSWORD" psql --single-transaction \
         -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-        -v ON_ERROR_STOP=1 -f "$SCHEMA_PATH" >/dev/null
+        -v ON_ERROR_STOP=1 -v schema_revision="$revision" \
+        -v min_logic_revision="$min_logic" -v schema_digest="$digest" \
+        -v logic_version="$logic_version" >/dev/null
     temporary=/opt/pitr/.schema.applied.$$
     printf '%s\n' "$digest" >"$temporary"
     mv -f "$temporary" /opt/pitr/schema.applied.sha256

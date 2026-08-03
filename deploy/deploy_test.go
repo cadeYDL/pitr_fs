@@ -349,11 +349,110 @@ func TestBuildUpgradeBundleSupportsLinuxArchitecturesAndSelfUpdate(t *testing.T)
 	}
 	for _, required := range []string{
 		`PITR_GOARCH`, `GOOS=linux GOARCH="$goarch"`,
-		`pitr-host-upgrade`, `goarch=%s`,
+		`pitr-host-upgrade`, `goarch=%s`, `SCHEMA-COMPAT`,
 	} {
 		if !bytes.Contains(content, []byte(required)) {
 			t.Errorf("升级包构建器缺少 %q", required)
 		}
+	}
+}
+
+func TestLogicUpgradeUsesExplicitSchemaCompatibilityContract(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+runtime_contract_value() {
+  case "$1:$2" in
+    old:schema_revision) echo 3 ;;
+    target:min_logic_revision) echo 2 ;;
+    *) return 1 ;;
+  esac
+}
+schema_rollback_safe old target
+runtime_contract_value() {
+  case "$1:$2" in
+    old:schema_revision) echo 1 ;;
+    target:min_logic_revision) echo 2 ;;
+    *) return 1 ;;
+  esac
+}
+if schema_rollback_safe old target; then
+  echo "不兼容版本不应允许自动回退" >&2
+  exit 9
+fi
+`, "bash", script)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("schema 兼容契约判断失败: %v\n%s", err, output)
+	}
+}
+
+func TestLogicUpgradeDoesNotRollbackBinaryAcrossUnsafeSchema(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+source "$1"
+RUNTIME_DIR=/runtime
+current_schema_digest() { echo old-digest; }
+target_schema_digest() { echo new-digest; }
+schema_rollback_safe() { return 1; }
+unmount_filesystem() { return 0; }
+run_root() { [ "$1" != tee ] || cat >/dev/null; return 0; }
+switch_runtime() { echo "switch:$1"; return 0; }
+apply_schema() { return 0; }
+record_schema_digest() { return 0; }
+request_restart() { return 0; }
+wait_version() { return 1; }
+recover_mount() { echo recovered; }
+if perform_switch target old new-version old-version; then
+  echo "健康检查失败不应返回成功" >&2
+  exit 8
+fi
+`, "bash", script)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("模拟不兼容升级失败路径: %v\n%s", err, output)
+	}
+	if bytes.Contains(output, []byte("switch:old")) ||
+		bytes.Contains(output, []byte("recovered")) {
+		t.Fatalf("不兼容 schema 后不应恢复旧逻辑/挂载:\n%s", output)
+	}
+	for _, expected := range []string{"switch:target", "服务保持停止", "不会自动回退"} {
+		if !bytes.Contains(output, []byte(expected)) {
+			t.Errorf("不安全回退提示缺少 %q:\n%s", expected, output)
+		}
+	}
+}
+
+func TestEntrypointUsesDatabaseSchemaLedgerAsAuthority(t *testing.T) {
+	root := repoRoot(t)
+	entrypoint, err := os.ReadFile(filepath.Join(root, "deploy", "entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"pitr_schema_state", "schema_revision", "min_logic_revision",
+		`SCHEMA-COMPAT`, `psql --single-transaction`,
+	} {
+		if !bytes.Contains(entrypoint, []byte(required)) {
+			t.Errorf("entrypoint 缺少数据库 schema 契约片段 %q", required)
+		}
+	}
+	if bytes.Contains(entrypoint,
+		[]byte(`applied=$(cat /opt/pitr/schema.applied.sha256`)) {
+		t.Error("entrypoint 不能再以数据库外摘要决定是否跳过 schema")
 	}
 }
 

@@ -78,6 +78,7 @@ COPY --from=builder /out/pitr  /usr/local/bin/pitr
 #   /etc/pitr/ 由 entrypoint 在 PG 就绪后再幂等跑一次(镜像升级补 DDL)
 COPY internal/schema/init_pitr.sql /docker-entrypoint-initdb.d/10-pitr-schema.sql
 COPY internal/schema/init_pitr.sql /etc/pitr/init_pitr.sql
+COPY SCHEMA-COMPAT /etc/pitr/SCHEMA-COMPAT
 
 # 容器编排脚本
 COPY deploy/entrypoint.sh /usr/local/bin/pitr-entrypoint.sh

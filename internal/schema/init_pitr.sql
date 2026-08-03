@@ -163,6 +163,19 @@ CREATE TABLE IF NOT EXISTS pitr_prune_queue (
     last_error   text
 );
 
+-- 数据库内的 schema 账本是升级判断的权威来源。init_pitr.sql 只负责确保
+-- 表结构存在；部署器在同一个 psql --single-transaction 中写入本次逻辑
+-- 版本、摘要和兼容边界，避免数据库恢复后被宿主机旧摘要误判为已校准。
+CREATE TABLE IF NOT EXISTS pitr_schema_state (
+    singleton           boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    schema_revision     bigint NOT NULL CHECK (schema_revision > 0),
+    min_logic_revision  bigint NOT NULL CHECK (min_logic_revision > 0),
+    digest              text NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
+    logic_version       text NOT NULL,
+    applied_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (min_logic_revision <= schema_revision)
+);
+
 CREATE TABLE IF NOT EXISTS pitr_internal_state (
     key          text PRIMARY KEY,
     value        text NOT NULL,

@@ -233,12 +233,23 @@ func TestSQL_TablesExist(t *testing.T) {
 		"pitr_slice_pin", "pitr_slice_ref", "pitr_gc_queue",
 		"pitr_prune_queue",
 		"pitr_internal_state", "pitr_slice_index_state", "pitr_space_state",
+		"pitr_schema_state",
 		"pitr_config", "pitr_volume_config",
 	} {
 		n := mustScalarInt(t, conn,
 			"SELECT count(*) FROM information_schema.tables WHERE table_name = $1", tbl)
 		if n != 1 {
 			t.Errorf("表 %s 未建", tbl)
+		}
+	}
+	for _, column := range []string{
+		"schema_revision", "min_logic_revision", "digest", "logic_version",
+	} {
+		got := mustScalarInt(t, conn, `
+			SELECT count(*) FROM information_schema.columns
+			 WHERE table_name='pitr_schema_state' AND column_name=$1`, column)
+		if got != 1 {
+			t.Errorf("pitr_schema_state 缺少列 %s", column)
 		}
 	}
 
