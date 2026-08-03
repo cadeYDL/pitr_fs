@@ -42,13 +42,6 @@ func (n *Node) Create(
 			}
 			return errno
 		})
-	if errno == 0 && file != nil && file.writable {
-		if keepErrno := n.keepWritableWindow(
-			ctx, path, command("open-write", path), posixOp, file); keepErrno != 0 {
-			_ = file.LoopbackFile.Release(ctx)
-			return nil, nil, 0, keepErrno
-		}
-	}
 	return inode, fh, fuseFlags, errno
 }
 
@@ -169,15 +162,6 @@ func (n *Node) Open(
 		errno = n.versionedHook(
 			ctx, path, command("open", path), posixOp, 0, open)
 	}
-	if errno == 0 {
-		if file, ok := tracked(fh); ok && file.writable {
-			if keepErrno := n.keepWritableWindow(
-				ctx, path, command("open-write", path), posixOp, file); keepErrno != 0 {
-				_ = file.LoopbackFile.Release(ctx)
-				return nil, 0, keepErrno
-			}
-		}
-	}
 	return fh, fuseFlags, errno
 }
 
@@ -192,15 +176,20 @@ func (n *Node) Write(
 		return 0, syscall.EBADF
 	}
 	path := n.root.visiblePath(n)
-	sample := n.root.sampleWrite(path, data, off)
 	posixOp := fmt.Sprintf("write(%q, offset=%d, len=%d)",
 		path, off, len(data))
+	if keepErrno := n.keepWritableWindow(
+		ctx, path, command("write", path), posixOp, file); keepErrno != 0 {
+		return 0, keepErrno
+	}
+	sample := n.root.sampleWrite(path, data, off)
 	errno = n.versionedHook(ctx, path, command("write", path), posixOp, file.id,
 		func() syscall.Errno {
 			written, errno = file.LoopbackFile.Write(ctx, data, off)
 			return errno
 		})
 	if errno == 0 && written != 0 {
+		file.mutated.Store(true)
 		sample.length = int(written)
 		if len(sample.before) > int(written) {
 			sample.before = sample.before[:written]
@@ -224,18 +213,27 @@ func (n *Node) Setattr(
 	if _, ok := in.GetSize(); ok {
 		op = "truncate"
 	}
-	var fd uint64
-	if file, ok := tracked(f); ok {
-		fd = file.id
-	}
 	posixOp := fmt.Sprintf("setattr(%q)", path)
 	if size, ok := in.GetSize(); ok {
 		posixOp = fmt.Sprintf("truncate(%q, %d)", path, size)
 	}
-	return n.versionedHook(ctx, path, command(op, path), posixOp, fd,
+	var fd uint64
+	file, trackedFile := tracked(f)
+	if trackedFile {
+		fd = file.id
+		if keepErrno := n.keepWritableWindow(
+			ctx, path, command(op, path), posixOp, file); keepErrno != 0 {
+			return keepErrno
+		}
+	}
+	errno := n.versionedHook(ctx, path, command(op, path), posixOp, fd,
 		func() syscall.Errno {
 			return n.LoopbackNode.Setattr(ctx, f, in, out)
 		})
+	if errno == 0 && trackedFile {
+		file.mutated.Store(true)
+	}
+	return errno
 }
 
 func (n *Node) Setxattr(
@@ -274,10 +272,18 @@ func (n *Node) Allocate(
 	path := n.root.visiblePath(n)
 	posixOp := fmt.Sprintf("fallocate(%q, offset=%d, len=%d, mode=%d)",
 		path, off, size, mode)
-	return n.versionedHook(ctx, path, command("fallocate", path), posixOp, file.id,
+	if keepErrno := n.keepWritableWindow(
+		ctx, path, command("fallocate", path), posixOp, file); keepErrno != 0 {
+		return keepErrno
+	}
+	errno := n.versionedHook(ctx, path, command("fallocate", path), posixOp, file.id,
 		func() syscall.Errno {
 			return file.LoopbackFile.Allocate(ctx, off, size, mode)
 		})
+	if errno == 0 {
+		file.mutated.Store(true)
+	}
+	return errno
 }
 
 // Flush 为已有变更的 mmap/close 提供兜底打点。只有该 fd 已经由 Create、
@@ -357,6 +363,10 @@ func (n *Node) CopyFileRange(
 	posixOp := fmt.Sprintf(
 		"copy_file_range(<source>, %q, offset=%d, len=%d)",
 		path, offOut, length)
+	if keepErrno := destinationNode.keepWritableWindow(
+		ctx, path, command("copy_file_range", path), posixOp, destination); keepErrno != 0 {
+		return 0, keepErrno
+	}
 	errno = destinationNode.versionedHook(
 		ctx, path, command("copy_file_range", path), posixOp, destination.id,
 		func() syscall.Errno {
@@ -373,6 +383,7 @@ func (n *Node) CopyFileRange(
 			return errno
 		})
 	if errno == 0 && count != 0 {
+		destination.mutated.Store(true)
 		destination.addWriteSample(writeSample{
 			offset: int64(offOut), length: int(count), calls: 1,
 		})

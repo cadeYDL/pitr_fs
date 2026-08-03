@@ -263,7 +263,7 @@ func TestLoopback_AllMutationOperationsAreVersioned(t *testing.T) {
 		seen[op] = true
 	}
 	for _, op := range []string{
-		"mkdir", "create", "open-write", "setxattr", "removexattr", "link",
+		"mkdir", "create", "write", "setxattr", "removexattr", "link",
 		"symlink", "rename", "unlink", "rmdir",
 	} {
 		if !seen[op] {
@@ -319,7 +319,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		assertFirst("open-write")
+		assertFirst("write")
 	})
 
 	t.Run("setattr", func(t *testing.T) {
@@ -352,7 +352,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		assertFirst("open-write")
+		assertFirst("fallocate")
 	})
 
 	t.Run("open_trunc", func(t *testing.T) {
@@ -365,7 +365,7 @@ func TestLoopback_FileMutationHandlers_FirstOperation(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Linux FUSE 可把 O_TRUNC 下沉成 SETATTR(size=0),两种路径都满足语义。
-		assertFirst("open", "truncate", "open-write")
+		assertFirst("open", "truncate")
 	})
 }
 
@@ -562,6 +562,27 @@ func TestLoopback_DiscardOpenWritesRestoresPartialFile(t *testing.T) {
 	manager.mu.Unlock()
 	if aborts != 1 {
 		t.Fatalf("abort calls=%d", aborts)
+	}
+}
+
+func TestLoopback_WritableOpenWithoutMutationDoesNotCreateVersion(t *testing.T) {
+	manager := new(mockManager)
+	backend, mount, _ := mountedLoopback(t, WithManager(manager))
+	if err := os.WriteFile(filepath.Join(backend, "idle"), []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(mount, "idle"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	opens, closes := manager.openCalls, manager.closeCalls
+	manager.mu.Unlock()
+	if opens != 0 || closes != 0 {
+		t.Fatalf("仅打开可写 fd 不应创建版本: opens=%d closes=%d", opens, closes)
 	}
 }
 

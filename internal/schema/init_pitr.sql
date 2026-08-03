@@ -1368,6 +1368,30 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Engine 把目录闭包保存在连接级临时表中。用动态 SQL 读取 pg_temp，避免
+-- procedure 创建时依赖尚不存在的临时 relation；聚合数组只在 PostgreSQL
+-- 进程内部传给兼容的 pitr_revert 主过程，不经过 Go 客户端往返。
+CREATE OR REPLACE PROCEDURE pitr_revert_from_temp(
+    p_target_hash char(12),
+    p_scope_path text,
+    p_capture_txn_id bigint,
+    p_filter_scope boolean
+) AS $$
+DECLARE
+    v_scope_inodes bigint[];
+BEGIN
+    IF p_filter_scope THEN
+        EXECUTE 'SELECT COALESCE(array_agg(inode),ARRAY[]::bigint[])
+                   FROM pg_temp.pitr_revert_scope_inode'
+           INTO v_scope_inodes;
+    ELSE
+        v_scope_inodes := NULL;
+    END IF;
+    CALL pitr_revert(
+        p_target_hash,p_scope_path,p_capture_txn_id,v_scope_inodes);
+END;
+$$ LANGUAGE plpgsql;
+
 -- ============================================================================
 -- active transaction rollback
 --

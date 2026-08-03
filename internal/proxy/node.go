@@ -20,6 +20,7 @@ type trackedFile struct {
 	writable  bool
 	released  atomic.Bool
 	discarded atomic.Bool
+	mutated   atomic.Bool
 
 	auditMu sync.Mutex
 	path    string

@@ -316,6 +316,46 @@ func TestRevert_SubtreeInodeClosureWithinBroadTxn(t *testing.T) {
 	}
 }
 
+func TestPrepareScopeInodesStaysInsidePostgresTempTable(t *testing.T) {
+	_, db := setupEngine(t)
+	engine := NewEngine(db, WithMountPath("/workspace"))
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jfs_node(inode,mode,nlink,length,parent)
+		VALUES (10,16877,2,0,1);
+		INSERT INTO jfs_edge(parent,name,inode,type)
+		VALUES (1,convert_to('proj','UTF8'),10,2);
+		INSERT INTO jfs_node(inode,mode,nlink,length,parent)
+		SELECT value,33188,1,1,10 FROM generate_series(1000,5999) value;
+		INSERT INTO jfs_edge(parent,name,inode,type)
+		SELECT 10,convert_to(value::text,'UTF8'),value,1
+		  FROM generate_series(1000,5999) value`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InTx(ctx, func(txDB pg.Tx) error {
+		filtered, err := engine.prepareScopeInodes(
+			ctx, txDB, 1, "/workspace/proj")
+		if err != nil {
+			return err
+		}
+		if !filtered {
+			return errors.New("配置 mount path 后应启用 inode closure")
+		}
+		var count int64
+		if err := txDB.QueryRow(ctx,
+			"SELECT count(*) FROM pg_temp.pitr_revert_scope_inode").
+			Scan(&count); err != nil {
+			return err
+		}
+		if count != 5001 {
+			return fmt.Errorf("temp scope inode=%d,期望 5001", count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRevert_RejectsActiveScope(t *testing.T) {
 	engine, db := setupEngine(t)
 	if _, err := db.Exec(context.Background(), `

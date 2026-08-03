@@ -190,6 +190,9 @@ func (n *Node) keepWritableWindow(
 	if root.Quiescing() {
 		return syscall.EBUSY
 	}
+	if root.active != nil && root.active.files[file.id] == file {
+		return 0
+	}
 
 	before := root.captureContent(absPath)
 	if root.active == nil {
@@ -247,15 +250,17 @@ func (n *Node) closeWritableWindow(
 
 	path, posixOp, before, samples := file.auditState()
 	releaseErrno := file.LoopbackFile.Release(ctx)
-	after := root.captureContent(path)
-	window.posixOps = appendNonEmpty(
-		window.posixOps,
-		summarizeWriteOp(path, posixOp, samples),
-	)
-	window.summaries = appendNonEmpty(
-		window.summaries,
-		summarizeContent(before, after, samples),
-	)
+	if file.mutated.Load() {
+		after := root.captureContent(path)
+		window.posixOps = appendNonEmpty(
+			window.posixOps,
+			summarizeWriteOp(path, posixOp, samples),
+		)
+		window.summaries = appendNonEmpty(
+			window.summaries,
+			summarizeContent(before, after, samples),
+		)
+	}
 	delete(window.files, file.id)
 	if len(window.files) != 0 {
 		root.window.Unlock()
@@ -269,12 +274,17 @@ func (n *Node) closeWritableWindow(
 	root.window.Unlock()
 
 	finalCtx, cancel := root.managerContext(context.Background())
-	closeErr := root.manager.CloseStandaloneVersion(
-		finalCtx,
-		window.autoID,
-		joinAudit(window.posixOps),
-		joinAudit(window.summaries),
-	)
+	var closeErr error
+	if len(window.posixOps) == 0 {
+		closeErr = root.manager.AbortAutoVersion(finalCtx, window.autoID)
+	} else {
+		closeErr = root.manager.CloseStandaloneVersion(
+			finalCtx,
+			window.autoID,
+			joinAudit(window.posixOps),
+			joinAudit(window.summaries),
+		)
+	}
 	cancel()
 	if closeErr != nil {
 		slog.Error("关闭 writable auto 窗口",

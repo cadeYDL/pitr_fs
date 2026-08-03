@@ -137,9 +137,15 @@ func (e *Engine) Revert(
 			return fmt.Errorf("%w: %d", ErrActiveScope, activeCount)
 		}
 
-		var scopeInodes []int64
+		if _, createErr := tx.Exec(ctx, `
+			CREATE TEMP TABLE pitr_revert_scope_inode(
+				inode bigint PRIMARY KEY
+			) ON COMMIT DROP`); createErr != nil {
+			return fmt.Errorf("创建 revert scope 临时表: %w", createErr)
+		}
+		scopeFiltered := false
 		if scope != nil {
-			scopeInodes, err = e.resolveScopeInodes(
+			scopeFiltered, err = e.prepareScopeInodes(
 				ctx, tx, targetID, *scope)
 			if err != nil {
 				return err
@@ -151,28 +157,36 @@ func (e *Engine) Revert(
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
-			     AND ($3::bigint[] IS NULL OR h.inode=ANY($3))) +
+			     AND (NOT $3::boolean OR EXISTS (
+			          SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
+			           WHERE s.inode=h.inode))) +
 			  (SELECT count(*) FROM pitr_edge_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
-			     AND ($3::bigint[] IS NULL OR h.parent=ANY($3)
-			          OR (h.snapshot->>'inode')::bigint=ANY($3))) +
+			     AND (NOT $3::boolean OR EXISTS (
+			          SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
+			           WHERE s.inode=h.parent
+			              OR s.inode=(h.snapshot->>'inode')::bigint))) +
 			  (SELECT count(*) FROM pitr_chunk_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
-			     AND ($3::bigint[] IS NULL OR h.inode=ANY($3))) +
+			     AND (NOT $3::boolean OR EXISTS (
+			          SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
+			           WHERE s.inode=h.inode))) +
 			  (SELECT count(*) FROM pitr_chunk_ref_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
 			   WHERE t.id>$1
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
-			     AND ($3::bigint[] IS NULL OR NOT EXISTS (
+			     AND (NOT $3::boolean OR NOT EXISTS (
 			          SELECT 1 FROM pitr_chunk_history scoped_chunk
 			           WHERE scoped_chunk.txn_id=h.txn_id
-			             AND NOT (scoped_chunk.inode=ANY($3))
+			             AND NOT EXISTS (
+			                 SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
+			                  WHERE s.inode=scoped_chunk.inode)
 			     )))`,
-			targetID, scope, scopeInodes).Scan(&applied); scanErr != nil {
+			targetID, scope, scopeFiltered).Scan(&applied); scanErr != nil {
 			return scanErr
 		}
 		if options.DryRun {
@@ -213,8 +227,8 @@ func (e *Engine) Revert(
 			return errors.New("生成唯一 revert version hash 失败:连续冲突 3 次")
 		}
 		if _, callErr := tx.Exec(ctx,
-			"CALL pitr_revert($1,$2,$3,$4)",
-			targetHash, scope, revertID, scopeInodes); callErr != nil {
+			"CALL pitr_revert_from_temp($1,$2,$3,$4)",
+			targetHash, scope, revertID, scopeFiltered); callErr != nil {
 			return callErr
 		}
 		if _, pruneErr := txn.PruneClosedVersions(
@@ -263,29 +277,39 @@ func (e *Engine) waitForOpenWrites(
 	}
 }
 
-// resolveScopeInodes 用当前 edge 与目标之后的 edge history 合成目录图。这样
+// prepareScopeInodes 用当前 edge 与目标之后的 edge history 合成目录图。这样
 // 即使 scope 或其子项当前已被 rename/delete,仍能通过历史 edge 找回闭包。
-// mountPath 未配置时返回 nil,保留按 transaction scope 过滤的兼容语义。
-func (e *Engine) resolveScopeInodes(
+// 闭包保留在当前 PostgreSQL 事务的临时表中，计数与 replay 都在服务端 join，
+// 不再把大型 inode 数组物化到 Go 后又传回数据库。
+// mountPath 未配置时返回 false,保留按 transaction scope 过滤的兼容语义。
+func (e *Engine) prepareScopeInodes(
 	ctx context.Context,
 	tx pg.Tx,
 	targetID int64,
 	scope string,
-) ([]int64, error) {
+) (bool, error) {
+	if _, err := tx.Exec(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS pitr_revert_scope_inode(
+			inode bigint PRIMARY KEY
+		) ON COMMIT DROP;
+		TRUNCATE pg_temp.pitr_revert_scope_inode`); err != nil {
+		return false, fmt.Errorf("准备 revert scope 临时表: %w", err)
+	}
 	mountPath := e.getMountPath()
 	if mountPath == "" {
-		return nil, nil
+		return false, nil
 	}
 	relative, ok := strings.CutPrefix(path.Clean(scope), mountPath)
 	if !ok || (relative != "" && !strings.HasPrefix(relative, "/")) {
-		return []int64{}, nil
+		return true, nil
 	}
 	relative = strings.Trim(relative, "/")
 	parts := make([]string, 0)
 	if relative != "" {
 		parts = strings.Split(relative, "/")
 	}
-	rows, err := tx.Query(ctx, `
+	_, err := tx.Exec(ctx, `
+		INSERT INTO pg_temp.pitr_revert_scope_inode(inode)
 		WITH RECURSIVE
 		history_edges AS (
 		  SELECT edge.parent,convert_from(edge.name,'UTF8') AS name,edge.inode
@@ -317,22 +341,10 @@ func (e *Engine) resolveScopeInodes(
 		  UNION
 		  SELECT edge.inode FROM tree JOIN all_edges edge ON edge.parent=tree.inode
 		)
-		SELECT DISTINCT inode FROM tree ORDER BY inode`,
+		SELECT DISTINCT inode FROM tree`,
 		targetID, scope, parts)
 	if err != nil {
-		return nil, fmt.Errorf("解析 revert scope inode: %w", err)
+		return false, fmt.Errorf("解析 revert scope inode: %w", err)
 	}
-	defer rows.Close()
-	inodes := make([]int64, 0)
-	for rows.Next() {
-		var inode int64
-		if err := rows.Scan(&inode); err != nil {
-			return nil, fmt.Errorf("读取 revert scope inode: %w", err)
-		}
-		inodes = append(inodes, inode)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历 revert scope inode: %w", err)
-	}
-	return inodes, nil
+	return true, nil
 }
