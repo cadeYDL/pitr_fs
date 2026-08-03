@@ -17,7 +17,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "pitr_fs/api/pitrd/v1"
 	"pitr_fs/internal/buildinfo"
@@ -25,7 +27,8 @@ import (
 )
 
 const (
-	rpcTimeout             = 5 * time.Second
+	queryRPCTimeout        = 5 * time.Second
+	mutationRPCTimeout     = 30 * time.Minute
 	defaultHistoryLimitCLI = 100
 )
 
@@ -54,7 +57,15 @@ func (c *daemonClient) close() {
 }
 
 func rpcContext(cmd *cobra.Command) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(cmd.Context(), rpcTimeout)
+	timeout := queryRPCTimeout
+	switch cmd.Name() {
+	case "init", "recover", "mount", "umount", "rollback", "revert", "clear", "squash":
+		timeout = mutationRPCTimeout
+	}
+	if override, err := cmd.Root().PersistentFlags().GetDuration("timeout"); err == nil && override > 0 {
+		timeout = override
+	}
+	return context.WithTimeout(cmd.Context(), timeout)
 }
 
 // resolveCLIPath 把用户路径按 pitr 进程的工作目录转成 daemon 使用的绝对
@@ -72,6 +83,10 @@ func resolveCLIPath(value string) (string, error) {
 
 func friendlyRPCError(cmd *cobra.Command, err error) error {
 	socket, _ := cmd.Root().PersistentFlags().GetString("socket")
+	if status.Code(err) == codes.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("pitrd 请求超时(%s)；可用 --timeout 调整等待时间: %w",
+			socket, err)
+	}
 	return fmt.Errorf("pitrd 请求失败(%s): %w", socket, err)
 }
 
@@ -87,11 +102,23 @@ func newRoot() *cobra.Command {
 		Use:   "pitr",
 		Short: "pitr — 元数据 MVCC 文件系统 CLI",
 		Long:  `pitr 通过 unix socket 连接本地 pitrd,提供版本管理、revert、logs、diff 等命令。`,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			timeout, err := cmd.Root().PersistentFlags().GetDuration("timeout")
+			if err != nil {
+				return err
+			}
+			if timeout < 0 {
+				return errors.New("--timeout 不能为负数")
+			}
+			return nil
+		},
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 
 	// 全局 flag(未来放到 config)
 	root.PersistentFlags().String("socket", "/var/run/pitrd.sock", "pitrd unix socket")
+	root.PersistentFlags().Duration("timeout", 0,
+		"RPC 超时；0 使用命令默认值（查询 5s，挂载/恢复/清理 30m）")
 
 	// 生命周期 (§8.1)
 	root.AddCommand(newDaemonCmd())
@@ -945,7 +972,7 @@ func newSquashCmd() *cobra.Command {
 				return err
 			}
 			defer client.close()
-			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			actorUID, actorGID, actorPID, actorName := squashActor()
 			response, err := client.rpc.Squash(ctx, &pb.SquashRequest{

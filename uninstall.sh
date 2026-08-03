@@ -21,6 +21,29 @@ pitr_uninstall_main() (
     # shellcheck disable=SC1090
     source "$_pitr_uninstall_dir/install.sh"
 
+    remove_managed_volume() {
+        local volume=$1 output
+        if ! output=$(docker_cli volume inspect "$volume" 2>&1); then
+            if printf '%s\n' "$output" | grep -Eqi 'no such volume|not found'; then
+                return 0
+            fi
+            echo "错误: 无法检查数据卷 $volume: $output" >&2
+            return 1
+        fi
+        if ! output=$(docker_cli volume rm "$volume" 2>&1); then
+            echo "错误: 数据卷删除失败 $volume: $output" >&2
+            return 1
+        fi
+        if output=$(docker_cli volume inspect "$volume" 2>&1); then
+            echo "错误: 数据卷删除命令已返回成功，但卷仍存在: $volume" >&2
+            return 1
+        fi
+        if ! printf '%s\n' "$output" | grep -Eqi 'no such volume|not found'; then
+            echo "错误: 无法确认数据卷已删除 $volume: $output" >&2
+            return 1
+        fi
+    }
+
     case "${1:-}" in
         "") purge=0 ;;
         --purge) purge=1 ;;
@@ -55,14 +78,21 @@ EOF
         }
     fi
     if [ "$purge" -ne 0 ]; then
-        docker_cli volume rm "$PG_VOLUME" "$DATA_VOLUME" >/dev/null 2>&1 || true
+        if ! remove_managed_volume "$PG_VOLUME"; then
+            return 1
+        fi
+        if ! remove_managed_volume "$DATA_VOLUME"; then
+            return 1
+        fi
         echo "  数据卷已清理"
         if [ -n "$BLOCK_PATH" ]; then
             echo "  用户块存储目录未删除: $BLOCK_PATH"
         fi
     fi
     if [ "$CACHE_VOLUME_MANAGED" = "1" ]; then
-        docker_cli volume rm "$CACHE_VOLUME" >/dev/null 2>&1 || true
+        if ! remove_managed_volume "$CACHE_VOLUME"; then
+            return 1
+        fi
     elif docker_cli volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then
         echo "  用户已有缓存卷未删除: $CACHE_VOLUME"
     fi

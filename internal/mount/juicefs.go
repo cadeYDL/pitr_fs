@@ -29,7 +29,10 @@ type JuiceFS struct {
 	managed bool
 }
 
-const defaultCacheSizeMiB = 1024
+const (
+	defaultCacheSizeMiB = 1024
+	processStopGrace    = 2 * time.Second
+)
 
 // GC 使用 JuiceFS 原生对象适配层做 mark/delete，因此 file、S3、OSS 等
 // 后端共享同一套安全语义。例行生命周期回收不主动 compact 仍在使用的 chunk，
@@ -136,9 +139,7 @@ func (m *JuiceFS) Start(ctx context.Context) error {
 	for {
 		select {
 		case err := <-done:
-			m.cmd = nil
-			m.done = nil
-			m.managed = false
+			m.resetProcessState()
 			if err == nil {
 				err = errors.New("juicefs mount 在就绪前退出")
 			}
@@ -146,19 +147,62 @@ func (m *JuiceFS) Start(ctx context.Context) error {
 		case <-ticker.C:
 			ready, statErr := IsMountPoint(m.MountPoint)
 			if statErr != nil {
-				_ = cmd.Process.Signal(syscall.SIGTERM)
-				return statErr
+				cleanupErr := stopAndReap(cmd, done, processStopGrace)
+				m.resetProcessState()
+				return errors.Join(statErr, cleanupErr)
 			}
 			if ready {
 				return nil
 			}
 		case <-timeout.C:
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			return fmt.Errorf("juicefs mount %s 30 秒内未就绪", m.MountPoint)
+			cleanupErr := stopAndReap(cmd, done, processStopGrace)
+			m.resetProcessState()
+			return errors.Join(
+				fmt.Errorf("juicefs mount %s 30 秒内未就绪", m.MountPoint),
+				cleanupErr)
 		case <-ctx.Done():
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			return ctx.Err()
+			cleanupErr := stopAndReap(cmd, done, processStopGrace)
+			m.resetProcessState()
+			return errors.Join(ctx.Err(), cleanupErr)
 		}
+	}
+}
+
+func (m *JuiceFS) resetProcessState() {
+	m.cmd = nil
+	m.done = nil
+	m.managed = false
+}
+
+// stopAndReap 用于启动失败补偿：先给挂载进程一次优雅退出机会，再强制
+// KILL，并且无论哪条路径都消费 Wait 结果，避免僵尸进程和不可重试状态。
+func stopAndReap(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	var signalErr error
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil &&
+		!errors.Is(err, os.ErrProcessDone) {
+		signalErr = fmt.Errorf("停止 juicefs mount: %w", err)
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return signalErr
+	case <-timer.C:
+	}
+	var killErr error
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		killErr = fmt.Errorf("强制停止 juicefs mount: %w", err)
+	}
+	timer.Reset(grace)
+	select {
+	case <-done:
+		return errors.Join(signalErr, killErr)
+	case <-timer.C:
+		return errors.Join(signalErr, killErr,
+			errors.New("juicefs mount 被 KILL 后仍未回收"))
 	}
 }
 
@@ -179,9 +223,7 @@ func (m *JuiceFS) Stop(ctx context.Context) error {
 
 	select {
 	case waitErr := <-m.done:
-		m.cmd = nil
-		m.done = nil
-		m.managed = false
+		m.resetProcessState()
 		if waitErr != nil {
 			var exitErr *exec.ExitError
 			// FUSE 进程在正常 umount 后通常收到信号退出。
@@ -194,7 +236,21 @@ func (m *JuiceFS) Stop(ctx context.Context) error {
 		}
 		return nil
 	case <-ctx.Done():
-		_ = m.cmd.Process.Kill()
+		cmd, done := m.cmd, m.done
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			m.resetProcessState()
+			return errors.Join(fmt.Errorf("等待 juicefs umount: %w", ctx.Err()), err)
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), processStopGrace)
+		defer cancel()
+		select {
+		case <-done:
+		case <-cleanupCtx.Done():
+			m.resetProcessState()
+			return errors.Join(fmt.Errorf("等待 juicefs umount: %w", ctx.Err()),
+				errors.New("juicefs mount 被 KILL 后仍未回收"))
+		}
+		m.resetProcessState()
 		return fmt.Errorf("等待 juicefs umount: %w", ctx.Err())
 	}
 }

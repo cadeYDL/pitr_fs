@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAuditShorteningAndOpenFlags(t *testing.T) {
@@ -23,6 +24,24 @@ func TestAuditShorteningAndOpenFlags(t *testing.T) {
 		501,
 	); got != "ydl" {
 		t.Fatalf("passwd name=%q", got)
+	}
+}
+
+func TestProcessCommandCacheIsBoundedAndDropsExpiredEntries(t *testing.T) {
+	loopback := &Loopback{processCache: make(map[uint32]processCacheEntry)}
+	for index := 0; index < maxProcessCacheEntries; index++ {
+		loopback.processCache[uint32(100000+index)] = processCacheEntry{
+			command: "old", expiresAt: time.Now().Add(-time.Minute),
+		}
+	}
+	_ = loopback.processCommand(uint32(os.Getpid()))
+	if len(loopback.processCache) > maxProcessCacheEntries {
+		t.Fatalf("process cache 无界增长: %d", len(loopback.processCache))
+	}
+	for pid, entry := range loopback.processCache {
+		if pid != uint32(os.Getpid()) && time.Now().After(entry.expiresAt) {
+			t.Fatalf("过期 PID 未清理: %d", pid)
+		}
 	}
 }
 

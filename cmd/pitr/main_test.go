@@ -74,6 +74,42 @@ func TestPitrCLI_DoesNotExposeUnrelatedCompletionCommand(t *testing.T) {
 	}
 }
 
+func TestRPCContextUsesCommandClassAndGlobalOverride(t *testing.T) {
+	root := newRoot()
+	root.SetContext(context.Background())
+	status, _, err := root.Find([]string{"status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status.SetContext(context.Background())
+	revert, _, err := root.Find([]string{"revert"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revert.SetContext(context.Background())
+	shortCtx, shortCancel := rpcContext(status)
+	defer shortCancel()
+	longCtx, longCancel := rpcContext(revert)
+	defer longCancel()
+	shortDeadline, _ := shortCtx.Deadline()
+	longDeadline, _ := longCtx.Deadline()
+	if longDeadline.Sub(shortDeadline) < 20*time.Minute {
+		t.Fatalf("revert 应使用长超时: short=%s long=%s",
+			shortDeadline, longDeadline)
+	}
+
+	if err := root.PersistentFlags().Set("timeout", "37s"); err != nil {
+		t.Fatal(err)
+	}
+	overrideCtx, overrideCancel := rpcContext(revert)
+	defer overrideCancel()
+	overrideDeadline, _ := overrideCtx.Deadline()
+	remaining := time.Until(overrideDeadline)
+	if remaining < 36*time.Second || remaining > 38*time.Second {
+		t.Fatalf("--timeout 覆盖未生效: %s", remaining)
+	}
+}
+
 // TestPitrCLI_DaemonUnavailableReturnsErr — daemon 不可用时返回明确错误
 func TestPitrCLI_DaemonUnavailableReturnsErr(t *testing.T) {
 	cases := [][]string{

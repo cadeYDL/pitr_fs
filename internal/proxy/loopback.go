@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -253,7 +254,17 @@ func (l *Loopback) UnmountLazy() error {
 		return nil
 	}
 	if err := unix.Unmount(l.Mount, unix.MNT_DETACH); err != nil {
-		return fmt.Errorf("惰性卸载 FUSE %s: %w", l.Mount, err)
+		if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EACCES) {
+			return fmt.Errorf("惰性卸载 FUSE %s: %w", l.Mount, err)
+		}
+		// 非特权 FUSE owner 没有 CAP_SYS_ADMIN，直接 umount(2) 会返回
+		// EPERM；fusermount3 通过受控 helper 执行同一个 lazy detach。
+		output, helperErr := exec.Command("fusermount3", "-uz", l.Mount).
+			CombinedOutput()
+		if helperErr != nil {
+			return fmt.Errorf("惰性卸载 FUSE %s: syscall=%v; fusermount3: %w: %s",
+				l.Mount, err, helperErr, string(output))
+		}
 	}
 	l.Server = nil
 	return nil

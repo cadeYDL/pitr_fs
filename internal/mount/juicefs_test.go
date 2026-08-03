@@ -3,10 +3,15 @@ package mount
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestIsMountPoint(t *testing.T) {
@@ -84,5 +89,43 @@ func TestJuiceFS_StopBeforeStart(t *testing.T) {
 	m := &JuiceFS{MountPoint: filepath.Join(t.TempDir(), "jfs")}
 	if err := m.Stop(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestJuiceFS_StartFailureKillsReapsAndResetsProcess(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("JuiceFS mount process cleanup 仅在 Linux 验证")
+	}
+	root := t.TempDir()
+	pidFile := filepath.Join(root, "pid")
+	binary := filepath.Join(root, "juicefs")
+	script := "#!/bin/sh\ntrap '' TERM\nprintf '%s' $$ >\"$PITR_TEST_PID\"\nwhile :; do sleep 1; done\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PITR_TEST_PID", pidFile)
+	m := &JuiceFS{
+		Binary: binary, MetaURL: "postgres://example",
+		MountPoint: filepath.Join(root, "mount"), LogOutput: new(bytes.Buffer),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := m.Start(ctx); err == nil {
+		t.Fatal("取消 Start 应返回错误")
+	}
+	content, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("失败 Start 遗留进程 pid=%d err=%v", pid, err)
+	}
+	if m.cmd != nil || m.done != nil || m.managed {
+		t.Fatalf("失败 Start 未重置状态: cmd=%v done=%v managed=%v",
+			m.cmd, m.done, m.managed)
 	}
 }

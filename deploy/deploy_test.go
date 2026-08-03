@@ -958,7 +958,7 @@ func TestInstall_UsesBoundedDedicatedJuiceFSCache(t *testing.T) {
 	}
 	if !bytes.Contains(uninstall, []byte(`if [ "$CACHE_VOLUME_MANAGED" = "1" ]`)) ||
 		!bytes.Contains(uninstall, []byte(`elif docker_cli volume inspect "$CACHE_VOLUME"`)) ||
-		!bytes.Contains(uninstall, []byte(`docker_cli volume rm "$CACHE_VOLUME"`)) {
+		!bytes.Contains(uninstall, []byte(`remove_managed_volume "$CACHE_VOLUME"`)) {
 		t.Error("卸载脚本未清理临时缓存卷")
 	}
 }
@@ -1025,6 +1025,74 @@ func TestUninstall_RefreshesParentShellCommandCache(t *testing.T) {
 		if !bytes.Contains(content, []byte(required)) {
 			t.Errorf("uninstall.sh 缺少父 Shell 缓存处理 %q", required)
 		}
+	}
+}
+
+func TestUninstallDoesNotHideManagedVolumeRemovalFailure(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"remove_managed_volume", "数据卷删除失败", "确认数据卷已删除",
+	} {
+		if !bytes.Contains(content, []byte(required)) {
+			t.Errorf("uninstall.sh 缺少严格卷清理片段 %q", required)
+		}
+	}
+	if bytes.Contains(content,
+		[]byte(`docker_cli volume rm "$PG_VOLUME" "$DATA_VOLUME" >/dev/null 2>&1 || true`)) {
+		t.Error("purge 不得再吞掉数据卷删除失败")
+	}
+}
+
+func TestUninstallPurgeFailsBeforeClaimingVolumeCleanup(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	uninstall, err := os.ReadFile(filepath.Join(root, "uninstall.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(temp, "uninstall.sh"), uninstall, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeInstall := `
+SCRIPT_DIR=/fake
+CONTAINER=pitrfs
+PG_VOLUME=pitr_pgdata
+DATA_VOLUME=pitr_data
+CACHE_VOLUME=pitr_cache
+CACHE_VOLUME_MANAGED=1
+BLOCK_PATH=
+BIN_LINK=/tmp/never-reached-pitr
+HOST_UPGRADER=/tmp/never-reached-upgrader
+RUNTIME_DIR=/tmp/never-reached-runtime
+INSTALL_CONFIG=/tmp/never-reached-config
+require_linux() { :; }
+validate_mount_root() { :; }
+configure_docker() { :; }
+detach_stale_fuse() { :; }
+docker_cli_timeout() { return 1; }
+docker_cli() {
+  if [ "$1 $2" = "volume inspect" ]; then return 0; fi
+  if [ "$1 $2" = "volume rm" ]; then echo "volume is in use" >&2; return 1; fi
+  return 1
+}
+`
+	if err := os.WriteFile(filepath.Join(temp, "install.sh"),
+		[]byte(fakeInstall), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "-c", `source "$1" --purge`,
+		"bash", filepath.Join(temp, "uninstall.sh"))
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("数据卷 rm 失败时 purge 应失败:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("数据卷删除失败 pitr_pgdata")) ||
+		bytes.Contains(output, []byte("数据卷已清理")) {
+		t.Fatalf("purge 错误输出不准确:\n%s", output)
 	}
 }
 

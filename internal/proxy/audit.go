@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	contentCaptureLimit = 4096
-	contentDisplayRunes = 12
-	processDisplayRunes = 10
-	maxWriteSamples     = 3
-	hostPasswdPath      = "/host/etc/passwd"
+	contentCaptureLimit    = 4096
+	contentDisplayRunes    = 12
+	processDisplayRunes    = 10
+	maxWriteSamples        = 3
+	maxProcessCacheEntries = 1024
+	hostPasswdPath         = "/host/etc/passwd"
 )
 
 type processCacheEntry struct {
@@ -92,11 +93,34 @@ func (l *Loopback) processCommand(pid uint32) string {
 	}
 	command = shortenRunes(command, processDisplayRunes)
 	l.auditMu.Lock()
+	pruneProcessCache(l.processCache, now)
 	l.processCache[pid] = processCacheEntry{
 		command: command, expiresAt: now.Add(time.Second),
 	}
 	l.auditMu.Unlock()
 	return command
+}
+
+func pruneProcessCache(cache map[uint32]processCacheEntry, now time.Time) {
+	if len(cache) < maxProcessCacheEntries {
+		return
+	}
+	for pid, entry := range cache {
+		if !now.Before(entry.expiresAt) {
+			delete(cache, pid)
+		}
+	}
+	for len(cache) >= maxProcessCacheEntries {
+		var oldestPID uint32
+		var oldest time.Time
+		for pid, entry := range cache {
+			if oldest.IsZero() || entry.expiresAt.Before(oldest) {
+				oldestPID = pid
+				oldest = entry.expiresAt
+			}
+		}
+		delete(cache, oldestPID)
+	}
 }
 
 func (l *Loopback) actorName(uid uint32) string {
