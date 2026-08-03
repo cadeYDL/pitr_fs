@@ -1,0 +1,43 @@
+name: 持续集成
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go 与 PostgreSQL 集成测试
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.14-bookworm
+        env:
+          POSTGRES_PASSWORD: x
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PITR_REQUIRE_INTEGRATION: "1"
+      PITR_TEST_PG_DSN: postgres://postgres:x@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 静态检查
+        run: go vet ./...
+      - name: 单元与 PostgreSQL 集成测试
+        run: go test ./...

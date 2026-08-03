@@ -12,6 +12,22 @@ jobs:
   build-and-release:
     name: 构建并发布 Linux 升级包
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.14-bookworm
+        env:
+          POSTGRES_PASSWORD: x
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PITR_REQUIRE_INTEGRATION: "1"
+      PITR_TEST_PG_DSN: postgres://postgres:x@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - name: 检出发布提交
         uses: actions/checkout@v4
@@ -26,6 +42,9 @@ jobs:
 
       - name: 静态检查
         run: go vet ./...
+
+      - name: 单元与 PostgreSQL 集成测试
+        run: go test ./...
 
       - name: 构建双架构升级包
         env:

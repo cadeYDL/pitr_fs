@@ -35,7 +35,12 @@ func TestMain(m *testing.M) {
 	}
 
 	if _, err := exec.LookPath("docker"); err != nil {
-		fmt.Fprintln(os.Stderr, "跳过 SQL 单测:未找到 docker,也未设置 PITR_TEST_PG_DSN")
+		message := "未找到 docker,也未设置 PITR_TEST_PG_DSN"
+		if os.Getenv("PITR_REQUIRE_INTEGRATION") == "1" {
+			fmt.Fprintln(os.Stderr, "SQL 集成测试环境缺失:", message)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "跳过 SQL 集成测试:", message)
 		os.Exit(0)
 	}
 
