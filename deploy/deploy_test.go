@@ -935,7 +935,9 @@ func TestInstall_UsesBoundedDedicatedJuiceFSCache(t *testing.T) {
 		`CACHE_VOLUME="${PITR_CACHE_VOLUME:-${SAVED_CACHE_VOLUME:-pitr_cache}}"`,
 		`JFS_CACHE_SIZE="${PITR_JFS_CACHE_SIZE:-${SAVED_JFS_CACHE_SIZE:-1024}}"`,
 		`CACHE_VOLUME_MANAGED="${SAVED_CACHE_VOLUME_MANAGED:-}"`,
-		`docker_cli volume create "$CACHE_VOLUME"`,
+		`--label io.pitr-fs.managed=true`,
+		`--label io.pitr-fs.role=cache`,
+		`index .Labels "io.pitr-fs.managed"`,
 		`SAVED_CACHE_VOLUME_MANAGED=%q`,
 		`-e "PITR_JFS_CACHE_SIZE=$JFS_CACHE_SIZE"`,
 		`-v "$CACHE_VOLUME:/var/jfsCache"`,
@@ -960,6 +962,35 @@ func TestInstall_UsesBoundedDedicatedJuiceFSCache(t *testing.T) {
 		!bytes.Contains(uninstall, []byte(`elif docker_cli volume inspect "$CACHE_VOLUME"`)) ||
 		!bytes.Contains(uninstall, []byte(`remove_managed_volume "$CACHE_VOLUME"`)) {
 		t.Error("卸载脚本未清理临时缓存卷")
+	}
+}
+
+func TestInstall_RecoversCacheVolumeOwnershipAfterInterruptedInstall(t *testing.T) {
+	root := repoRoot(t)
+	install := filepath.Join(root, "install.sh")
+	command := exec.Command("bash", "-c", `
+set -euo pipefail
+source "$1"
+docker_cli() {
+  if [ "$1 $2 $3" = "volume inspect -f" ]; then
+    printf 'true\n'
+    return 0
+  fi
+  if [ "$1 $2" = "volume inspect" ]; then
+    return 0
+  fi
+  return 1
+}
+CACHE_VOLUME_MANAGED=
+prepare_cache_volume
+printf '%s\n' "$CACHE_VOLUME_MANAGED"
+`, "bash", install)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("模拟安装中断后的缓存卷识别失败: %v\n%s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "1" {
+		t.Fatalf("带 pitr-fs 标签的缓存卷应恢复为安装器管理，实际: %q", output)
 	}
 }
 
@@ -1012,6 +1043,38 @@ func TestInstall_DockerOperationsAreBounded(t *testing.T) {
 	}
 	if !bytes.Contains(uninstall, []byte(`docker_cli_timeout 30 rm -f "$CONTAINER"`)) {
 		t.Error("uninstall.sh 缺少有界容器停止")
+	}
+}
+
+func TestInstallRetriesTransientImageBuildFailure(t *testing.T) {
+	root := repoRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\ninstall_main() {\n")
+	index := bytes.Index(content, marker)
+	if index < 0 {
+		t.Fatal("install.sh 未找到主命令 case")
+	}
+	temp := t.TempDir()
+	functions := filepath.Join(temp, "install-functions.sh")
+	if err := os.WriteFile(functions, content[:index], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", "-c", `
+source "$1"
+calls=0
+docker_cli() {
+  calls=$((calls+1))
+  [ "$calls" -ge 3 ]
+}
+sleep() { :; }
+build_image_with_retry build -t image .
+[ "$calls" -eq 3 ]
+`, "bash", functions)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("Docker build 瞬时失败重试未生效: %v\n%s", err, output)
 	}
 }
 

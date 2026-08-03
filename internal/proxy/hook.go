@@ -95,14 +95,17 @@ func (n *Node) versionedHookWindow(
 	action func() syscall.Errno,
 ) (fdVersion, syscall.Errno) {
 	root := n.root
-	if root.Quiescing() {
-		return fdVersion{}, syscall.EBUSY
+	for {
+		if errno := root.waitWritable(ctx); errno != 0 {
+			return fdVersion{}, errno
+		}
+		root.window.Lock()
+		if root.writeGate.Load() == 0 {
+			break
+		}
+		root.window.Unlock()
 	}
-	root.window.Lock()
 	defer root.window.Unlock()
-	if root.Quiescing() {
-		return fdVersion{}, syscall.EBUSY
-	}
 
 	if root.manager == nil {
 		return fdVersion{}, action()
@@ -185,11 +188,17 @@ func (n *Node) keepWritableWindow(
 		return 0
 	}
 
-	root.window.Lock()
-	defer root.window.Unlock()
-	if root.Quiescing() {
-		return syscall.EBUSY
+	for {
+		if errno := root.waitWritable(ctx); errno != 0 {
+			return errno
+		}
+		root.window.Lock()
+		if root.writeGate.Load() == 0 {
+			break
+		}
+		root.window.Unlock()
 	}
+	defer root.window.Unlock()
 	if root.active != nil && root.active.files[file.id] == file {
 		return 0
 	}
@@ -267,8 +276,8 @@ func (n *Node) closeWritableWindow(
 		return releaseErrno
 	}
 
-	// 最后一个 fd 已经下沉到底层。先切换成恢复屏障并释放 window mutex，
-	// 后续新写会快速返回 EBUSY，而不会跟随数据库关闭/补偿一起阻塞。
+	// 最后一个 fd 已经下沉到底层。先切换成恢复屏障并释放 window mutex。
+	// 后续新写只短暂等待正常收口；慢补偿会有界返回 EBUSY，不占用窗口锁。
 	root.active = nil
 	root.setWriteGate(writeGateRecovery, true)
 	root.window.Unlock()

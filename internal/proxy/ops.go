@@ -136,8 +136,10 @@ func (n *Node) Open(
 	ctx context.Context,
 	flags uint32,
 ) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	if flags&syscall.O_ACCMODE != syscall.O_RDONLY && n.root.Quiescing() {
-		return nil, 0, syscall.EBUSY
+	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
+		if waitErrno := n.root.waitWritable(ctx); waitErrno != 0 {
+			return nil, 0, waitErrno
+		}
 	}
 	path := n.root.visiblePath(n)
 	posixOp := fmt.Sprintf("open(%q, %s)", path, formatOpenFlags(flags))

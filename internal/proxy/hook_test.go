@@ -206,6 +206,29 @@ func TestHook_QuiescingRejectsBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestHook_NormalRecoveryGateWaitsThenContinues(t *testing.T) {
+	manager := new(mockManager)
+	node := newHookNode(manager)
+	node.root.setWriteGate(writeGateRecovery, true)
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		node.root.setWriteGate(writeGateRecovery, false)
+	}()
+	started := time.Now()
+	called := false
+	errno := node.versionedHook(
+		context.Background(), "/workspace/a", "write:/workspace/a",
+		`write("/workspace/a")`, 0,
+		func() syscall.Errno { called = true; return 0 })
+	if errno != 0 || !called {
+		t.Fatalf("errno=%v called=%v", errno, called)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond ||
+		elapsed > time.Second {
+		t.Fatalf("recovery gate 等待时间异常: %s", elapsed)
+	}
+}
+
 func TestKeepWritableWindow_MultipleFDsDoNotHoldLifetimeLock(t *testing.T) {
 	manager := new(mockManager)
 	node := newHookNode(manager)

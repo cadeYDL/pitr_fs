@@ -78,6 +78,7 @@ const (
 	writeGateExternal uint32 = 1 << iota
 	writeGateRecovery
 	defaultManagerTimeout = 5 * time.Second
+	defaultWriteGateWait  = 100 * time.Millisecond
 )
 
 func (l *Loopback) setWriteGate(reason uint32, enabled bool) {
@@ -116,6 +117,37 @@ func (l *Loopback) SetQuiescing(enabled bool) {
 
 func (l *Loopback) Quiescing() bool {
 	return l.writeGate.Load() != 0
+}
+
+// waitWritable 区分两类写屏障：升级/卸载是外部冻结，必须立即拒绝；正常
+// 版本收口是极短的 recovery 窗口，新写有界等待即可，避免异步 Release 与
+// 下一条 shell 写命令竞态出 EBUSY。等待上限远短于数据库超时；补偿失败会
+// 保留 recovery 位，新写最多等待 100ms 后返回 EBUSY，不会跟随补偿阻塞。
+func (l *Loopback) waitWritable(ctx context.Context) syscall.Errno {
+	timeout := defaultWriteGateWait
+	if l.managerTimeout > 0 && l.managerTimeout < timeout {
+		timeout = l.managerTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		gate := l.writeGate.Load()
+		if gate&writeGateExternal != 0 {
+			return syscall.EBUSY
+		}
+		if gate&writeGateRecovery == 0 {
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			return syscall.EINTR
+		case <-timer.C:
+			return syscall.EBUSY
+		case <-ticker.C:
+		}
+	}
 }
 
 func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {

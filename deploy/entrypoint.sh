@@ -5,8 +5,8 @@ set -euo pipefail
 
 log() { echo "[pitr] $*"; }
 
-# schema 摘要和逻辑升级运行时都保存在这里。全新安装没有宿主机升级脚本
-# 预先创建目录，entrypoint 必须自行保证基础目录存在。
+# 逻辑升级运行时和仅供诊断的宿主 schema 摘要缓存保存在这里；数据库内账本才是
+# schema 状态的权威来源。全新安装没有宿主机升级脚本，entrypoint 必须自行创建目录。
 mkdir -p /opt/pitr
 
 runtime_file() {

@@ -265,10 +265,19 @@ prepare_block_storage() {
 
 prepare_cache_volume() {
     if docker_cli volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then
-        CACHE_VOLUME_MANAGED="${CACHE_VOLUME_MANAGED:-0}"
+        # 安装可能在创建缓存卷后、写入 install.conf 前中断。使用卷标签记录
+        # 所有权，避免下一次安装把自己创建的卷误判为用户已有资源。
+        if [ "$(docker_cli volume inspect -f '{{ index .Labels "io.pitr-fs.managed" }}' "$CACHE_VOLUME" 2>/dev/null || true)" = "true" ]; then
+            CACHE_VOLUME_MANAGED=1
+        else
+            CACHE_VOLUME_MANAGED="${CACHE_VOLUME_MANAGED:-0}"
+        fi
         return 0
     fi
-    docker_cli volume create "$CACHE_VOLUME" >/dev/null
+    docker_cli volume create \
+        --label io.pitr-fs.managed=true \
+        --label io.pitr-fs.role=cache \
+        "$CACHE_VOLUME" >/dev/null
     CACHE_VOLUME_MANAGED=1
 }
 
@@ -495,6 +504,33 @@ run_container() {
         "$IMAGE" >/dev/null
 }
 
+build_image_with_retry() {
+    local attempts=${PITR_BUILD_ATTEMPTS:-3}
+    local delay=${PITR_BUILD_RETRY_DELAY:-2}
+    local attempt
+    case "$attempts:$delay" in
+        *[!0-9:]*)
+            echo "错误: PITR_BUILD_ATTEMPTS/PITR_BUILD_RETRY_DELAY 必须是非负整数" >&2
+            return 2
+            ;;
+    esac
+    [ "$attempts" -ge 1 ] && [ "$attempts" -le 10 ] || {
+        echo "错误: PITR_BUILD_ATTEMPTS 必须在 1..10" >&2
+        return 2
+    }
+    for attempt in $(seq 1 "$attempts"); do
+        if docker_cli "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -eq "$attempts" ]; then
+            echo "错误: Docker 镜像构建连续失败 $attempts 次" >&2
+            return 1
+        fi
+        echo "警告: Docker 镜像构建失败，${delay}s 后重试 ($attempt/$attempts)" >&2
+        sleep "$delay"
+    done
+}
+
 do_install() {
     ensure_host_environment
     need_host_tools
@@ -509,7 +545,7 @@ do_install() {
     build_commit=$(git -C "$SCRIPT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
     build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     build_version=${PITR_VERSION:-dev-$build_commit}
-    docker_cli build -t "$IMAGE" -f "$SCRIPT_DIR/deploy/Dockerfile" \
+    build_image_with_retry build -t "$IMAGE" -f "$SCRIPT_DIR/deploy/Dockerfile" \
         --build-arg "PITR_VERSION=$build_version" \
         --build-arg "PITR_COMMIT=$build_commit" \
         --build-arg "PITR_BUILD_DATE=$build_date" \
