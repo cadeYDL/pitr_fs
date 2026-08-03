@@ -42,6 +42,12 @@ var (
 	flagCheckABI   bool
 )
 
+const (
+	pruneInterval = time.Second
+	pruneTimeout  = 30 * time.Second
+	pruneBatch    = int64(8)
+)
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -140,6 +146,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	if flagGCInterval > 0 {
 		go runGCWorker(cmd.Context(), mgr, jfs, flagGCInterval, flagGCThreads)
 	}
+	go runPruneWorker(cmd.Context(), mgr, pruneInterval, pruneBatch)
 	persisted, err := mgr.LoadVolumeMountConfig(cmd.Context(), flagVolume)
 	if err != nil {
 		return err
@@ -267,6 +274,35 @@ func runGCWorker(
 				slog.Debug("JuiceFS lifecycle GC deferred", "reason", err)
 			case err != nil && !errors.Is(err, context.Canceled):
 				slog.Error("JuiceFS lifecycle GC failed", "error", err)
+			}
+		}
+	}
+}
+
+func runPruneWorker(
+	ctx context.Context,
+	mgr *txn.Manager,
+	interval time.Duration,
+	batch int64,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runCtx, cancel := context.WithTimeout(ctx, pruneTimeout)
+			pruned, pending, err := mgr.RunPendingPrune(runCtx, "/", batch)
+			cancel()
+			switch {
+			case err == nil && pruned != 0:
+				slog.Info("version pruning batch completed",
+					"pruned", pruned, "pending", pending)
+			case errors.Is(err, txn.ErrMaintenanceBusy):
+				slog.Debug("version pruning deferred", "reason", err)
+			case err != nil && !errors.Is(err, context.Canceled):
+				slog.Error("version pruning failed", "error", err)
 			}
 		}
 	}

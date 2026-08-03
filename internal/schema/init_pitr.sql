@@ -154,6 +154,15 @@ CREATE TABLE IF NOT EXISTS pitr_gc_queue (
 ALTER TABLE pitr_gc_queue
     ADD COLUMN IF NOT EXISTS estimated_bytes bigint NOT NULL DEFAULT 0;
 
+-- 前台版本关闭只执行有上限的裁剪，其余工作由 daemon 分批继续。单例队列
+-- 只表示“仍需按当前配置重算”，避免为每个候选版本复制一份任务状态。
+CREATE TABLE IF NOT EXISTS pitr_prune_queue (
+    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    requested_at timestamptz NOT NULL DEFAULT now(),
+    attempts     bigint NOT NULL DEFAULT 0,
+    last_error   text
+);
+
 CREATE TABLE IF NOT EXISTS pitr_internal_state (
     key          text PRIMARY KEY,
     value        text NOT NULL,
@@ -306,12 +315,7 @@ CREATE OR REPLACE FUNCTION pitr_pin_chunk_slices(
     p_slices bytea
 ) RETURNS void AS $$
 DECLARE
-    v_count        integer;
-    v_index        integer;
-    v_piece        bytea;
-    v_delayed      bytea := ''::bytea;
-    v_chunkid      bigint;
-    v_size         integer;
+    v_delayed      bytea;
     v_delayed_id   bigint := pitr_pin_delayed_id(p_txn_id);
     v_existing     bytea;
     v_old_suppress text := current_setting('pitr.suppress_capture', true);
@@ -324,44 +328,91 @@ BEGIN
             p_txn_id, length(p_slices);
     END IF;
 
-    v_count := length(p_slices) / 24;
     PERFORM set_config('pitr.suppress_capture', 'on', true);
-    FOR v_index IN 0..v_count-1 LOOP
-        v_piece := substring(p_slices FROM v_index*24+5 FOR 12);
-        v_chunkid := pitr_decode_u64(substring(v_piece FROM 1 FOR 8));
-        v_size := pitr_decode_u32(substring(v_piece FROM 9 FOR 4));
-        IF v_chunkid = 0 THEN
-            CONTINUE;
-        END IF;
-        IF v_size <= 0 THEN
-            RAISE EXCEPTION 'txn % 的 slice % size 非法:%',
-                p_txn_id, v_chunkid, v_size;
-        END IF;
-        v_delayed := v_delayed || v_piece;
-        INSERT INTO pitr_slice_ref(chunkid,size,pins)
-        VALUES (v_chunkid,v_size,1)
-        ON CONFLICT (chunkid) DO UPDATE
-           SET pins=pitr_slice_ref.pins+1
-         WHERE pitr_slice_ref.size=EXCLUDED.size;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'slice % 的 size 发生冲突', v_chunkid;
-        END IF;
-        -- 历史 pin 的来源是 jfs_chunk 快照。正常情况下 JuiceFS 引用行仍然
-        -- 存在；旧版本曾在异步 unlink/revert 时把引用行降到 0 并提前清掉，
-        -- 此处必须能够从权威快照自愈，而不是让后续 schema 升级永久失败。
-        INSERT INTO jfs_chunk_ref(chunkid,size,refs)
-        VALUES (v_chunkid,v_size,1)
-        ON CONFLICT (chunkid) DO UPDATE
-           SET refs=jfs_chunk_ref.refs+1
-         WHERE jfs_chunk_ref.size=EXCLUDED.size;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'slice % 的 size 与 JuiceFS 引用行冲突:%',
-                v_chunkid,v_size;
-        END IF;
-    END LOOP;
+    -- 一次解码整个 bundle，并在 SQL 内按 slice 聚合。这样一个 chunk 的
+    -- 覆盖链再长，也只对每个唯一 slice 更新一行引用计数。
+    IF EXISTS (
+        WITH decoded AS (
+            SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+                   pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+              FROM (
+                  SELECT substring(p_slices FROM g.i*24+5 FOR 12) AS piece
+                    FROM generate_series(0,length(p_slices)/24-1) AS g(i)
+              ) pieces
+        )
+        SELECT 1 FROM decoded WHERE chunkid<>0 AND size<=0
+    ) THEN
+        RAISE EXCEPTION 'txn % 的 slice size 非法', p_txn_id;
+    END IF;
+    IF EXISTS (
+        WITH decoded AS (
+            SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+                   pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+              FROM (
+                  SELECT substring(p_slices FROM g.i*24+5 FOR 12) AS piece
+                    FROM generate_series(0,length(p_slices)/24-1) AS g(i)
+              ) pieces
+        ), known_sizes AS (
+            SELECT chunkid,size FROM decoded WHERE chunkid<>0
+            UNION ALL
+            SELECT r.chunkid,r.size FROM pitr_slice_ref r
+             WHERE r.chunkid IN (SELECT chunkid FROM decoded WHERE chunkid<>0)
+            UNION ALL
+            SELECT r.chunkid,r.size FROM jfs_chunk_ref r
+             WHERE r.chunkid IN (SELECT chunkid FROM decoded WHERE chunkid<>0)
+        )
+        SELECT 1 FROM known_sizes GROUP BY chunkid
+         HAVING count(DISTINCT size)>1
+    ) THEN
+        RAISE EXCEPTION 'txn % 的 slice size 发生冲突', p_txn_id;
+    END IF;
+
+    WITH decoded AS (
+        SELECT g.i AS ordinal,
+               substring(p_slices FROM g.i*24+5 FOR 12) AS piece
+          FROM generate_series(0,length(p_slices)/24-1) AS g(i)
+    )
+    SELECT string_agg(piece,''::bytea ORDER BY ordinal) INTO v_delayed
+      FROM decoded
+     WHERE pitr_decode_u64(substring(piece FROM 1 FOR 8))<>0;
+
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+          FROM (
+              SELECT substring(p_slices FROM g.i*24+5 FOR 12) AS piece
+                FROM generate_series(0,length(p_slices)/24-1) AS g(i)
+          ) pieces
+    ), aggregated AS (
+        SELECT chunkid,min(size)::integer AS size,count(*)::bigint AS refs
+          FROM decoded WHERE chunkid<>0 GROUP BY chunkid
+    )
+    INSERT INTO pitr_slice_ref(chunkid,size,pins)
+    SELECT chunkid,size,refs FROM aggregated
+    ON CONFLICT (chunkid) DO UPDATE
+       SET pins=pitr_slice_ref.pins+EXCLUDED.pins;
+
+    -- 历史 pin 的来源是 jfs_chunk 快照。正常情况下 JuiceFS 引用行仍然
+    -- 存在；旧版本曾在异步 unlink/revert 时把引用行降到 0 并提前清掉，
+    -- 此处必须能够从权威快照自愈，而不是让后续 schema 升级永久失败。
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+          FROM (
+              SELECT substring(p_slices FROM g.i*24+5 FOR 12) AS piece
+                FROM generate_series(0,length(p_slices)/24-1) AS g(i)
+          ) pieces
+    ), aggregated AS (
+        SELECT chunkid,min(size)::integer AS size,count(*)::integer AS refs
+          FROM decoded WHERE chunkid<>0 GROUP BY chunkid
+    )
+    INSERT INTO jfs_chunk_ref(chunkid,size,refs)
+    SELECT chunkid,size,refs FROM aggregated
+    ON CONFLICT (chunkid) DO UPDATE
+       SET refs=jfs_chunk_ref.refs+EXCLUDED.refs;
     PERFORM set_config('pitr.suppress_capture', COALESCE(v_old_suppress,''), true);
 
-    IF length(v_delayed) = 0 THEN
+    IF v_delayed IS NULL OR length(v_delayed) = 0 THEN
         RETURN;
     END IF;
     SELECT slices INTO v_existing
@@ -617,13 +668,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION pitr_release_version_pins() RETURNS TRIGGER AS $$
 DECLARE
     v_pin          RECORD;
-    v_index        integer;
-    v_piece        bytea;
-    v_chunkid      bigint;
-    v_size         integer;
-    v_refs_after   integer;
-    v_pin_count    bigint;
-    v_jfs_refs     integer;
+    v_reconcile_ids bigint[];
     v_release_bytes bigint := 0;
     v_old_suppress text := current_setting('pitr.suppress_capture', true);
 BEGIN
@@ -641,47 +686,101 @@ BEGIN
         RAISE EXCEPTION 'txn % 的 slice pin 编码损坏', OLD.id;
     END IF;
     PERFORM set_config('pitr.suppress_capture', 'on', true);
-    FOR v_index IN 0..(length(v_pin.slices)/12)-1 LOOP
-        v_piece := substring(v_pin.slices FROM v_index*12+1 FOR 12);
-        v_chunkid := pitr_decode_u64(substring(v_piece FROM 1 FOR 8));
-        v_size := pitr_decode_u32(substring(v_piece FROM 9 FOR 4));
-        SELECT pins INTO v_pin_count FROM pitr_slice_ref
-         WHERE chunkid=v_chunkid AND size=v_size FOR UPDATE;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION '释放 txn % 时 slice % pin 丢失',
-                OLD.id,v_chunkid;
-        END IF;
-        SELECT refs INTO v_jfs_refs FROM jfs_chunk_ref
-         WHERE chunkid=v_chunkid AND size=v_size FOR UPDATE;
+    -- 先验证整个 bundle，任何损坏都在修改引用前原子失败。
+    IF EXISTS (
+        WITH decoded AS (
+            SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+                   pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+              FROM (
+                  SELECT substring(v_pin.slices FROM g.i*12+1 FOR 12) AS piece
+                    FROM generate_series(0,length(v_pin.slices)/12-1) AS g(i)
+              ) pieces
+        ), releasing AS (
+            SELECT chunkid,min(size)::integer AS size,count(*)::bigint AS refs
+              FROM decoded GROUP BY chunkid
+        )
+        SELECT 1 FROM releasing x
+          LEFT JOIN pitr_slice_ref r USING(chunkid)
+         WHERE r.chunkid IS NULL OR r.size<>x.size OR r.pins<x.refs
+    ) THEN
+        RAISE EXCEPTION '释放 txn % 时 slice pin 丢失或计数不足', OLD.id;
+    END IF;
 
-        DELETE FROM pitr_slice_ref
-         WHERE chunkid=v_chunkid AND pins=1;
-        IF NOT FOUND THEN
-            UPDATE pitr_slice_ref SET pins=pins-1
-             WHERE chunkid=v_chunkid AND pins>1;
-            IF NOT FOUND THEN
-                RAISE EXCEPTION '释放 txn % 时 slice % pin 丢失',
-                    OLD.id, v_chunkid;
-            END IF;
-        END IF;
+    -- 旧版本可能存在 refs<pins 或 JuiceFS 引用行丢失。记录异常集合，先
+    -- 释放 PITR pin，再只对这些 slice 从当前 chunk+剩余 pin 精确重算。
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+          FROM (
+              SELECT substring(v_pin.slices FROM g.i*12+1 FOR 12) AS piece
+                FROM generate_series(0,length(v_pin.slices)/12-1) AS g(i)
+          ) pieces
+    ), releasing AS (
+        SELECT chunkid,min(size)::integer AS size,count(*)::bigint AS refs
+          FROM decoded GROUP BY chunkid
+    )
+    SELECT array_agg(x.chunkid ORDER BY x.chunkid) INTO v_reconcile_ids
+      FROM releasing x
+      JOIN pitr_slice_ref p USING(chunkid)
+      LEFT JOIN jfs_chunk_ref j USING(chunkid)
+     WHERE j.chunkid IS NULL OR j.size<>x.size OR j.refs<p.pins;
 
-        -- 正常路径保持 O(1)。若旧版本已经出现 refs<pins 或引用行丢失，
-        -- 只对这个异常 slice 扫描当前 chunk 并重算，保证 clear/prune 能安全
-        -- 清理历史，而不是被旧漂移永久卡住。
-        IF v_jfs_refs IS NOT NULL AND v_jfs_refs>=v_pin_count THEN
-            UPDATE jfs_chunk_ref SET refs=refs-1
-             WHERE chunkid=v_chunkid AND size=v_size
-             RETURNING refs INTO v_refs_after;
-        ELSE
-            PERFORM pitr_reconcile_slice_refs(ARRAY[v_chunkid]);
-            SELECT refs INTO v_refs_after FROM jfs_chunk_ref
-             WHERE chunkid=v_chunkid AND size=v_size;
-            v_refs_after := COALESCE(v_refs_after,0);
-        END IF;
-        IF v_refs_after = 0 THEN
-            v_release_bytes := v_release_bytes+v_size;
-        END IF;
-    END LOOP;
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               count(*)::bigint AS refs
+          FROM (
+              SELECT substring(v_pin.slices FROM g.i*12+1 FOR 12) AS piece
+                FROM generate_series(0,length(v_pin.slices)/12-1) AS g(i)
+          ) pieces
+         GROUP BY pitr_decode_u64(substring(piece FROM 1 FOR 8))
+    )
+    DELETE FROM pitr_slice_ref r USING decoded x
+     WHERE r.chunkid=x.chunkid AND r.pins=x.refs;
+
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               count(*)::bigint AS refs
+          FROM (
+              SELECT substring(v_pin.slices FROM g.i*12+1 FOR 12) AS piece
+                FROM generate_series(0,length(v_pin.slices)/12-1) AS g(i)
+          ) pieces
+         GROUP BY pitr_decode_u64(substring(piece FROM 1 FOR 8))
+    )
+    UPDATE pitr_slice_ref r SET pins=r.pins-x.refs
+      FROM decoded x
+     WHERE r.chunkid=x.chunkid AND r.pins>x.refs;
+
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               count(*)::integer AS refs
+          FROM (
+              SELECT substring(v_pin.slices FROM g.i*12+1 FOR 12) AS piece
+                FROM generate_series(0,length(v_pin.slices)/12-1) AS g(i)
+          ) pieces
+         GROUP BY pitr_decode_u64(substring(piece FROM 1 FOR 8))
+    )
+    UPDATE jfs_chunk_ref j SET refs=j.refs-x.refs
+      FROM decoded x
+     WHERE j.chunkid=x.chunkid
+       AND (v_reconcile_ids IS NULL OR NOT j.chunkid=ANY(v_reconcile_ids));
+
+    IF v_reconcile_ids IS NOT NULL THEN
+        PERFORM pitr_reconcile_slice_refs(v_reconcile_ids);
+    END IF;
+
+    WITH decoded AS (
+        SELECT pitr_decode_u64(substring(piece FROM 1 FOR 8)) AS chunkid,
+               pitr_decode_u32(substring(piece FROM 9 FOR 4)) AS size
+          FROM (
+              SELECT substring(v_pin.slices FROM g.i*12+1 FOR 12) AS piece
+                FROM generate_series(0,length(v_pin.slices)/12-1) AS g(i)
+          ) pieces
+    ), released AS (
+        SELECT chunkid,min(size)::integer AS size FROM decoded GROUP BY chunkid
+    )
+    SELECT COALESCE(sum(x.size),0)::bigint INTO v_release_bytes
+      FROM released x LEFT JOIN jfs_chunk_ref j USING(chunkid)
+     WHERE COALESCE(j.refs,0)=0;
     -- pin 释放后不能直接丢掉 delslices 索引，否则 refs=0 的 slice 可能不再
     -- 出现在 JuiceFS delete 扫描中。把远期 pin 改成立即到期的待删记录；
     -- 仍被当前数据或其他版本引用的 slice 会由 JuiceFS 引用检查跳过。

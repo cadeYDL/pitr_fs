@@ -231,6 +231,7 @@ func TestSQL_TablesExist(t *testing.T) {
 		"pitr_txn", "pitr_node_history", "pitr_edge_history",
 		"pitr_chunk_history", "pitr_chunk_ref_history", "pitr_blob_retention",
 		"pitr_slice_pin", "pitr_slice_ref", "pitr_gc_queue",
+		"pitr_prune_queue",
 		"pitr_internal_state", "pitr_slice_index_state", "pitr_space_state",
 		"pitr_config", "pitr_volume_config",
 	} {
@@ -617,6 +618,48 @@ func TestVersionReleaseRepairsLegacyMissingRef(t *testing.T) {
 	if got := mustScalarInt(t, conn,
 		"SELECT count(*) FROM pitr_slice_ref WHERE chunkid=902"); got != 0 {
 		t.Fatalf("损坏历史释放后仍残留 slice_ref=%d", got)
+	}
+}
+
+func TestPinAndReleaseAggregatesDuplicateSlices(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, mockJFSNodeSQL)
+	mustExec(t, conn, InitSQL)
+	mustExec(t, conn,
+		"INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (904,4,1)")
+	autoID := mustScalarInt(t, conn, `
+		INSERT INTO pitr_txn(version_hash,parent_id,scope_path,state,command,closed_at)
+		VALUES ('pin_batch_01',1,'/','auto','write:/batch',now()) RETURNING id`)
+	// 同一 slice 可在一个 chunk 的覆盖链中出现多次；批量 pin/release 必须
+	// 按出现次数聚合，而不能把 DISTINCT chunkid 误当成一次引用。
+	const one = "000000000000000000000388000000040000000000000004"
+	mustExec(t, conn,
+		"SELECT pitr_pin_chunk_slices($1,decode($2,'hex'))", autoID, one+one)
+	if got := mustScalarInt(t, conn,
+		"SELECT pins FROM pitr_slice_ref WHERE chunkid=904"); got != 2 {
+		t.Fatalf("重复 slice 应聚合为两个历史 pin,pins=%d", got)
+	}
+	if got := mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=904"); got != 3 {
+		t.Fatalf("JuiceFS refs 应包含当前引用和两个历史 pin,refs=%d", got)
+	}
+	if got := mustScalarInt(t, conn,
+		"SELECT length(slices) FROM pitr_slice_pin WHERE txn_id=$1", autoID); got != 24 {
+		t.Fatalf("紧凑 pin bundle 应保留两项,bytes=%d", got)
+	}
+
+	mustExec(t, conn, "DELETE FROM pitr_txn WHERE id=$1", autoID)
+	if got := mustScalarInt(t, conn,
+		"SELECT count(*) FROM pitr_slice_ref WHERE chunkid=904"); got != 0 {
+		t.Fatalf("版本释放后不应残留历史 pin,row=%d", got)
+	}
+	if got := mustScalarInt(t, conn,
+		"SELECT refs FROM jfs_chunk_ref WHERE chunkid=904"); got != 1 {
+		t.Fatalf("版本释放后应保留当前引用,refs=%d", got)
 	}
 }
 

@@ -518,6 +518,82 @@ func TestOpenStandaloneVersionFailsFastWhileMaintenanceOwnsLock(t *testing.T) {
 	}
 }
 
+func TestPruningContinuesFromPersistentQueueInBoundedBatches(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	for i := 0; i < 6; i++ {
+		id, err := mgr.OpenStandaloneVersion(
+			ctx, fmt.Sprintf("/workspace/%d", i), "write", VersionMetadata{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := mgr.CloseStandaloneVersion(ctx, id, "write", "change"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruned, err := mgr.SetHistoryLimit(ctx, "/", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 1 {
+		t.Fatalf("前台裁剪=%d,期望固定为 1 个版本", pruned)
+	}
+	versions, err := mgr.List(ctx, "/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) <= 1 {
+		t.Fatalf("前台不应同步清空全部积压版本:len=%d", len(versions))
+	}
+
+	// 模拟 daemon 重启：队列必须完全由数据库状态驱动。
+	restarted := NewManager(db)
+	for attempt := 0; attempt < 10; attempt++ {
+		_, pending, runErr := restarted.RunPendingPrune(ctx, "/", 2)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		if !pending {
+			break
+		}
+	}
+	versions, err = restarted.List(ctx, "/", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 1 {
+		t.Fatalf("后台裁剪后版本数=%d,期望 1", len(versions))
+	}
+}
+
+func TestSpacePressureWithoutHistoryDoesNotSpinPruneQueue(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO jfs_chunk_ref(chunkid,size,refs) VALUES (199,100,1)`); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := mgr.SetSpacePolicy(ctx, "/", 100, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 0 {
+		t.Fatalf("没有历史版本时不应裁剪,pruned=%d", pruned)
+	}
+	var queued bool
+	if err := db.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pitr_prune_queue WHERE singleton)`).
+		Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued {
+		t.Fatal("当前数据本身超限时不应留下无法完成的裁剪任务")
+	}
+	if _, pending, err := mgr.RunPendingPrune(ctx, "/", 2); err != nil || pending {
+		t.Fatalf("空裁剪队列结果 pending=%v err=%v", pending, err)
+	}
+}
+
 func TestSliceIndexUpgradeRebuildsLegacyAndCleanupState(t *testing.T) {
 	mgr, db := setupManager(t)
 	ctx := context.Background()

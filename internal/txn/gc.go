@@ -5,9 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 var ErrMaintenanceBusy = errors.New("存在开放写窗口，维护任务延期")
+
+const queueErrorRecordTimeout = 5 * time.Second
+
+func queueErrorContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), queueErrorRecordTimeout)
+}
 
 // RunPendingGC 把多次版本淘汰合并成一次外部 GC。run 必须执行 JuiceFS
 // 原生 GC；维护锁阻止新版本开始，有已开放窗口时立即延期，避免阻塞 close。
@@ -61,7 +68,9 @@ func (m *Manager) RunPendingGC(
 	if len(message) > 2000 {
 		message = message[:2000]
 	}
-	_, updateErr := m.db.Exec(context.WithoutCancel(ctx), `
+	recordCtx, cancel := queueErrorContext(ctx)
+	defer cancel()
+	_, updateErr := m.db.Exec(recordCtx, `
 		UPDATE pitr_gc_queue
 		   SET attempts=attempts+1,last_error=$1
 		 WHERE singleton`, strings.TrimSpace(message))

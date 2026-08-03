@@ -13,6 +13,7 @@ import (
 const (
 	defaultHistoryLimit        = 100
 	defaultSpaceReservePercent = 20
+	foregroundPruneBatch       = 1
 )
 
 type SpacePolicy struct {
@@ -368,67 +369,94 @@ func pruneClosedVersions(
 	scope string,
 	limit int64,
 ) (int64, error) {
-	var doomed []int64
-	if limit != -1 {
-		if limit <= 0 {
-			return 0, fmt.Errorf("history limit 必须是 -1 或正整数: %d", limit)
-		}
-		rows, err := tx.Query(ctx, `
-			SELECT id
-			  FROM pitr_txn
-			 WHERE state<>'root' AND closed_at IS NOT NULL
-			 ORDER BY id DESC
-			 OFFSET $1`, limit)
-		if err != nil {
-			return 0, err
-		}
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return 0, err
-			}
-			doomed = append(doomed, id)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		rows.Close()
+	result, err := pruneClosedVersionsBatch(
+		ctx, tx, scope, limit, foregroundPruneBatch)
+	return result.Pruned, err
+}
+
+type pruneBatchResult struct {
+	Pruned  int64
+	Pending bool
+}
+
+func pruneClosedVersionsBatch(
+	ctx context.Context,
+	tx pg.Tx,
+	scope string,
+	limit int64,
+	batch int64,
+) (pruneBatchResult, error) {
+	result := pruneBatchResult{}
+	if limit != -1 && limit <= 0 {
+		return result, fmt.Errorf("history limit 必须是 -1 或正整数: %d", limit)
 	}
+	if batch <= 0 {
+		return result, fmt.Errorf("裁剪批次必须是正整数: %d", batch)
+	}
+	remaining := batch
 	var rootID int64
 	if err := tx.QueryRow(ctx,
 		"SELECT id FROM pitr_txn WHERE state='root' ORDER BY id LIMIT 1").
 		Scan(&rootID); err != nil {
-		return 0, err
+		return result, err
 	}
-	var pruned int64
+
+	var doomed []int64
+	if limit != -1 {
+		var count int64
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM pitr_txn
+			 WHERE state<>'root' AND closed_at IS NOT NULL`).Scan(&count); err != nil {
+			return result, err
+		}
+		take := count - limit
+		if take > remaining {
+			take = remaining
+		}
+		if take > 0 {
+			rows, err := tx.Query(ctx, `
+				SELECT id FROM pitr_txn
+				 WHERE state<>'root' AND closed_at IS NOT NULL
+				 ORDER BY id ASC LIMIT $1`, take)
+			if err != nil {
+				return result, err
+			}
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return result, err
+				}
+				doomed = append(doomed, id)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return result, err
+			}
+			rows.Close()
+		}
+	}
 	if len(doomed) != 0 {
 		if _, err := tx.Exec(ctx, `
 			UPDATE pitr_txn SET parent_id=$1 WHERE parent_id=ANY($2)`,
 			rootID, doomed); err != nil {
-			return 0, err
+			return result, err
 		}
 		affected, err := tx.Exec(ctx,
 			"DELETE FROM pitr_txn WHERE id=ANY($1)", doomed)
 		if err != nil {
-			return 0, err
+			return result, err
 		}
-		pruned += affected
+		result.Pruned += affected
+		remaining -= affected
 	}
 
 	policy, err := spacePolicyTx(ctx, tx, scope)
 	if err != nil {
-		return 0, err
+		return result, err
 	}
 	highWatermark := policy.HighWatermarkBytes()
-	if policy.MaxBytes == 0 || policy.RetainedBytes <= highWatermark {
-		return pruned, nil
-	}
-
-	// 空间压力下逐个删除最老版本。每次 DELETE trigger 都会同步释放该版本
-	// 的 pin 并更新 retained_bytes，因此共享 slice 的边际价值会自然重算。
-	for policy.RetainedBytes > highWatermark {
+	for policy.MaxBytes != 0 && policy.RetainedBytes > highWatermark && remaining > 0 {
 		var oldestID int64
 		err := tx.QueryRow(ctx, `
 			SELECT id FROM pitr_txn
@@ -438,26 +466,60 @@ func pruneClosedVersions(
 			break
 		}
 		if err != nil {
-			return 0, err
+			return result, err
 		}
 		if _, err := tx.Exec(ctx,
 			"UPDATE pitr_txn SET parent_id=$1 WHERE parent_id=$2",
 			rootID, oldestID); err != nil {
-			return 0, err
+			return result, err
 		}
 		affected, err := tx.Exec(ctx,
 			"DELETE FROM pitr_txn WHERE id=$1", oldestID)
 		if err != nil {
-			return 0, err
+			return result, err
 		}
-		pruned += affected
+		result.Pruned += affected
+		remaining -= affected
 		if err := tx.QueryRow(ctx, `
 			SELECT retained_bytes FROM pitr_space_state WHERE singleton`).
 			Scan(&policy.RetainedBytes); err != nil {
-			return 0, err
+			return result, err
 		}
 	}
-	return pruned, nil
+
+	if limit != -1 {
+		var count int64
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM pitr_txn
+			 WHERE state<>'root' AND closed_at IS NOT NULL`).Scan(&count); err != nil {
+			return result, err
+		}
+		result.Pending = count > limit
+	}
+	if policy.MaxBytes != 0 && policy.RetainedBytes > highWatermark {
+		var hasPrunable bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pitr_txn
+				 WHERE state<>'root' AND closed_at IS NOT NULL
+			)`).Scan(&hasPrunable); err != nil {
+			return result, err
+		}
+		// 当前数据本身超过空间阈值时，删除历史已无法释放更多空间。
+		// 这种状态仍由 config/status 暴露，但不能让后台队列永久空转。
+		result.Pending = result.Pending || hasPrunable
+	}
+	if result.Pending {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO pitr_prune_queue(singleton,requested_at)
+			VALUES (true,now())
+			ON CONFLICT (singleton) DO UPDATE
+			   SET requested_at=EXCLUDED.requested_at`)
+	} else {
+		_, err = tx.Exec(ctx,
+			"DELETE FROM pitr_prune_queue WHERE singleton")
+	}
+	return result, err
 }
 
 func PruneClosedVersions(
