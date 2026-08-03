@@ -239,7 +239,7 @@ func newDaemonCmd() *cobra.Command {
 }
 
 func newInitCmd() *cobra.Command {
-	var volume, storage, bucket, accessKey, secretKey, dataDir string
+	var volume, workspaceName, storage, bucket, accessKey, secretKey, dataDir string
 	var historyLimit int64
 	var spaceReserve int
 	var maxSpace string
@@ -269,7 +269,7 @@ func newInitCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			request := &pb.InitRequest{
-				Path: resolved, Volume: volume,
+				Path: resolved, Volume: volume, Workspace: workspaceName,
 				StorageArgs: storageArgs,
 			}
 			if cmd.Flags().Changed("history-limit") {
@@ -292,9 +292,18 @@ func newInitCmd() *cobra.Command {
 				return friendlyRPCError(cmd, err)
 			}
 			item := resp.GetVolume()
+			if resp.GetWorkspace() == nil {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"initialized %s @ %s (jfs=%s history-limit=%s max-space=%s reserve=%d%%)\n",
+					item.GetName(), item.GetFuseMount(), item.GetJfsMount(),
+					formatHistoryLimit(item.GetHistoryLimit()),
+					txn.FormatSpaceLimit(item.GetMaxSpaceBytes()),
+					item.GetSpaceReservePercent())
+				return nil
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"initialized %s @ %s (jfs=%s history-limit=%s max-space=%s reserve=%d%%)\n",
-				item.GetName(), item.GetFuseMount(),
+				"initialized workspace %s @ %s (volume=%s jfs=%s history-limit=%s max-space=%s reserve=%d%%)\n",
+				workspaceName, item.GetFuseMount(), item.GetName(),
 				item.GetJfsMount(), formatHistoryLimit(item.GetHistoryLimit()),
 				txn.FormatSpaceLimit(item.GetMaxSpaceBytes()),
 				item.GetSpaceReservePercent())
@@ -302,6 +311,8 @@ func newInitCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&volume, "volume", "default", "JuiceFS 卷名")
+	c.Flags().StringVar(&workspaceName, "workspace", "default",
+		"工作空间名称；同一 workspace 的所有挂载共享版本线")
 	c.Flags().StringVar(&storage, "storage", "file", "兼容参数；存储后端在 install 时确定")
 	c.Flags().StringVar(&bucket, "bucket", "", "兼容参数；bucket 在 install 时确定")
 	c.Flags().StringVar(&accessKey, "access-key", "", "兼容参数；凭证在 install 时确定")
@@ -317,7 +328,8 @@ func newInitCmd() *cobra.Command {
 }
 
 func newRecoverCmd() *cobra.Command {
-	return &cobra.Command{
+	var workspaceName string
+	c := &cobra.Command{
 		Use:   "recover [path]",
 		Short: "数据仍在,重新拉起 daemon + 挂载",
 		Args:  cobra.MaximumNArgs(1),
@@ -338,11 +350,31 @@ func newRecoverCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Recover(ctx,
-				&pb.RecoverRequest{Path: requested})
+				&pb.RecoverRequest{Path: requested, Workspace: workspaceName})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
 			rows := [][]string{{"状态", "卷", "挂载点", "JuiceFS/错误"}}
+			if len(resp.GetWorkspaces()) != 0 {
+				rows[0][1] = "WORKSPACE"
+			}
+			for _, workspaceItem := range resp.GetWorkspaces() {
+				if len(workspaceItem.GetMounts()) == 0 {
+					rows = append(rows, []string{
+						"已校验", workspaceItem.GetName(), "-", workspaceItem.GetJfsMount(),
+					})
+					continue
+				}
+				for _, mountItem := range workspaceItem.GetMounts() {
+					state := "未挂载"
+					if mountItem.GetMounted() {
+						state = "已恢复"
+					}
+					rows = append(rows, []string{
+						state, workspaceItem.GetName(), mountItem.GetPath(), workspaceItem.GetJfsMount(),
+					})
+				}
+			}
 			for _, volume := range resp.GetVolumes() {
 				if volume.GetError() != "" {
 					rows = append(rows, []string{
@@ -357,10 +389,13 @@ func newRecoverCmd() *cobra.Command {
 			return writeAlignedTable(cmd.OutOrStdout(), rows)
 		},
 	}
+	c.Flags().StringVar(&workspaceName, "workspace", "",
+		"只恢复指定工作空间；省略时恢复全部工作空间")
+	return c
 }
 
 func newMountCmd() *cobra.Command {
-	var volume string
+	var volume, workspaceName string
 	c := &cobra.Command{
 		Use:   "mount <path>",
 		Short: "已格式化的卷单独恢复 FUSE 挂载",
@@ -378,17 +413,23 @@ func newMountCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Mount(ctx,
-				&pb.MountRequest{Path: resolved, Volume: volume})
+				&pb.MountRequest{Path: resolved, Volume: volume, Workspace: workspaceName})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
 			item := resp.GetVolume()
+			if resp.GetWorkspace() == nil {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"mounted %s @ %s\n", item.GetName(), item.GetFuseMount())
+				return nil
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"mounted %s @ %s\n", item.GetName(), item.GetFuseMount())
+				"mounted workspace %s @ %s\n", workspaceName, item.GetFuseMount())
 			return nil
 		},
 	}
 	c.Flags().StringVar(&volume, "volume", "", "卷名(默认按 path 匹配)")
+	c.Flags().StringVar(&workspaceName, "workspace", "default", "工作空间名称")
 	return c
 }
 
@@ -436,9 +477,38 @@ func newStatusCmd() *cobra.Command {
 			if err != nil {
 				return friendlyRPCError(cmd, err)
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"connected to pitrd %s, %d volumes, %d open writes\n",
-				resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetOpenWrites())
+			if len(resp.GetWorkspaces()) != 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"connected to pitrd %s, %d workspaces, %d open writes\n",
+					resp.GetDaemonVersion(), len(resp.GetWorkspaces()), resp.GetOpenWrites())
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"connected to pitrd %s, %d volumes, %d open writes\n",
+					resp.GetDaemonVersion(), len(resp.GetVolumes()), resp.GetOpenWrites())
+			}
+			if len(resp.GetWorkspaces()) != 0 {
+				rows := [][]string{{
+					"工作空间", "卷", "JuiceFS", "挂载点", "状态", "版本上限",
+				}}
+				for _, item := range resp.GetWorkspaces() {
+					if len(item.GetMounts()) == 0 {
+						rows = append(rows, []string{item.GetName(), item.GetVolume(),
+							item.GetJfsMount(), "-", "未挂载",
+							formatHistoryLimit(item.GetHistoryLimit())})
+						continue
+					}
+					for _, mount := range item.GetMounts() {
+						state := "未挂载"
+						if mount.GetMounted() {
+							state = "已挂载"
+						}
+						rows = append(rows, []string{item.GetName(), item.GetVolume(),
+							item.GetJfsMount(), mount.GetPath(), state,
+							formatHistoryLimit(item.GetHistoryLimit())})
+					}
+				}
+				return writeAlignedTable(cmd.OutOrStdout(), rows)
+			}
 			rows := [][]string{{
 				"卷", "JuiceFS", "挂载点", "版本上限",
 				"空间上限", "预留比例", "已占用", "可回收",
@@ -515,6 +585,7 @@ func newSpaceCmd() *cobra.Command {
 }
 
 func newConfigCmd() *cobra.Command {
+	var workspaceName string
 	const configHelp = `查看或设置全局运行时配置。
 
 支持的配置项：
@@ -536,7 +607,17 @@ history-limit 与空间水位同时生效，最终由更严格的约束决定保
 			return friendlyRPCError(cmd, err)
 		}
 		historyLimit, maxSpace, spaceReserve := "-", "-", "-"
-		if len(resp.GetVolumes()) > 0 {
+		if len(resp.GetWorkspaces()) > 0 {
+			for _, item := range resp.GetWorkspaces() {
+				if item.GetName() != workspaceName {
+					continue
+				}
+				historyLimit = formatHistoryLimit(item.GetHistoryLimit())
+				maxSpace = txn.FormatSpaceLimit(item.GetMaxSpaceBytes())
+				spaceReserve = fmt.Sprintf("%d%%", item.GetSpaceReservePercent())
+				break
+			}
+		} else if len(resp.GetVolumes()) > 0 {
 			volume := resp.GetVolumes()[0]
 			historyLimit = formatHistoryLimit(volume.GetHistoryLimit())
 			maxSpace = txn.FormatSpaceLimit(volume.GetMaxSpaceBytes())
@@ -586,7 +667,7 @@ history-limit 与空间水位同时生效，最终由更严格的约束决定保
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.ConfigSet(ctx, &pb.ConfigSetRequest{
-				Key: args[0], Value: args[1],
+				Key: args[0], Value: args[1], Workspace: workspaceName,
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
@@ -599,6 +680,8 @@ history-limit 与空间水位同时生效，最终由更严格的约束决定保
 	}
 	// value 允许直接写 -1；此子命令没有位于位置参数之后的选项。
 	set.Flags().SetInterspersed(false)
+	c.PersistentFlags().StringVar(&workspaceName, "workspace", "default",
+		"查看或修改指定 workspace 的配置")
 	c.AddCommand(list, set)
 	return c
 }
@@ -916,6 +999,7 @@ func newRevertCmd() *cobra.Command {
 
 func newClearCmd() *cobra.Command {
 	var global, yes bool
+	var workspaceName string
 	c := &cobra.Command{
 		Use:   "clear",
 		Short: "清空版本历史并保留当前文件作为新基线",
@@ -935,7 +1019,7 @@ func newClearCmd() *cobra.Command {
 			ctx, cancel := rpcContext(cmd)
 			defer cancel()
 			resp, err := client.rpc.Clear(ctx, &pb.ClearRequest{
-				Global: true, Confirm: true,
+				Global: true, Confirm: true, Workspace: workspaceName,
 			})
 			if err != nil {
 				return friendlyRPCError(cmd, err)
@@ -946,8 +1030,9 @@ func newClearCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&global, "global", false, "清空整个卷(当前唯一支持的维度)")
+	c.Flags().BoolVar(&global, "global", false, "清空指定 workspace 的全部历史")
 	c.Flags().BoolVar(&yes, "yes", false, "确认永久删除历史")
+	c.Flags().StringVar(&workspaceName, "workspace", "default", "工作空间名称")
 	return c
 }
 

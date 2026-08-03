@@ -24,9 +24,9 @@ import (
 	juicefsabi "pitr_fs/internal/juicefsabi/v1"
 	pitrmount "pitr_fs/internal/mount"
 	"pitr_fs/internal/pg"
-	"pitr_fs/internal/proxy"
 	pitrserver "pitr_fs/internal/server"
 	"pitr_fs/internal/txn"
+	"pitr_fs/internal/workspace"
 )
 
 var (
@@ -147,84 +147,53 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		go runGCWorker(cmd.Context(), mgr, jfs, flagGCInterval, flagGCThreads)
 	}
 	go runPruneWorker(cmd.Context(), mgr, pruneInterval, pruneBatch)
-	persisted, err := mgr.LoadVolumeMountConfig(cmd.Context(), flagVolume)
+	catalog := workspace.NewCatalog(db)
+	if _, err := catalog.Ensure(cmd.Context(), workspace.DefaultName, flagVolume); err != nil {
+		return fmt.Errorf("校准 default workspace: %w", err)
+	}
+	workspaceRuntime := pitrmount.NewWorkspaceRuntime(
+		flagJFSMount, "/run/pitr/workspaces", mgr)
+	var restoredMounts []string
+	workspaceItems, err := catalog.List(cmd.Context())
 	if err != nil {
 		return err
 	}
-	var fuseProxy *proxy.Loopback
-	mountProxy := func(_ context.Context, mountPath string) error {
-		if fuseProxy != nil {
-			if fuseProxy.Mount != filepath.Clean(mountPath) {
-				return fmt.Errorf("FUSE 已配置到 %s", fuseProxy.Mount)
+	for _, item := range workspaceItems {
+		mounts, err := catalog.Mounts(cmd.Context(), item.ID)
+		if err != nil {
+			return err
+		}
+		for _, configured := range mounts {
+			if !pathInsideMountRoot(configured.Path, flagMountRoot) {
+				return fmt.Errorf("持久化挂载点 %q 不在 mount root %q 下",
+					configured.Path, flagMountRoot)
 			}
-			return fuseProxy.Start()
-		}
-		created, createErr := proxy.NewLoopback(
-			flagJFSMount,
-			mountPath,
-			proxy.WithManager(mgr),
-			proxy.WithAllowOther(true),
-		)
-		if createErr != nil {
-			return createErr
-		}
-		if startErr := created.Start(); startErr != nil {
-			return startErr
-		}
-		fuseProxy = created
-		return nil
-	}
-	umountProxy := func(context.Context) error {
-		if fuseProxy == nil {
-			return nil
-		}
-		return fuseProxy.Unmount()
-	}
-	forceUmountProxy := func(context.Context) error {
-		if fuseProxy == nil {
-			return nil
-		}
-		return fuseProxy.UnmountLazy()
-	}
-	fuseMount := ""
-	if persisted != nil {
-		fuseMount = persisted.FUSEMount
-		if !pathInsideMountRoot(fuseMount, flagMountRoot) {
-			return fmt.Errorf("持久化挂载点 %q 不在 mount root %q 下",
-				fuseMount, flagMountRoot)
-		}
-		if err := mountProxy(cmd.Context(), fuseMount); err != nil {
-			return fmt.Errorf("恢复 FUSE 代理: %w", err)
+			if err := workspaceRuntime.Mount(cmd.Context(), item, configured.Path); err != nil {
+				return fmt.Errorf("恢复 workspace %s 挂载 %s: %w",
+					item.Name, configured.Path, err)
+			}
+			restoredMounts = append(restoredMounts, configured.Path)
 		}
 	}
 	defer func() {
-		if err := umountProxy(context.Background()); err != nil {
-			slog.Error("stop FUSE proxy", "error", err)
+		if err := workspaceRuntime.StopAll(); err != nil {
+			slog.Error("stop workspace FUSE proxies", "error", err)
 		}
 	}()
 
 	handler := pitrserver.New(db, mgr, pitrserver.Config{
-		DaemonVersion:   buildinfo.Full(),
-		Volume:          flagVolume,
-		JFSMount:        flagJFSMount,
-		FUSEMount:       fuseMount,
-		MountRoot:       flagMountRoot,
-		JFSMounted:      true,
-		FUSEMounted:     fuseProxy != nil && fuseProxy.Mounted(),
-		MountFunc:       mountProxy,
-		UmountFunc:      umountProxy,
-		ForceUmountFunc: forceUmountProxy,
-		QuiesceFunc: func(enabled bool) {
-			if fuseProxy != nil {
-				fuseProxy.SetQuiescing(enabled)
-			}
-		},
-		DiscardWritesFunc: func(ctx context.Context) (int, error) {
-			if fuseProxy == nil {
-				return 0, nil
-			}
-			return fuseProxy.DiscardOpenWrites(ctx)
-		},
+		DaemonVersion:              buildinfo.Full(),
+		Volume:                     flagVolume,
+		JFSMount:                   flagJFSMount,
+		FUSEMount:                  "",
+		MountRoot:                  flagMountRoot,
+		JFSMounted:                 true,
+		FUSEMounted:                false,
+		MountedWorkspacePaths:      restoredMounts,
+		MountWorkspaceFunc:         workspaceRuntime.Mount,
+		UmountWorkspaceFunc:        workspaceRuntime.Umount,
+		QuiesceWorkspaceFunc:       workspaceRuntime.SetQuiescing,
+		DiscardWorkspaceWritesFunc: workspaceRuntime.DiscardOpenWrites,
 		UpgradeDiscardRequested: func() bool {
 			_, err := os.Stat("/run/pitr/discard-open-writes")
 			return err == nil
@@ -239,7 +208,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		"volume", flagVolume,
 		"jfs_mount", flagJFSMount,
 		"mount_root", flagMountRoot,
-		"fuse_mount", fuseMount,
+		"workspace_mounts", len(restoredMounts),
 	)
 	return serveSocket(cmd.Context(), flagSocket, grpcServer)
 }
@@ -293,12 +262,25 @@ func runPruneWorker(
 			return
 		case <-ticker.C:
 			runCtx, cancel := context.WithTimeout(ctx, pruneTimeout)
-			pruned, pending, err := mgr.RunPendingPrune(runCtx, "/", batch)
+			workspaceIDs, err := mgr.PendingPruneWorkspaceIDs(runCtx)
+			var totalPruned int64
+			pending := false
+			for _, workspaceID := range workspaceIDs {
+				pruned, workspacePending, pruneErr := mgr.ForWorkspace(workspaceID).
+					RunPendingPrune(runCtx, "/", batch)
+				totalPruned += pruned
+				pending = pending || workspacePending
+				if pruneErr != nil {
+					err = pruneErr
+					break
+				}
+			}
 			cancel()
 			switch {
-			case err == nil && pruned != 0:
+			case err == nil && totalPruned != 0:
 				slog.Info("version pruning batch completed",
-					"pruned", pruned, "pending", pending)
+					"pruned", totalPruned, "pending", pending,
+					"workspaces", len(workspaceIDs))
 			case errors.Is(err, txn.ErrMaintenanceBusy):
 				slog.Debug("version pruning deferred", "reason", err)
 			case err != nil && !errors.Is(err, context.Canceled):

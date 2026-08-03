@@ -127,6 +127,14 @@ func (s *Server) Init(
 		return nil, status.Errorf(codes.InvalidArgument,
 			"space-reserve 必须是 1..99%%: %d", req.GetSpaceReservePercent())
 	}
+	// 新 daemon 即使收到旧 CLI（尚未携带 workspace 字段）的请求，也把它
+	// 解释为 default workspace；仅保留注入旧生命周期回调的单元测试/兼容
+	// 嵌入场景继续走 legacy volume 分支。
+	if req.GetWorkspace() != "" || s.cfg.MountWorkspaceFunc != nil {
+		s.lifecycleMu.Lock()
+		defer s.lifecycleMu.Unlock()
+		return s.initWorkspace(ctx, req)
+	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	index, err := s.findVolumeLocked("", req.GetVolume())
@@ -184,6 +192,11 @@ func (s *Server) Mount(
 	if req.GetPath() == "" {
 		return nil, status.Error(codes.InvalidArgument, "path 不能为空")
 	}
+	if req.GetWorkspace() != "" || s.cfg.MountWorkspaceFunc != nil {
+		s.lifecycleMu.Lock()
+		defer s.lifecycleMu.Unlock()
+		return s.mountWorkspace(ctx, req)
+	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	index, err := s.findVolumeLocked(req.GetPath(), req.GetVolume())
@@ -205,6 +218,9 @@ func (s *Server) Umount(
 	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	if resolved, resolveErr := s.catalog.ResolveMount(ctx, req.GetPath()); resolveErr == nil {
+		return s.umountWorkspaceLocked(ctx, resolved.Workspace, req.GetPath())
+	}
 	index, err := s.findVolumeLocked(req.GetPath(), "")
 	if err != nil {
 		return nil, err
@@ -284,6 +300,10 @@ func (s *Server) ConfigSet(
 ) (*pb.ConfigSetResponse, error) {
 	key := strings.ToLower(strings.TrimSpace(req.GetKey()))
 	value := strings.ToLower(strings.TrimSpace(req.GetValue()))
+	manager, item, err := s.managerForWorkspaceName(ctx, req.GetWorkspace())
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
 	if req.GetWindow() != "" {
 		return nil, status.Error(codes.InvalidArgument,
 			"--window 已随 retention 配置移除")
@@ -294,22 +314,26 @@ func (s *Server) ConfigSet(
 			return nil, status.Errorf(codes.InvalidArgument,
 				"history-limit 必须是 -1 或正整数: %q", value)
 		}
-		if _, err := s.mgr.SetHistoryLimit(ctx, "/", limit); err != nil {
+		if _, err := manager.SetHistoryLimit(ctx, "/", limit); err != nil {
 			return nil, rpcError(err)
 		}
 		return &pb.ConfigSetResponse{
 			Key: key, Value: strconv.FormatInt(limit, 10)}, nil
 	}
 	if key == "max-space" {
+		if item.Name != "default" {
+			return nil, status.Error(codes.FailedPrecondition,
+				"max-space 当前是 JuiceFS 卷级策略，只能由 default workspace 设置")
+		}
 		maxBytes, err := txn.ParseSpaceBytes(value)
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
-		policy, err := s.mgr.SpacePolicy(ctx, "/")
+		policy, err := manager.SpacePolicy(ctx, "/")
 		if err != nil {
 			return nil, rpcError(err)
 		}
-		if _, err := s.mgr.SetSpacePolicy(
+		if _, err := manager.SetSpacePolicy(
 			ctx, "/", maxBytes, policy.ReservePercent); err != nil {
 			return nil, rpcError(err)
 		}
@@ -317,17 +341,21 @@ func (s *Server) ConfigSet(
 			Key: key, Value: txn.FormatSpaceLimit(maxBytes)}, nil
 	}
 	if key == "space-reserve" {
+		if item.Name != "default" {
+			return nil, status.Error(codes.FailedPrecondition,
+				"space-reserve 当前是 JuiceFS 卷级策略，只能由 default workspace 设置")
+		}
 		percentText := strings.TrimSuffix(value, "%")
 		percent, err := strconv.Atoi(percentText)
 		if err != nil || percent < 1 || percent > 99 {
 			return nil, status.Errorf(codes.InvalidArgument,
 				"space-reserve 必须是 1..99%%: %q", value)
 		}
-		policy, err := s.mgr.SpacePolicy(ctx, "/")
+		policy, err := manager.SpacePolicy(ctx, "/")
 		if err != nil {
 			return nil, rpcError(err)
 		}
-		if _, err := s.mgr.SetSpacePolicy(
+		if _, err := manager.SetSpacePolicy(
 			ctx, "/", policy.MaxBytes, percent); err != nil {
 			return nil, rpcError(err)
 		}

@@ -47,6 +47,27 @@ func mountedLoopback(
 	return backend, mount, loopback
 }
 
+func TestLoopback_DefaultWorkspaceProtectsInternalBackend(t *testing.T) {
+	root := t.TempDir()
+	backend := filepath.Join(root, "backend")
+	mount := filepath.Join(root, "mount")
+	if err := os.MkdirAll(filepath.Join(backend, ".pitr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loopback, err := NewLoopback(
+		backend, mount, WithHiddenRootName(".pitr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootNode := loopback.rootNode.(*Node)
+	if !rootNode.protectedChild(".pitr") {
+		t.Fatal("default workspace 必须保护内部 .pitr 后端")
+	}
+	if rootNode.protectedChild("user-file") {
+		t.Fatal("普通用户文件不应被保护规则拦截")
+	}
+}
+
 func TestLoopback_WriteRead(t *testing.T) {
 	backend, mount, _ := mountedLoopback(t)
 	content := []byte("pitr loopback\n")

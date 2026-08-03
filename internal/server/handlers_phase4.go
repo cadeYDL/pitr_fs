@@ -15,6 +15,7 @@ import (
 	pb "pitr_fs/api/pitrd/v1"
 	"pitr_fs/internal/revert"
 	"pitr_fs/internal/txn"
+	"pitr_fs/internal/workspace"
 )
 
 func (s *Server) Revert(
@@ -28,6 +29,9 @@ func (s *Server) Revert(
 			"version_hash 与 target_time 必须且只能指定一个")
 	}
 	var resolved *txn.Txn
+	var manager *txn.Manager
+	var workspaceItem workspace.Workspace
+	scope := req.GetPath()
 	if targetTime != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, targetTime)
 		if err != nil {
@@ -38,7 +42,15 @@ func (s *Server) Revert(
 			return nil, status.Error(codes.InvalidArgument,
 				"target_time 不能晚于当前时间")
 		}
-		resolved, err = s.mgr.FindClosedAtOrBefore(ctx, parsed)
+		if scope != "" {
+			manager, scope, workspaceItem, err = s.managerForPath(ctx, scope)
+		} else {
+			manager, workspaceItem, err = s.managerForWorkspaceName(ctx, workspace.DefaultName)
+		}
+		if err != nil {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		resolved, err = manager.FindClosedAtOrBefore(ctx, parsed)
 		if err != nil {
 			if errors.Is(err, txn.ErrTimeBeforeHistory) {
 				return nil, status.Error(codes.OutOfRange, err.Error())
@@ -52,14 +64,30 @@ func (s *Server) Revert(
 				"%v: %q", revert.ErrInvalidHash, versionHash)
 		}
 		var err error
-		resolved, err = s.mgr.FindByHash(ctx, versionHash)
+		manager, workspaceItem, err = s.managerForVersion(ctx, versionHash)
+		if err == nil && scope != "" {
+			var pathManager *txn.Manager
+			var pathWorkspace workspace.Workspace
+			pathManager, scope, pathWorkspace, err = s.managerForPath(ctx, scope)
+			if err == nil && pathWorkspace.ID != workspaceItem.ID {
+				err = fmt.Errorf("版本属于 workspace %s，path 属于 workspace %s",
+					workspaceItem.Name, pathWorkspace.Name)
+			}
+			_ = pathManager
+		}
+		if err != nil {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		resolved, err = manager.FindByHash(ctx, versionHash)
 		if err != nil {
 			return nil, rpcError(err)
 		}
 	}
-	applied, hash, err := s.rev.Revert(ctx, revert.Options{
+	engine := revert.NewEngine(s.db,
+		revert.WithWorkspace(workspaceItem.ID, workspaceItem.BackendPath))
+	applied, hash, err := engine.Revert(ctx, revert.Options{
 		TargetHash: versionHash,
-		ScopePath:  req.GetPath(),
+		ScopePath:  scope,
 		DryRun:     req.GetDryRun(),
 	})
 	if err != nil {
@@ -96,8 +124,32 @@ func (s *Server) Diff(
 		return nil, status.Error(codes.InvalidArgument,
 			"version_a 和 version_b 均不能为空")
 	}
-	stats, err := s.mgr.Diff(
-		ctx, req.GetVersionA(), req.GetVersionB(), req.GetPath())
+	manager, workspaceA, err := s.managerForVersion(ctx, req.GetVersionA())
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	_, workspaceB, err := s.managerForVersion(ctx, req.GetVersionB())
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	if workspaceA.ID != workspaceB.ID {
+		return nil, status.Error(codes.InvalidArgument,
+			"不能比较不同 workspace 的版本")
+	}
+	scope := req.GetPath()
+	if scope != "" {
+		_, resolvedScope, pathWorkspace, resolveErr := s.managerForPath(ctx, scope)
+		if resolveErr != nil {
+			return nil, status.Error(codes.NotFound, resolveErr.Error())
+		}
+		if pathWorkspace.ID != workspaceA.ID {
+			return nil, status.Error(codes.InvalidArgument,
+				"path 与版本不属于同一 workspace")
+		}
+		scope = resolvedScope
+	}
+	stats, err := manager.Diff(
+		ctx, req.GetVersionA(), req.GetVersionB(), scope)
 	if err != nil {
 		return nil, rpcError(err)
 	}
@@ -120,7 +172,11 @@ func (s *Server) Clear(
 		return nil, status.Error(codes.InvalidArgument,
 			"clear 会永久删除全部版本历史；请添加 --yes")
 	}
-	stats, err := s.mgr.ClearHistory(ctx, "/")
+	manager, _, err := s.managerForWorkspaceName(ctx, req.GetWorkspace())
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	stats, err := manager.ClearHistory(ctx, "/")
 	if err != nil {
 		return nil, rpcError(err)
 	}
@@ -153,17 +209,32 @@ func (s *Server) Squash(
 		return nil, status.Error(codes.InvalidArgument,
 			"squash 会永久删除中间版本；请先使用 --dry-run 预览，再添加 --yes 执行")
 	}
+	manager, baseWorkspace, err := s.managerForVersion(ctx, baseVersion)
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	_, endWorkspace, err := s.managerForVersion(ctx, endVersion)
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	if baseWorkspace.ID != endWorkspace.ID {
+		return nil, status.Error(codes.InvalidArgument,
+			"不能 squash 不同 workspace 的版本")
+	}
 
 	if !req.GetDryRun() {
 		s.lifecycleMu.Lock()
 		defer s.lifecycleMu.Unlock()
-		if s.cfg.QuiesceFunc != nil {
+		if s.cfg.QuiesceWorkspaceFunc != nil {
+			s.cfg.QuiesceWorkspaceFunc(baseWorkspace.ID, true)
+			defer s.cfg.QuiesceWorkspaceFunc(baseWorkspace.ID, false)
+		} else if s.cfg.QuiesceFunc != nil {
 			s.cfg.QuiesceFunc(true)
 			defer s.cfg.QuiesceFunc(false)
 		}
 		deadline := time.Now().Add(3 * time.Second)
 		for {
-			open, err := s.mgr.CountOpenWrites(ctx)
+			open, err := manager.CountWorkspaceOpenWrites(ctx)
 			if err != nil {
 				return nil, rpcError(err)
 			}
@@ -182,7 +253,7 @@ func (s *Server) Squash(
 		}
 	}
 
-	stats, err := s.mgr.Squash(ctx, txn.SquashOptions{
+	stats, err := manager.Squash(ctx, txn.SquashOptions{
 		BaseHash:  baseVersion,
 		EndHash:   endVersion,
 		Message:   message,
@@ -216,6 +287,9 @@ func (s *Server) Recover(
 	ctx context.Context,
 	req *pb.RecoverRequest,
 ) (*pb.RecoverResponse, error) {
+	if req.GetWorkspace() != "" || s.cfg.MountWorkspaceFunc != nil {
+		return s.recoverWorkspaces(ctx, req)
+	}
 	requested := path.Clean(req.GetPath())
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -253,6 +327,67 @@ func (s *Server) Recover(
 			results[0].GetError())
 	}
 	return &pb.RecoverResponse{Volumes: results}, nil
+}
+
+func (s *Server) recoverWorkspaces(
+	ctx context.Context,
+	req *pb.RecoverRequest,
+) (*pb.RecoverResponse, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if err := recoverVolume(ctx, s.volumes[0]); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	var items []workspace.Workspace
+	switch {
+	case req.GetPath() != "":
+		resolved, err := s.catalog.ResolveMount(ctx, req.GetPath())
+		if err != nil {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		if req.GetWorkspace() != "" && req.GetWorkspace() != resolved.Workspace.Name {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"挂载点属于 workspace %s，不是 %s",
+				resolved.Workspace.Name, req.GetWorkspace())
+		}
+		items = []workspace.Workspace{resolved.Workspace}
+	case req.GetWorkspace() != "":
+		item, err := s.catalog.GetByName(ctx, req.GetWorkspace())
+		if err != nil {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		items = []workspace.Workspace{item}
+	default:
+		var err error
+		items, err = s.catalog.List(ctx)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+	results := make([]*pb.WorkspaceStatus, 0, len(items))
+	for _, item := range items {
+		mounts, err := s.catalog.Mounts(ctx, item.ID)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		for _, mount := range mounts {
+			if req.GetPath() != "" && path.Clean(mount.Path) != path.Clean(req.GetPath()) {
+				continue
+			}
+			if err := s.mountWorkspaceLocked(ctx, item, mount.Path); err != nil {
+				return nil, err
+			}
+		}
+		itemStatus, err := s.workspaceStatus(ctx, item)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, itemStatus)
+	}
+	if len(results) == 0 {
+		return nil, status.Error(codes.NotFound, "未找到可恢复的 workspace")
+	}
+	return &pb.RecoverResponse{Workspaces: results}, nil
 }
 
 func recoverVolume(ctx context.Context, volume VolumeConfig) error {

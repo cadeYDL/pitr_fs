@@ -20,6 +20,7 @@ import (
 
 	pb "pitr_fs/api/pitrd/v1"
 	"pitr_fs/internal/pg"
+	"pitr_fs/internal/revert"
 	"pitr_fs/internal/schema"
 	"pitr_fs/internal/txn"
 )
@@ -234,7 +235,7 @@ func TestServer_SquashPreviewAndExecute(t *testing.T) {
 	}
 	var endHash string
 	for index := 0; index < 3; index++ {
-		id, err := f.mgr.OpenStandaloneVersion(ctx, "/workspace/file",
+		id, err := f.mgr.OpenStandaloneVersion(ctx, "/file",
 			fmt.Sprintf("write-%d", index), txn.VersionMetadata{})
 		if err != nil {
 			t.Fatal(err)
@@ -313,7 +314,7 @@ func TestServer_AutomaticVersion_E2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	autoID, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/proj/a", "write:/workspace/proj/a",
+		ctx, "/proj/a", "write:/workspace/proj/a",
 		txn.VersionMetadata{
 			PosixOp:        `write("/workspace/proj/a", offset=0, len=2)`,
 			ProcessCommand: "echo hi > ...",
@@ -367,7 +368,7 @@ func TestServer_RevertAtValidationAndResolution(t *testing.T) {
 	if err := f.db.QueryRow(ctx, `
 		INSERT INTO pitr_txn
 			(version_hash,parent_id,scope_path,state,command,closed_at)
-		VALUES ('111111111111',1,'/workspace/proj','committed','commit',
+		VALUES ('111111111111',1,'/proj','committed','commit',
 		        '2020-01-01T01:00:00Z')
 		RETURNING id`).Scan(&firstID); err != nil {
 		t.Fatal(err)
@@ -375,7 +376,7 @@ func TestServer_RevertAtValidationAndResolution(t *testing.T) {
 	if _, err := f.db.Exec(ctx, `
 		INSERT INTO pitr_txn
 			(version_hash,parent_id,scope_path,state,command,closed_at)
-		VALUES ('222222222222',$1,'/workspace/proj','committed','commit',
+		VALUES ('222222222222',$1,'/proj','committed','commit',
 		        '2020-01-01T02:00:00Z')`, firstID); err != nil {
 		t.Fatal(err)
 	}
@@ -428,14 +429,14 @@ func TestServer_RevertDiffRecover_E2E(t *testing.T) {
 	if err := f.db.QueryRow(ctx, `
 		INSERT INTO pitr_txn
 			(version_hash,parent_id,scope_path,state,command,closed_at)
-		VALUES ('111111111111',1,'/workspace/proj','committed','commit',now())
+		VALUES ('111111111111',1,'/proj','committed','commit',now())
 		RETURNING id`).Scan(&v1); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.db.QueryRow(ctx, `
 		INSERT INTO pitr_txn
 			(version_hash,parent_id,scope_path,state,command,closed_at)
-		VALUES ('222222222222',$1,'/workspace/proj','committed','commit',now())
+		VALUES ('222222222222',$1,'/proj','committed','commit',now())
 		RETURNING id`, v1).Scan(&v2); err != nil {
 		t.Fatal(err)
 	}
@@ -447,6 +448,19 @@ func TestServer_RevertDiffRecover_E2E(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+	var captured int64
+	if err := f.db.QueryRow(ctx,
+		"SELECT count(*) FROM pitr_node_history WHERE txn_id=$1", v2).
+		Scan(&captured); err != nil || captured != 1 {
+		t.Fatalf("captured=%d err=%v", captured, err)
+	}
+	dryRunApplied, _, err := revert.NewEngine(f.db,
+		revert.WithWorkspace(1, "/")).Revert(ctx, revert.Options{
+		TargetHash: "111111111111", ScopePath: "/proj", DryRun: true,
+	})
+	if err != nil || dryRunApplied != 1 {
+		t.Fatalf("dry-run applied=%d err=%v", dryRunApplied, err)
 	}
 
 	diff, err := f.client.Diff(ctx, &pb.DiffRequest{
@@ -640,7 +654,7 @@ func TestServer_LifecycleAndConfig_E2E(t *testing.T) {
 	}
 }
 
-func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
+func TestServer_InitCreatesWorkspaceAndPersistsMultipleMounts(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	var mounted []string
@@ -669,7 +683,7 @@ func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
 		t.Fatalf("legacy retention code=%s err=%v", status.Code(err), err)
 	}
 	initialized, err := handler.Init(ctx, &pb.InitRequest{
-		Path: "/pitr/data", Volume: "dynamic-volume",
+		Path: "/pitr/data", Volume: "dynamic-volume", Workspace: "alpha",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -679,27 +693,67 @@ func TestServer_InitSelectsAndPersistsMountPath(t *testing.T) {
 		mounted[0] != "/pitr/data" {
 		t.Fatalf("init=%+v mounted=%v", initialized, mounted)
 	}
-	persisted, err := f.mgr.LoadVolumeMountConfig(ctx, "dynamic-volume")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted == nil || persisted.FUSEMount != "/pitr/data" {
-		t.Fatalf("persisted=%+v", persisted)
+	if initialized.GetWorkspace().GetName() != "alpha" ||
+		len(initialized.GetWorkspace().GetMounts()) != 1 {
+		t.Fatalf("workspace=%+v", initialized.GetWorkspace())
 	}
 	if _, err := handler.Init(ctx, &pb.InitRequest{
-		Path: "/pitr/data", Volume: "dynamic-volume",
+		Path: "/pitr/data", Volume: "dynamic-volume", Workspace: "alpha",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	persisted, err = f.mgr.LoadVolumeMountConfig(ctx, "dynamic-volume")
-	if err != nil || persisted == nil || len(mounted) != 1 {
-		t.Fatalf("idempotent persisted=%+v mounted=%v err=%v",
-			persisted, mounted, err)
+	if len(mounted) != 1 {
+		t.Fatalf("幂等 init mounted=%v", mounted)
 	}
-	if _, err := handler.Init(ctx, &pb.InitRequest{
-		Path: "/pitr/other", Volume: "dynamic-volume",
-	}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("第二挂载路径 code=%s err=%v", status.Code(err), err)
+	second, err := handler.Mount(ctx, &pb.MountRequest{
+		Path: "/pitr/other", Volume: "dynamic-volume", Workspace: "alpha",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.GetWorkspace().GetMounts()) != 2 || len(mounted) != 2 {
+		t.Fatalf("second=%+v mounted=%v", second.GetWorkspace(), mounted)
+	}
+}
+
+func TestServer_WorkspacePoliciesAndVersionLogsAreIndependent(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	handler := New(f.db, f.mgr, Config{
+		Volume: "test-volume", JFSMount: "/jfs", MountRoot: "/pitr",
+		JFSMounted: true,
+		MountFunc:  func(context.Context, string) error { return nil },
+		UmountFunc: func(context.Context) error { return nil },
+	})
+	for _, item := range []struct {
+		name  string
+		path  string
+		limit int64
+	}{
+		{name: "alpha", path: "/pitr/alpha", limit: 3},
+		{name: "beta", path: "/pitr/beta", limit: 9},
+	} {
+		limit := item.limit
+		if _, err := handler.Init(ctx, &pb.InitRequest{
+			Path: item.path, Volume: "test-volume", Workspace: item.name,
+			HistoryLimit: &limit,
+		}); err != nil {
+			t.Fatalf("init %s: %v", item.name, err)
+		}
+	}
+	statusResponse, err := handler.Status(ctx, &pb.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statusResponse.GetWorkspaces()) < 3 {
+		t.Fatalf("workspaces=%+v", statusResponse.GetWorkspaces())
+	}
+	limits := map[string]int64{}
+	for _, item := range statusResponse.GetWorkspaces() {
+		limits[item.GetName()] = item.GetHistoryLimit()
+	}
+	if limits["alpha"] != 3 || limits["beta"] != 9 {
+		t.Fatalf("limits=%v", limits)
 	}
 }
 
@@ -707,7 +761,7 @@ func TestServer_UmountRejectsOpenWrite(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	versionID, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/proj", "write:/workspace/proj/a",
+		ctx, "/proj", "write:/workspace/proj/a",
 		txn.VersionMetadata{})
 	if err != nil {
 		t.Fatal(err)
@@ -746,7 +800,7 @@ func TestServer_UpgradeUmountDiscardsOpenWrite(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	if _, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/large", "write:/workspace/large",
+		ctx, "/large", "write:/workspace/large",
 		txn.VersionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +830,7 @@ func TestServer_UpgradeDiscardFailureKeepsWritesFrozen(t *testing.T) {
 	f := setupServer(t)
 	ctx := context.Background()
 	if _, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/large", "write:/workspace/large",
+		ctx, "/large", "write:/workspace/large",
 		txn.VersionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
@@ -801,7 +855,7 @@ func TestServer_ClearRequiresConfirmationAndKeepsCurrentData(t *testing.T) {
 		t.Fatal(err)
 	}
 	versionID, err := f.mgr.OpenStandaloneVersion(
-		ctx, "/workspace/proj/file", "write:/workspace/proj/file",
+		ctx, "/proj/file", "write:/workspace/proj/file",
 		txn.VersionMetadata{})
 	if err != nil {
 		t.Fatal(err)

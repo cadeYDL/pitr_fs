@@ -7,6 +7,7 @@ import (
 	"pitr_fs/internal/pg"
 	"pitr_fs/internal/revert"
 	"pitr_fs/internal/txn"
+	"pitr_fs/internal/workspace"
 
 	pb "pitr_fs/api/pitrd/v1"
 )
@@ -14,20 +15,25 @@ import (
 const DefaultDaemonVersion = "dev"
 
 type Config struct {
-	DaemonVersion           string
-	Volume                  string
-	JFSMount                string
-	FUSEMount               string
-	MountRoot               string
-	JFSMounted              bool
-	FUSEMounted             bool
-	Volumes                 []VolumeConfig
-	MountFunc               func(context.Context, string) error
-	UmountFunc              func(context.Context) error
-	ForceUmountFunc         func(context.Context) error
-	QuiesceFunc             func(bool)
-	DiscardWritesFunc       func(context.Context) (int, error)
-	UpgradeDiscardRequested func() bool
+	DaemonVersion              string
+	Volume                     string
+	JFSMount                   string
+	FUSEMount                  string
+	MountRoot                  string
+	JFSMounted                 bool
+	FUSEMounted                bool
+	Volumes                    []VolumeConfig
+	MountFunc                  func(context.Context, string) error
+	UmountFunc                 func(context.Context) error
+	ForceUmountFunc            func(context.Context) error
+	QuiesceFunc                func(bool)
+	DiscardWritesFunc          func(context.Context) (int, error)
+	UpgradeDiscardRequested    func() bool
+	MountWorkspaceFunc         func(context.Context, workspace.Workspace, string) error
+	UmountWorkspaceFunc        func(context.Context, workspace.Workspace, string, bool) error
+	QuiesceWorkspaceFunc       func(int64, bool)
+	DiscardWorkspaceWritesFunc func(context.Context, int64) (int, error)
+	MountedWorkspacePaths      []string
 }
 
 // VolumeConfig 描述 recover/status 可管理的一个卷。每卷可以使用独立的
@@ -44,11 +50,13 @@ type VolumeConfig struct {
 type Server struct {
 	pb.UnimplementedPitrdServer
 
-	db      *pg.DB
-	mgr     *txn.Manager
-	rev     *revert.Engine
-	cfg     Config
-	volumes []VolumeConfig
+	db                    *pg.DB
+	mgr                   *txn.Manager
+	rev                   *revert.Engine
+	cfg                   Config
+	volumes               []VolumeConfig
+	catalog               *workspace.Catalog
+	mountedWorkspacePaths map[string]bool
 
 	lifecycleMu sync.Mutex
 }
@@ -74,10 +82,16 @@ func New(db *pg.DB, mgr *txn.Manager, cfg Config) *Server {
 			DB:          db,
 		}}
 	}
-	return &Server{
+	server := &Server{
 		db: db, mgr: mgr,
-		rev:     revert.NewEngine(db, revert.WithMountPath(cfg.FUSEMount)),
-		cfg:     cfg,
-		volumes: volumes,
+		rev:                   revert.NewEngine(db, revert.WithMountPath(cfg.FUSEMount)),
+		cfg:                   cfg,
+		volumes:               volumes,
+		catalog:               workspace.NewCatalog(db),
+		mountedWorkspacePaths: map[string]bool{},
 	}
+	for _, mountPath := range cfg.MountedWorkspacePaths {
+		server.mountedWorkspacePaths[mountPath] = true
+	}
+	return server
 }

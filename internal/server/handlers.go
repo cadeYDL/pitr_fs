@@ -20,6 +20,7 @@ func transactionPB(in *txn.Txn) *pb.Transaction {
 	}
 	out := &pb.Transaction{
 		TxnId:          in.ID,
+		WorkspaceId:    in.WorkspaceID,
 		VersionHash:    in.VersionHash,
 		ScopePath:      in.ScopePath,
 		State:          in.State,
@@ -95,11 +96,16 @@ func (s *Server) Status(
 		volume.RetainedSpaceBytes = spacePolicy.RetainedBytes
 		volume.ReclaimableSpaceBytes = spacePolicy.ReclaimableBytes
 	}
+	workspaces, err := s.allWorkspaceStatuses(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
 	return &pb.StatusResponse{
 		DaemonVersion:   s.cfg.DaemonVersion,
 		PostgresHealthy: true,
 		Volumes:         volumes,
 		OpenWrites:      openWrites,
+		Workspaces:      workspaces,
 	}, nil
 }
 
@@ -111,11 +117,15 @@ func (s *Server) Space(
 	if scope == "" {
 		scope = "/"
 	}
-	policy, err := s.mgr.SpacePolicy(ctx, scope)
+	manager, scope, _, err := s.managerForPath(ctx, scope)
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	policy, err := manager.SpacePolicy(ctx, scope)
 	if err != nil {
 		return nil, rpcError(err)
 	}
-	estimates, err := s.mgr.SpaceVersions(ctx, scope, int(req.GetLimit()))
+	estimates, err := manager.SpaceVersions(ctx, scope, int(req.GetLimit()))
 	if err != nil {
 		return nil, rpcError(err)
 	}
@@ -197,7 +207,11 @@ func (s *Server) Logs(
 	if req.GetPath() == "" {
 		return nil, status.Error(codes.InvalidArgument, "path 不能为空")
 	}
-	items, err := s.mgr.List(ctx, req.GetPath(), int(req.GetLimit()))
+	manager, scope, _, err := s.managerForPath(ctx, req.GetPath())
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+	items, err := manager.List(ctx, scope, int(req.GetLimit()))
 	if err != nil {
 		return nil, rpcError(err)
 	}

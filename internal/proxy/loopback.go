@@ -44,6 +44,22 @@ func WithAllowOther(allow bool) Option {
 	}
 }
 
+// WithDisplayRoot 让审计路径和版本 scope 使用稳定的 workspace 内路径，
+// 与用户从哪个挂载别名进入无关。
+func WithDisplayRoot(root string) Option {
+	return func(loopback *Loopback) {
+		loopback.displayRoot = filepath.Clean(root)
+	}
+}
+
+// WithHiddenRootName 保留 workspace 容器目录，防止 default workspace 通过
+// 根目录绕过隔离边界访问其他 workspace 的后端。
+func WithHiddenRootName(name string) Option {
+	return func(loopback *Loopback) {
+		loopback.hiddenRootName = filepath.Base(filepath.Clean(name))
+	}
+}
+
 // Loopback 把 Backend 透明暴露到 Mount。所有变更操作由自定义 Node 拦截,
 // 读取操作继续使用 go-fuse 的 LoopbackNode 实现。
 type Loopback struct {
@@ -51,10 +67,12 @@ type Loopback struct {
 	Mount   string
 	Server  *fuse.Server
 
-	manager    VersionManager
-	allowOther bool
-	rootData   *fs.LoopbackRoot
-	rootNode   fs.InodeEmbedder
+	manager        VersionManager
+	allowOther     bool
+	displayRoot    string
+	hiddenRootName string
+	rootData       *fs.LoopbackRoot
+	rootNode       fs.InodeEmbedder
 
 	mountMu sync.Mutex
 	// window 只保护一次 FUSE 写操作或窗口成员变更，绝不能跨 fd 生命周期持有。
@@ -177,6 +195,7 @@ func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
 		managerTimeout: defaultManagerTimeout,
 		processCache:   make(map[uint32]processCacheEntry),
 		userCache:      make(map[uint32]string),
+		displayRoot:    mount,
 	}
 	for _, option := range options {
 		option(loopback)
@@ -330,6 +349,6 @@ func directWrite(flags uint32) bool {
 
 func (l *Loopback) visiblePath(node *Node, names ...string) string {
 	relative := node.Path(l.rootData.RootNode.EmbeddedInode())
-	parts := append([]string{l.Mount, relative}, names...)
+	parts := append([]string{l.displayRoot, relative}, names...)
 	return filepath.Join(parts...)
 }

@@ -19,6 +19,9 @@ func (n *Node) Create(
 	flags, mode uint32,
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	if n.protectedChild(name) {
+		return nil, nil, 0, syscall.EPERM
+	}
 	path := n.root.visiblePath(n, name)
 	var file *trackedFile
 	posixOp := fmt.Sprintf("open(%q, %s, %#o)",
@@ -51,6 +54,9 @@ func (n *Node) Mkdir(
 	mode uint32,
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, errno syscall.Errno) {
+	if n.protectedChild(name) {
+		return nil, syscall.EPERM
+	}
 	path := n.root.visiblePath(n, name)
 	posixOp := fmt.Sprintf("mkdir(%q, %#o)", path, mode)
 	errno = n.versionedHook(ctx, path, command("mkdir", path), posixOp, 0,
@@ -62,6 +68,9 @@ func (n *Node) Mkdir(
 }
 
 func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
+	if n.protectedChild(name) {
+		return syscall.EPERM
+	}
 	path := n.root.visiblePath(n, name)
 	return n.versionedHook(ctx, path, command("unlink", path),
 		fmt.Sprintf("unlink(%q)", path), 0,
@@ -71,6 +80,9 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
+	if n.protectedChild(name) {
+		return syscall.EPERM
+	}
 	path := n.root.visiblePath(n, name)
 	return n.versionedHook(ctx, path, command("rmdir", path),
 		fmt.Sprintf("rmdir(%q)", path), 0,
@@ -91,6 +103,9 @@ func (n *Node) Rename(
 	if !ok {
 		return syscall.EXDEV
 	}
+	if n.protectedChild(name) || destination.protectedChild(newName) {
+		return syscall.EPERM
+	}
 	source := n.root.visiblePath(n, name)
 	path := destination.root.visiblePath(destination, newName)
 	posixOp := fmt.Sprintf("rename(%q, %q)", source, path)
@@ -106,6 +121,9 @@ func (n *Node) Symlink(
 	target, name string,
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, errno syscall.Errno) {
+	if n.protectedChild(name) {
+		return nil, syscall.EPERM
+	}
 	path := n.root.visiblePath(n, name)
 	posixOp := fmt.Sprintf("symlink(%q, %q)", target, path)
 	errno = n.versionedHook(ctx, path, command("symlink", path), posixOp, 0,
@@ -122,6 +140,9 @@ func (n *Node) Link(
 	name string,
 	out *fuse.EntryOut,
 ) (inode *fs.Inode, errno syscall.Errno) {
+	if n.protectedChild(name) {
+		return nil, syscall.EPERM
+	}
 	path := n.root.visiblePath(n, name)
 	posixOp := fmt.Sprintf("link(<inode>, %q)", path)
 	errno = n.versionedHook(ctx, path, command("link", path), posixOp, 0,
