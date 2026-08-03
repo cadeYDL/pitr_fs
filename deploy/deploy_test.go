@@ -357,6 +357,19 @@ func TestBuildUpgradeBundleSupportsLinuxArchitecturesAndSelfUpdate(t *testing.T)
 	}
 }
 
+func TestWorkflowsSerializePackagesSharingPostgresIntegrationDatabase(t *testing.T) {
+	root := repoRoot(t)
+	for _, name := range []string{"ci.yml", "dev-release.yml"} {
+		content, err := os.ReadFile(filepath.Join(root, ".github", "workflows", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(content, []byte("go test -p 1 -timeout 10m ./...")) {
+			t.Errorf("%s 在共享 PITR_TEST_PG_DSN 下必须串行执行 package", name)
+		}
+	}
+}
+
 func TestLogicUpgradeUsesExplicitSchemaCompatibilityContract(t *testing.T) {
 	root := repoRoot(t)
 	temp := t.TempDir()
