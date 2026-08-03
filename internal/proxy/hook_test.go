@@ -27,6 +27,9 @@ type mockManager struct {
 	posixOps     []string
 	summaries    []string
 	scopeUpdates []string
+	abortStarted chan struct{}
+	abortRelease chan struct{}
+	abortOnce    sync.Once
 }
 
 func (m *mockManager) OpenStandaloneVersion(
@@ -73,11 +76,24 @@ func (m *mockManager) UpdateStandaloneVersionScope(
 	return nil
 }
 
-func (m *mockManager) AbortAutoVersion(context.Context, int64) error {
+func (m *mockManager) AbortAutoVersion(ctx context.Context, _ int64) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.abortCalls++
-	return m.abortErr
+	err := m.abortErr
+	started := m.abortStarted
+	release := m.abortRelease
+	m.mu.Unlock()
+	if started != nil {
+		m.abortOnce.Do(func() { close(started) })
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func newHookNode(manager VersionManager) *Node {

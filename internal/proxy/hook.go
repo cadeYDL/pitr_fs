@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
+
+	"pitr_fs/internal/txn"
 )
 
 type fdVersion struct {
@@ -62,8 +64,11 @@ func (l *Loopback) ensureWindowScopeLocked(
 	if scope == l.active.scope {
 		return nil
 	}
-	if err := l.manager.UpdateStandaloneVersionScope(
-		ctx, l.active.autoID, scope); err != nil {
+	managerCtx, managerCancel := l.managerContext(ctx)
+	err := l.manager.UpdateStandaloneVersionScope(
+		managerCtx, l.active.autoID, scope)
+	managerCancel()
+	if err != nil {
 		return err
 	}
 	l.active.scope = scope
@@ -128,29 +133,41 @@ func (n *Node) versionedHookWindow(
 	}
 
 	before := root.captureContent(absPath)
+	managerCtx, managerCancel := root.managerContext(ctx)
 	autoID, err := root.manager.OpenStandaloneVersion(
-		ctx, absPath, command, root.versionMetadata(ctx, posixOp))
+		managerCtx, absPath, command, root.versionMetadata(ctx, posixOp))
+	managerCancel()
 	if err != nil {
 		slog.Error("打开自动版本", "path", absPath, "command", command, "error", err)
+		if errors.Is(err, txn.ErrMaintenanceBusy) {
+			return fdVersion{}, syscall.EBUSY
+		}
 		return fdVersion{}, syscall.EIO
 	}
 	window := fdVersion{autoID: autoID}
 
 	errno := action()
 	if errno != 0 {
-		if abortErr := root.manager.AbortAutoVersion(ctx, window.autoID); abortErr != nil {
+		abortCtx, abortCancel := root.managerContext(context.Background())
+		if abortErr := root.manager.AbortAutoVersion(abortCtx, window.autoID); abortErr != nil {
 			slog.Error("补偿失败的 auto", "auto_id", window.autoID, "error", abortErr)
 		}
+		abortCancel()
 		return fdVersion{}, errno
 	}
 	after := root.captureContent(absPath)
 	summary := summarizeContent(before, after, nil)
-	if err := root.manager.CloseStandaloneVersion(
-		ctx, window.autoID, posixOp, summary); err != nil {
+	closeCtx, closeCancel := root.managerContext(ctx)
+	err = root.manager.CloseStandaloneVersion(
+		closeCtx, window.autoID, posixOp, summary)
+	closeCancel()
+	if err != nil {
 		slog.Error("关闭自动版本", "auto_id", window.autoID, "error", err)
-		if abortErr := root.manager.AbortAutoVersion(ctx, window.autoID); abortErr != nil {
+		abortCtx, abortCancel := root.managerContext(context.Background())
+		if abortErr := root.manager.AbortAutoVersion(abortCtx, window.autoID); abortErr != nil {
 			slog.Error("关闭失败后的 auto 补偿", "auto_id", window.autoID, "error", abortErr)
 		}
+		abortCancel()
 		return fdVersion{}, syscall.EIO
 	}
 	return window, 0
@@ -176,10 +193,15 @@ func (n *Node) keepWritableWindow(
 
 	before := root.captureContent(absPath)
 	if root.active == nil {
+		managerCtx, managerCancel := root.managerContext(ctx)
 		autoID, err := root.manager.OpenStandaloneVersion(
-			ctx, absPath, command, root.versionMetadata(ctx, posixOp))
+			managerCtx, absPath, command, root.versionMetadata(ctx, posixOp))
+		managerCancel()
 		if err != nil {
 			slog.Error("打开 buffered auto 窗口", "path", absPath, "error", err)
+			if errors.Is(err, txn.ErrMaintenanceBusy) {
+				return syscall.EBUSY
+			}
 			return syscall.EIO
 		}
 		root.active = &writableWindow{
@@ -216,10 +238,10 @@ func (n *Node) closeWritableWindow(
 	}
 
 	root.window.Lock()
-	defer root.window.Unlock()
 
 	window := root.active
 	if window == nil || window.files[file.id] != file {
+		root.window.Unlock()
 		return file.LoopbackFile.Release(ctx)
 	}
 
@@ -236,10 +258,17 @@ func (n *Node) closeWritableWindow(
 	)
 	delete(window.files, file.id)
 	if len(window.files) != 0 {
+		root.window.Unlock()
 		return releaseErrno
 	}
 
-	finalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 最后一个 fd 已经下沉到底层。先切换成恢复屏障并释放 window mutex，
+	// 后续新写会快速返回 EBUSY，而不会跟随数据库关闭/补偿一起阻塞。
+	root.active = nil
+	root.setWriteGate(writeGateRecovery, true)
+	root.window.Unlock()
+
+	finalCtx, cancel := root.managerContext(context.Background())
 	closeErr := root.manager.CloseStandaloneVersion(
 		finalCtx,
 		window.autoID,
@@ -247,17 +276,21 @@ func (n *Node) closeWritableWindow(
 		joinAudit(window.summaries),
 	)
 	cancel()
-	root.active = nil
 	if closeErr != nil {
 		slog.Error("关闭 writable auto 窗口",
 			"auto_id", window.autoID, "error", closeErr)
-		if abortErr := root.manager.AbortAutoVersion(
-			context.Background(), window.autoID); abortErr != nil {
+		abortCtx, abortCancel := root.managerContext(context.Background())
+		abortErr := root.manager.AbortAutoVersion(abortCtx, window.autoID)
+		abortCancel()
+		if abortErr != nil {
 			slog.Error("关闭失败后的 writable auto 补偿",
 				"auto_id", window.autoID, "error", abortErr)
+		} else {
+			root.setWriteGate(writeGateRecovery, false)
 		}
 		return syscall.EIO
 	}
+	root.setWriteGate(writeGateRecovery, false)
 	return releaseErrno
 }
 

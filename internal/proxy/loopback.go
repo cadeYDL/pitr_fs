@@ -62,19 +62,51 @@ type Loopback struct {
 	window sync.Mutex
 	active *writableWindow
 	nextFD atomic.Uint64
-	// quiescing 在升级/卸载屏障期间拒绝所有新写操作。读取继续工作；
-	// 已有可写 fd 的 Write/Flush/Fsync 直接失败，Release 只负责收口。
-	quiescing atomic.Bool
+	// writeGate 按原因维护写屏障。外部升级屏障与失败恢复可以重叠，任一原因
+	// 仍存在时都必须拒绝新写，不能由另一方错误地提前解除。
+	writeGate atomic.Uint32
+	// managerTimeout 限制持有 window mutex 时的数据库调用和失败补偿。
+	managerTimeout time.Duration
 
 	auditMu      sync.Mutex
 	processCache map[uint32]processCacheEntry
 	userCache    map[uint32]string
 }
 
+const (
+	writeGateExternal uint32 = 1 << iota
+	writeGateRecovery
+	defaultManagerTimeout = 5 * time.Second
+)
+
+func (l *Loopback) setWriteGate(reason uint32, enabled bool) {
+	for {
+		current := l.writeGate.Load()
+		next := current | reason
+		if !enabled {
+			next = current &^ reason
+		}
+		if current == next || l.writeGate.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+func (l *Loopback) managerContext(parent context.Context) (
+	context.Context,
+	context.CancelFunc,
+) {
+	timeout := l.managerTimeout
+	if timeout <= 0 {
+		timeout = defaultManagerTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 // SetQuiescing 原子关闭/开放写入口。启用时通过 window mutex 做一次屏障，
 // 返回后所有更早进入的单次写操作都已完整结束。
 func (l *Loopback) SetQuiescing(enabled bool) {
-	l.quiescing.Store(enabled)
+	l.setWriteGate(writeGateExternal, enabled)
 	if enabled {
 		l.window.Lock()
 		l.window.Unlock()
@@ -82,7 +114,7 @@ func (l *Loopback) SetQuiescing(enabled bool) {
 }
 
 func (l *Loopback) Quiescing() bool {
-	return l.quiescing.Load()
+	return l.writeGate.Load() != 0
 }
 
 func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
@@ -107,10 +139,11 @@ func NewLoopback(backend, mount string, options ...Option) (*Loopback, error) {
 	}
 
 	loopback := &Loopback{
-		Backend:      backend,
-		Mount:        mount,
-		processCache: make(map[uint32]processCacheEntry),
-		userCache:    make(map[uint32]string),
+		Backend:        backend,
+		Mount:          mount,
+		managerTimeout: defaultManagerTimeout,
+		processCache:   make(map[uint32]processCacheEntry),
+		userCache:      make(map[uint32]string),
 	}
 	for _, option := range options {
 		option(loopback)

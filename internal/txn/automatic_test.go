@@ -484,6 +484,40 @@ func TestPendingGCDefersWhileWriteIsOpen(t *testing.T) {
 	}
 }
 
+func TestOpenStandaloneVersionFailsFastWhileMaintenanceOwnsLock(t *testing.T) {
+	mgr, db := setupManager(t)
+	ctx := context.Background()
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	maintenanceDone := make(chan error, 1)
+	go func() {
+		maintenanceDone <- db.WithAdvisoryLock(
+			ctx, "pitr-fs:versions", func() error {
+				close(locked)
+				<-release
+				return nil
+			})
+	}()
+	<-locked
+
+	writeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := mgr.OpenStandaloneVersion(
+		writeCtx, "/workspace/maintenance", "write", VersionMetadata{})
+	elapsed := time.Since(started)
+	close(release)
+	if maintenanceErr := <-maintenanceDone; maintenanceErr != nil {
+		t.Fatal(maintenanceErr)
+	}
+	if !errors.Is(err, ErrMaintenanceBusy) {
+		t.Fatalf("维护期间错误=%v,期望 ErrMaintenanceBusy", err)
+	}
+	if elapsed >= 250*time.Millisecond {
+		t.Fatalf("维护期间新写等待过久:%s", elapsed)
+	}
+}
+
 func TestSliceIndexUpgradeRebuildsLegacyAndCleanupState(t *testing.T) {
 	mgr, db := setupManager(t)
 	ctx := context.Background()

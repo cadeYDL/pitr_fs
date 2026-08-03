@@ -230,9 +230,14 @@ func (m *Manager) OpenStandaloneVersion(
 	}
 	var versionID int64
 	err = m.db.InTx(ctx, func(tx pg.Tx) error {
-		if _, err := tx.Exec(ctx,
-			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:versions'))"); err != nil {
+		var locked bool
+		if err := tx.QueryRow(ctx,
+			"SELECT pg_try_advisory_xact_lock(hashtext('pitr-fs:versions'))").
+			Scan(&locked); err != nil {
 			return err
+		}
+		if !locked {
+			return ErrMaintenanceBusy
 		}
 		var parentID int64
 		if err := tx.QueryRow(ctx, `

@@ -565,6 +565,56 @@ func TestLoopback_DiscardOpenWritesRestoresPartialFile(t *testing.T) {
 	}
 }
 
+func TestLoopback_CloseRecoveryDoesNotHoldGlobalWriteLock(t *testing.T) {
+	manager := new(mockManager)
+	manager.closeErr = errors.New("close failed")
+	manager.abortStarted = make(chan struct{})
+	manager.abortRelease = make(chan struct{})
+	backend, mount, _ := mountedLoopback(t, WithManager(manager))
+	if err := os.WriteFile(filepath.Join(backend, "first"), []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.OpenFile(filepath.Join(mount, "first"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.WriteAt([]byte("after"), 0); err != nil {
+		t.Fatal(err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- first.Close() }()
+	select {
+	case <-manager.abortStarted:
+	case <-time.After(2 * time.Second):
+		close(manager.abortRelease)
+		t.Fatal("关闭失败后未进入补偿")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		second, openErr := os.OpenFile(
+			filepath.Join(mount, "second"), os.O_WRONLY|os.O_CREATE, 0o644)
+		if openErr == nil {
+			openErr = second.Close()
+		}
+		secondDone <- openErr
+	}()
+	select {
+	case openErr := <-secondDone:
+		if openErr == nil {
+			close(manager.abortRelease)
+			<-closeDone
+			t.Fatal("恢复期间的新写不应成功")
+		}
+	case <-time.After(300 * time.Millisecond):
+		close(manager.abortRelease)
+		<-closeDone
+		t.Fatal("恢复调用仍占用全局写锁")
+	}
+	close(manager.abortRelease)
+	<-closeDone
+}
+
 func TestLoopback_RenameCrossScope_BelongsToDestination(t *testing.T) {
 	manager := new(mockManager)
 	_, mount, _ := mountedLoopback(t, WithManager(manager))
