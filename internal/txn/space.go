@@ -37,7 +37,7 @@ func (m *Manager) SpaceVersions(
 		WITH selected AS (
 		    SELECT id,version_hash,closed_at
 		      FROM pitr_txn
-		     WHERE state<>'root' AND closed_at IS NOT NULL
+			 WHERE workspace_id=$3 AND state<>'root' AND closed_at IS NOT NULL
 		       AND pitr_scopes_overlap(scope_path,$1)
 		     ORDER BY id ASC
 		     LIMIT $2
@@ -62,7 +62,7 @@ func (m *Manager) SpaceVersions(
 		SELECT s.version_hash,s.closed_at,
 		       COALESCE(t.pinned_bytes,0),COALESCE(t.estimated_release_bytes,0)
 		  FROM selected s LEFT JOIN totals t ON t.id=s.id
-		 ORDER BY s.id ASC`, normalized, limit)
+		 ORDER BY s.id ASC`, normalized, limit, m.workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("估算版本空间: %w", err)
 	}

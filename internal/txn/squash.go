@@ -81,14 +81,16 @@ func (m *Manager) Squash(
 		var open int64
 		if err := tx.QueryRow(ctx, `
 			SELECT count(*) FROM pitr_txn
-			 WHERE state='active' OR (state='auto' AND closed_at IS NULL)`).Scan(&open); err != nil {
+			 WHERE workspace_id=$1
+			   AND (state='active' OR (state='auto' AND closed_at IS NULL))`,
+			m.workspaceID).Scan(&open); err != nil {
 			return fmt.Errorf("检查开放写操作: %w", err)
 		}
 		if open != 0 {
 			return fmt.Errorf("%w: %d", ErrOpenWrites, open)
 		}
 
-		lineage, err := loadSquashLineage(ctx, tx,
+		lineage, err := loadSquashLineage(ctx, tx, m.workspaceID,
 			options.BaseHash, options.EndHash)
 		if err != nil {
 			return err
@@ -141,7 +143,8 @@ func (m *Manager) Squash(
 			return err
 		}
 		stats.Transaction, err = scanTxn(tx.QueryRow(ctx,
-			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1", end.ID))
+			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1 AND workspace_id=$2",
+			end.ID, m.workspaceID))
 		return err
 	})
 	if err != nil {
@@ -154,21 +157,23 @@ func (m *Manager) Squash(
 func loadSquashLineage(
 	ctx context.Context,
 	tx pg.Tx,
+	workspaceID int64,
 	baseHash, endHash string,
 ) ([]squashLineageItem, error) {
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE lineage AS (
 			SELECT id,trim(version_hash) AS version_hash,parent_id,scope_path,
 			       state,created_at,closed_at,0::bigint AS depth
-			  FROM pitr_txn WHERE version_hash=$1
+			  FROM pitr_txn WHERE version_hash=$1 AND workspace_id=$3
 			UNION ALL
 			SELECT p.id,trim(p.version_hash),p.parent_id,p.scope_path,
 			       p.state,p.created_at,p.closed_at,l.depth+1
 			  FROM pitr_txn p JOIN lineage l ON p.id=l.parent_id
 			 WHERE l.version_hash<>$2 AND l.parent_id IS NOT NULL
+			   AND p.workspace_id=$3
 		)
 		SELECT id,version_hash,parent_id,scope_path,state,created_at,closed_at,depth
-		  FROM lineage ORDER BY depth DESC`, endHash, baseHash)
+		  FROM lineage ORDER BY depth DESC`, endHash, baseHash, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("读取版本链: %w", err)
 	}
@@ -323,11 +328,11 @@ func replaceSquashRange(
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO pitr_txn(
-			id,version_hash,parent_id,scope_path,state,command,message,
+			id,workspace_id,version_hash,parent_id,scope_path,state,command,message,
 			posix_op,process_command,actor_uid,actor_gid,actor_pid,actor_name,
 			change_summary,created_at,closed_at
 		)
-		SELECT id,version_hash,$1,$2,'committed','squash',$3,
+		SELECT id,workspace_id,version_hash,$1,$2,'committed','squash',$3,
 		       'squash','',$4,$5,$6,$7,$3,$8,$9
 		  FROM pitr_squash_end`, baseID, scope, options.Message,
 		options.ActorUID, options.ActorGID, options.ActorPID, options.ActorName,

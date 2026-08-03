@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"pitr_fs/internal/pg"
 )
@@ -48,11 +49,12 @@ func (m *Manager) HistoryLimit(ctx context.Context, scope string) (int64, error)
 	err = m.db.QueryRow(ctx, `
 		SELECT history_limit
 		  FROM pitr_config
-		 WHERE scope_path='/'
+		 WHERE workspace_id=$2
+		   AND (scope_path='/'
 		    OR scope_path=$1
-		    OR $1 LIKE rtrim(scope_path, '/') || '/%'
+		    OR $1 LIKE rtrim(scope_path, '/') || '/%')
 		 ORDER BY length(scope_path) DESC
-		 LIMIT 1`, normalized).Scan(&limit)
+		 LIMIT 1`, normalized, m.workspaceID).Scan(&limit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return defaultHistoryLimit, nil
 	}
@@ -62,16 +64,22 @@ func (m *Manager) HistoryLimit(ctx context.Context, scope string) (int64, error)
 	return limit, nil
 }
 
-func historyLimitTx(ctx context.Context, tx pg.Tx, scope string) (int64, error) {
+func historyLimitTx(
+	ctx context.Context,
+	tx pg.Tx,
+	workspaceID int64,
+	scope string,
+) (int64, error) {
 	var limit int64
 	err := tx.QueryRow(ctx, `
 		SELECT history_limit
 		  FROM pitr_config
-		 WHERE scope_path='/'
+		 WHERE workspace_id=$2
+		   AND (scope_path='/'
 		    OR scope_path=$1
-		    OR $1 LIKE rtrim(scope_path, '/') || '/%'
+		    OR $1 LIKE rtrim(scope_path, '/') || '/%')
 		 ORDER BY length(scope_path) DESC
-		 LIMIT 1`, scope).Scan(&limit)
+		 LIMIT 1`, scope, workspaceID).Scan(&limit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return defaultHistoryLimit, nil
 	}
@@ -90,11 +98,11 @@ func (m *Manager) SpacePolicy(ctx context.Context, scope string) (SpacePolicy, e
 		  FROM LATERAL (
 		        SELECT max_space_bytes,space_reserve_percent
 		          FROM pitr_config
-		         WHERE scope_path='/' OR scope_path=$1
-		            OR $1 LIKE rtrim(scope_path,'/') || '/%'
+		         WHERE workspace_id=$2 AND (scope_path='/' OR scope_path=$1
+		            OR $1 LIKE rtrim(scope_path,'/') || '/%')
 		         ORDER BY length(scope_path) DESC LIMIT 1
 		       ) c
-		  LEFT JOIN pitr_space_state s ON s.singleton`, normalized).Scan(
+		  LEFT JOIN pitr_space_state s ON s.singleton`, normalized, m.workspaceID).Scan(
 		&policy.MaxBytes, &policy.ReservePercent,
 		&policy.RetainedBytes, &policy.ReclaimableBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -107,7 +115,12 @@ func (m *Manager) SpacePolicy(ctx context.Context, scope string) (SpacePolicy, e
 	return policy, nil
 }
 
-func spacePolicyTx(ctx context.Context, tx pg.Tx, scope string) (SpacePolicy, error) {
+func spacePolicyTx(
+	ctx context.Context,
+	tx pg.Tx,
+	workspaceID int64,
+	scope string,
+) (SpacePolicy, error) {
 	var policy SpacePolicy
 	err := tx.QueryRow(ctx, `
 		SELECT c.max_space_bytes,c.space_reserve_percent,
@@ -115,11 +128,11 @@ func spacePolicyTx(ctx context.Context, tx pg.Tx, scope string) (SpacePolicy, er
 		  FROM LATERAL (
 		        SELECT max_space_bytes,space_reserve_percent
 		          FROM pitr_config
-		         WHERE scope_path='/' OR scope_path=$1
-		            OR $1 LIKE rtrim(scope_path,'/') || '/%'
+		         WHERE workspace_id=$2 AND (scope_path='/' OR scope_path=$1
+		            OR $1 LIKE rtrim(scope_path,'/') || '/%')
 		         ORDER BY length(scope_path) DESC LIMIT 1
 		       ) c
-		  LEFT JOIN pitr_space_state s ON s.singleton`, scope).Scan(
+		  LEFT JOIN pitr_space_state s ON s.singleton`, scope, workspaceID).Scan(
 		&policy.MaxBytes, &policy.ReservePercent,
 		&policy.RetainedBytes, &policy.ReclaimableBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -155,21 +168,22 @@ func (m *Manager) SetSpacePolicy(
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO pitr_config(
-				scope_path,history_limit,max_space_bytes,
+				workspace_id,scope_path,history_limit,max_space_bytes,
 				space_reserve_percent,updated_at)
-			VALUES ($1,$2,$3,$4,now())
-			ON CONFLICT (scope_path) DO UPDATE
+			VALUES ($1,$2,$3,$4,$5,now())
+			ON CONFLICT (workspace_id,scope_path) DO UPDATE
 			   SET max_space_bytes=EXCLUDED.max_space_bytes,
 			       space_reserve_percent=EXCLUDED.space_reserve_percent,
-			       updated_at=now()`, normalized, defaultHistoryLimit,
+			       updated_at=now()`, m.workspaceID, normalized, defaultHistoryLimit,
 			maxBytes, reservePercent); err != nil {
 			return err
 		}
-		limit, err := historyLimitTx(ctx, tx, normalized)
+		limit, err := historyLimitTx(ctx, tx, m.workspaceID, normalized)
 		if err != nil {
 			return err
 		}
-		pruned, err = pruneClosedVersions(ctx, tx, normalized, limit)
+		pruned, err = pruneClosedVersions(
+			ctx, tx, m.workspaceID, normalized, limit)
 		return err
 	})
 	if err != nil {
@@ -200,14 +214,15 @@ func (m *Manager) SetHistoryLimit(
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO pitr_config(scope_path,history_limit,updated_at)
-			VALUES ($1,$2,now())
-			ON CONFLICT (scope_path) DO UPDATE
+			INSERT INTO pitr_config(workspace_id,scope_path,history_limit,updated_at)
+			VALUES ($1,$2,$3,now())
+			ON CONFLICT (workspace_id,scope_path) DO UPDATE
 			    SET history_limit=EXCLUDED.history_limit,updated_at=now()`,
-			normalized, limit); err != nil {
+			m.workspaceID, normalized, limit); err != nil {
 			return err
 		}
-		pruned, err = pruneClosedVersions(ctx, tx, normalized, limit)
+		pruned, err = pruneClosedVersions(
+			ctx, tx, m.workspaceID, normalized, limit)
 		return err
 	})
 	if err != nil {
@@ -244,9 +259,9 @@ func (m *Manager) OpenStandaloneVersion(
 		if err := tx.QueryRow(ctx, `
 			SELECT id
 			  FROM pitr_txn
-			 WHERE state='root' OR closed_at IS NOT NULL
+			 WHERE workspace_id=$1 AND (state='root' OR closed_at IS NOT NULL)
 			 ORDER BY id DESC
-			 LIMIT 1`).Scan(&parentID); err != nil {
+			 LIMIT 1`, m.workspaceID).Scan(&parentID); err != nil {
 			return fmt.Errorf("查找自动版本 parent: %w", err)
 		}
 		for attempt := 0; attempt < 3; attempt++ {
@@ -256,12 +271,12 @@ func (m *Manager) OpenStandaloneVersion(
 			}
 			err = tx.QueryRow(ctx, `
 				INSERT INTO pitr_txn
-					(version_hash,parent_id,scope_path,state,command,posix_op,
+					(workspace_id,version_hash,parent_id,scope_path,state,command,posix_op,
 					 process_command,actor_uid,actor_gid,actor_pid,actor_name)
-				VALUES ($1,$2,$3,'auto',$4,$5,$6,$7,$8,$9,$10)
+				VALUES ($1,$2,$3,$4,'auto',$5,$6,$7,$8,$9,$10,$11)
 				ON CONFLICT (version_hash) DO NOTHING
 				RETURNING id`,
-				hash, parentID, normalized, command,
+				m.workspaceID, hash, parentID, normalized, command,
 				metadata.PosixOp, metadata.ProcessCommand,
 				metadata.ActorUID, metadata.ActorGID, metadata.ActorPID,
 				metadata.ActorName).Scan(&versionID)
@@ -275,6 +290,12 @@ func (m *Manager) OpenStandaloneVersion(
 		return errors.New("生成唯一自动 version hash 失败:连续冲突 3 次")
 	})
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+			pgErr.ConstraintName == "uniq_open_auto_window" {
+			return 0, fmt.Errorf("%w: 另一 workspace 正在关闭版本窗口",
+				ErrMaintenanceBusy)
+		}
 		return 0, fmt.Errorf("打开自动版本(%s): %w", normalized, err)
 	}
 	return versionID, nil
@@ -301,6 +322,7 @@ func (m *Manager) UpdateStandaloneVersionScope(
 			UPDATE pitr_txn
 			   SET scope_path=$2
 			 WHERE id=$1
+			   AND workspace_id=$3
 			   AND state='auto'
 			   AND closed_at IS NULL
 			   AND (scope_path=$2
@@ -308,7 +330,7 @@ func (m *Manager) UpdateStandaloneVersionScope(
 			           CASE WHEN $2='/' THEN '/%'
 			                ELSE rtrim($2, '/') || '/%' END)
 			 RETURNING scope_path`,
-			versionID, normalized).Scan(&updated)
+			versionID, normalized, m.workspaceID).Scan(&updated)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("%w:auto %d 不存在、已关闭或 scope 不是祖先",
 				ErrIllegalTransit, versionID)
@@ -339,20 +361,21 @@ func (m *Manager) CloseStandaloneVersion(
 			   SET closed_at=now(),
 			       posix_op=COALESCE(NULLIF($2,''),posix_op),
 			       change_summary=NULLIF($3,'')
-			 WHERE id=$1 AND state='auto' AND closed_at IS NULL
+			 WHERE id=$1 AND workspace_id=$4
+			   AND state='auto' AND closed_at IS NULL
 			 RETURNING scope_path`,
-			versionID, posixOp, changeSummary).Scan(&scope); err != nil {
+			versionID, posixOp, changeSummary, m.workspaceID).Scan(&scope); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("%w:auto %d 不存在或已关闭",
 					ErrIllegalTransit, versionID)
 			}
 			return err
 		}
-		limit, err := historyLimitTx(ctx, tx, scope)
+		limit, err := historyLimitTx(ctx, tx, m.workspaceID, scope)
 		if err != nil {
 			return err
 		}
-		_, err = pruneClosedVersions(ctx, tx, scope, limit)
+		_, err = pruneClosedVersions(ctx, tx, m.workspaceID, scope, limit)
 		return err
 	})
 	if err != nil {
@@ -366,11 +389,12 @@ func (m *Manager) CloseStandaloneVersion(
 func pruneClosedVersions(
 	ctx context.Context,
 	tx pg.Tx,
+	workspaceID int64,
 	scope string,
 	limit int64,
 ) (int64, error) {
 	result, err := pruneClosedVersionsBatch(
-		ctx, tx, scope, limit, foregroundPruneBatch)
+		ctx, tx, workspaceID, scope, limit, foregroundPruneBatch)
 	return result.Pruned, err
 }
 
@@ -382,6 +406,7 @@ type pruneBatchResult struct {
 func pruneClosedVersionsBatch(
 	ctx context.Context,
 	tx pg.Tx,
+	workspaceID int64,
 	scope string,
 	limit int64,
 	batch int64,
@@ -396,8 +421,8 @@ func pruneClosedVersionsBatch(
 	remaining := batch
 	var rootID int64
 	if err := tx.QueryRow(ctx,
-		"SELECT id FROM pitr_txn WHERE state='root' ORDER BY id LIMIT 1").
-		Scan(&rootID); err != nil {
+		"SELECT id FROM pitr_txn WHERE workspace_id=$1 AND state='root' ORDER BY id LIMIT 1",
+		workspaceID).Scan(&rootID); err != nil {
 		return result, err
 	}
 
@@ -406,7 +431,8 @@ func pruneClosedVersionsBatch(
 		var count int64
 		if err := tx.QueryRow(ctx, `
 			SELECT count(*) FROM pitr_txn
-			 WHERE state<>'root' AND closed_at IS NOT NULL`).Scan(&count); err != nil {
+			 WHERE workspace_id=$1 AND state<>'root' AND closed_at IS NOT NULL`,
+			workspaceID).Scan(&count); err != nil {
 			return result, err
 		}
 		take := count - limit
@@ -416,8 +442,8 @@ func pruneClosedVersionsBatch(
 		if take > 0 {
 			rows, err := tx.Query(ctx, `
 				SELECT id FROM pitr_txn
-				 WHERE state<>'root' AND closed_at IS NOT NULL
-				 ORDER BY id ASC LIMIT $1`, take)
+				 WHERE workspace_id=$1 AND state<>'root' AND closed_at IS NOT NULL
+				 ORDER BY id ASC LIMIT $2`, workspaceID, take)
 			if err != nil {
 				return result, err
 			}
@@ -451,7 +477,7 @@ func pruneClosedVersionsBatch(
 		remaining -= affected
 	}
 
-	policy, err := spacePolicyTx(ctx, tx, scope)
+	policy, err := spacePolicyTx(ctx, tx, workspaceID, scope)
 	if err != nil {
 		return result, err
 	}
@@ -460,8 +486,8 @@ func pruneClosedVersionsBatch(
 		var oldestID int64
 		err := tx.QueryRow(ctx, `
 			SELECT id FROM pitr_txn
-			 WHERE state<>'root' AND closed_at IS NOT NULL
-			 ORDER BY id ASC LIMIT 1`).Scan(&oldestID)
+			 WHERE workspace_id=$1 AND state<>'root' AND closed_at IS NOT NULL
+			 ORDER BY id ASC LIMIT 1`, workspaceID).Scan(&oldestID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -491,7 +517,8 @@ func pruneClosedVersionsBatch(
 		var count int64
 		if err := tx.QueryRow(ctx, `
 			SELECT count(*) FROM pitr_txn
-			 WHERE state<>'root' AND closed_at IS NOT NULL`).Scan(&count); err != nil {
+			 WHERE workspace_id=$1 AND state<>'root' AND closed_at IS NOT NULL`,
+			workspaceID).Scan(&count); err != nil {
 			return result, err
 		}
 		result.Pending = count > limit
@@ -501,8 +528,8 @@ func pruneClosedVersionsBatch(
 		if err := tx.QueryRow(ctx, `
 			SELECT EXISTS (
 				SELECT 1 FROM pitr_txn
-				 WHERE state<>'root' AND closed_at IS NOT NULL
-			)`).Scan(&hasPrunable); err != nil {
+				 WHERE workspace_id=$1 AND state<>'root' AND closed_at IS NOT NULL
+			)`, workspaceID).Scan(&hasPrunable); err != nil {
 			return result, err
 		}
 		// 当前数据本身超过空间阈值时，删除历史已无法释放更多空间。
@@ -511,13 +538,14 @@ func pruneClosedVersionsBatch(
 	}
 	if result.Pending {
 		_, err = tx.Exec(ctx, `
-			INSERT INTO pitr_prune_queue(singleton,requested_at)
-			VALUES (true,now())
-			ON CONFLICT (singleton) DO UPDATE
-			   SET requested_at=EXCLUDED.requested_at`)
+			INSERT INTO pitr_prune_queue(workspace_id,singleton,requested_at)
+			VALUES ($1,true,now())
+			ON CONFLICT (workspace_id,singleton) DO UPDATE
+			   SET requested_at=EXCLUDED.requested_at`, workspaceID)
 	} else {
 		_, err = tx.Exec(ctx,
-			"DELETE FROM pitr_prune_queue WHERE singleton")
+			"DELETE FROM pitr_prune_queue WHERE workspace_id=$1 AND singleton",
+			workspaceID)
 	}
 	return result, err
 }
@@ -531,11 +559,28 @@ func PruneClosedVersions(
 	if err != nil {
 		return 0, err
 	}
-	limit, err := historyLimitTx(ctx, tx, normalized)
+	limit, err := historyLimitTx(ctx, tx, 1, normalized)
 	if err != nil {
 		return 0, err
 	}
-	return pruneClosedVersions(ctx, tx, normalized, limit)
+	return pruneClosedVersions(ctx, tx, 1, normalized, limit)
+}
+
+func PruneClosedVersionsForWorkspace(
+	ctx context.Context,
+	tx pg.Tx,
+	workspaceID int64,
+	scope string,
+) (int64, error) {
+	normalized, err := NormalizeScope(scope)
+	if err != nil {
+		return 0, err
+	}
+	limit, err := historyLimitTx(ctx, tx, workspaceID, normalized)
+	if err != nil {
+		return 0, err
+	}
+	return pruneClosedVersions(ctx, tx, workspaceID, normalized, limit)
 }
 
 func (m *Manager) Prune(ctx context.Context, scope string) (int64, error) {
@@ -549,11 +594,12 @@ func (m *Manager) Prune(ctx context.Context, scope string) (int64, error) {
 			"SELECT pg_advisory_xact_lock(hashtext('pitr-fs:versions'))"); err != nil {
 			return err
 		}
-		limit, err := historyLimitTx(ctx, tx, normalized)
+		limit, err := historyLimitTx(ctx, tx, m.workspaceID, normalized)
 		if err != nil {
 			return err
 		}
-		pruned, err = pruneClosedVersions(ctx, tx, normalized, limit)
+		pruned, err = pruneClosedVersions(
+			ctx, tx, m.workspaceID, normalized, limit)
 		return err
 	})
 	return pruned, err
@@ -578,8 +624,9 @@ func (m *Manager) ClearHistory(ctx context.Context, scope string) (ClearStats, e
 		var open int64
 		if err := tx.QueryRow(ctx, `
 			SELECT count(*) FROM pitr_txn
-			 WHERE state='active' OR (state='auto' AND closed_at IS NULL)`).
-			Scan(&open); err != nil {
+			 WHERE workspace_id=$1 AND
+			       (state='active' OR (state='auto' AND closed_at IS NULL))`,
+			m.workspaceID).Scan(&open); err != nil {
 			return err
 		}
 		if open != 0 {
@@ -587,26 +634,25 @@ func (m *Manager) ClearHistory(ctx context.Context, scope string) (ClearStats, e
 		}
 		if err := tx.QueryRow(ctx, `
 			SELECT
-			  (SELECT count(*) FROM pitr_node_history) +
-			  (SELECT count(*) FROM pitr_edge_history) +
-			  (SELECT count(*) FROM pitr_chunk_history) +
-			  (SELECT count(*) FROM pitr_chunk_ref_history)`).
-			Scan(&stats.HistoryDeleted); err != nil {
+			  (SELECT count(*) FROM pitr_node_history h JOIN pitr_txn t ON t.id=h.txn_id WHERE t.workspace_id=$1) +
+			  (SELECT count(*) FROM pitr_edge_history h JOIN pitr_txn t ON t.id=h.txn_id WHERE t.workspace_id=$1) +
+			  (SELECT count(*) FROM pitr_chunk_history h JOIN pitr_txn t ON t.id=h.txn_id WHERE t.workspace_id=$1) +
+			  (SELECT count(*) FROM pitr_chunk_ref_history h JOIN pitr_txn t ON t.id=h.txn_id WHERE t.workspace_id=$1)`,
+			m.workspaceID).Scan(&stats.HistoryDeleted); err != nil {
 			return err
 		}
-		affected, err := tx.Exec(ctx, "DELETE FROM pitr_txn WHERE state<>'root'")
+		affected, err := tx.Exec(ctx,
+			"DELETE FROM pitr_txn WHERE workspace_id=$1 AND state<>'root'",
+			m.workspaceID)
 		if err != nil {
 			return err
 		}
 		stats.VersionsDeleted = affected
-		if _, err := tx.Exec(ctx, "TRUNCATE pitr_blob_retention"); err != nil {
-			return err
-		}
 		_, err = tx.Exec(ctx, `
 			UPDATE pitr_txn
 			   SET parent_id=NULL,scope_path='/',command='baseline',
 			       message='',created_at=now(),closed_at=NULL
-			 WHERE state='root'`)
+			 WHERE workspace_id=$1 AND state='root'`, m.workspaceID)
 		return err
 	})
 	if err != nil {

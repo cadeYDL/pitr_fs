@@ -22,14 +22,16 @@ func (m *Manager) Diff(
 ) (DiffStats, error) {
 	var idA, idB int64
 	if err := m.db.QueryRow(ctx,
-		"SELECT id FROM pitr_txn WHERE version_hash=$1", versionA).Scan(&idA); err != nil {
+		"SELECT id FROM pitr_txn WHERE version_hash=$1 AND workspace_id=$2",
+		versionA, m.workspaceID).Scan(&idA); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return DiffStats{}, ErrTxnNotFound
 		}
 		return DiffStats{}, fmt.Errorf("查找 version_a: %w", err)
 	}
 	if err := m.db.QueryRow(ctx,
-		"SELECT id FROM pitr_txn WHERE version_hash=$1", versionB).Scan(&idB); err != nil {
+		"SELECT id FROM pitr_txn WHERE version_hash=$1 AND workspace_id=$2",
+		versionB, m.workspaceID).Scan(&idB); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return DiffStats{}, ErrTxnNotFound
 		}
@@ -53,31 +55,31 @@ func (m *Manager) Diff(
 		  (SELECT count(*) FROM (
 		     SELECT DISTINCT h.inode
 		       FROM pitr_node_history h JOIN pitr_txn t ON t.id=h.txn_id
-		      WHERE t.id>$1 AND t.id<=$2
+			      WHERE t.workspace_id=$4 AND t.id>$1 AND t.id<=$2
 		        AND ($3::text IS NULL OR pitr_scopes_overlap(t.scope_path,$3))
 		  ) n),
 		  (SELECT count(*) FROM (
 		     SELECT DISTINCT h.parent,h.name
 		       FROM pitr_edge_history h JOIN pitr_txn t ON t.id=h.txn_id
-		      WHERE t.id>$1 AND t.id<=$2
+			      WHERE t.workspace_id=$4 AND t.id>$1 AND t.id<=$2
 		        AND ($3::text IS NULL OR pitr_scopes_overlap(t.scope_path,$3))
 		  ) e),
 		  (SELECT
 		     (SELECT count(*) FROM (
 		        SELECT DISTINCT h.inode,h.indx
 		          FROM pitr_chunk_history h JOIN pitr_txn t ON t.id=h.txn_id
-		         WHERE t.id>$1 AND t.id<=$2
+			         WHERE t.workspace_id=$4 AND t.id>$1 AND t.id<=$2
 		           AND ($3::text IS NULL OR pitr_scopes_overlap(t.scope_path,$3))
 		     ) c)
 		     +
 		     (SELECT count(*) FROM (
 		        SELECT DISTINCT h.chunkid
 		          FROM pitr_chunk_ref_history h JOIN pitr_txn t ON t.id=h.txn_id
-		         WHERE t.id>$1 AND t.id<=$2
+			         WHERE t.workspace_id=$4 AND t.id>$1 AND t.id<=$2
 		           AND ($3::text IS NULL OR pitr_scopes_overlap(t.scope_path,$3))
 		     ) r)
 		  )`,
-		idA, idB, scopeArg).
+		idA, idB, scopeArg, m.workspaceID).
 		Scan(&stats.NodeChanges, &stats.EdgeChanges, &stats.ChunkChanges); err != nil {
 		return DiffStats{}, fmt.Errorf("diff %s..%s: %w", versionA, versionB, err)
 	}

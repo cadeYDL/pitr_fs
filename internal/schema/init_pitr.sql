@@ -19,8 +19,27 @@
 
 -- ---------- 4.1 pitr 自有表 ----------
 
+-- Workspace 是版本、配置和发布状态的归属边界；挂载点只是访问入口。
+-- id=1 为旧单卷安装保留，升级时所有历史自动归入 default workspace。
+CREATE TABLE IF NOT EXISTS pitr_workspace (
+    id            bigserial PRIMARY KEY,
+    name          text UNIQUE NOT NULL,
+    volume_name   text NOT NULL,
+    backend_path  text NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    CHECK (name ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'),
+    CHECK (backend_path LIKE '/%')
+);
+
+INSERT INTO pitr_workspace(id,name,volume_name,backend_path)
+VALUES (1,'default','default','/')
+ON CONFLICT (id) DO NOTHING;
+SELECT setval(pg_get_serial_sequence('pitr_workspace','id'),
+              GREATEST(1,(SELECT max(id) FROM pitr_workspace)),true);
+
 CREATE TABLE IF NOT EXISTS pitr_txn (
     id            bigserial PRIMARY KEY,
+    workspace_id  bigint    NOT NULL DEFAULT 1 REFERENCES pitr_workspace(id),
     version_hash  char(12)  UNIQUE NOT NULL,
     parent_id     bigint    REFERENCES pitr_txn(id),
     scope_path    text      NOT NULL,
@@ -45,8 +64,11 @@ ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_gid bigint;
 ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_pid bigint;
 ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS actor_name text;
 ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS change_summary text;
+ALTER TABLE pitr_txn ADD COLUMN IF NOT EXISTS workspace_id bigint NOT NULL DEFAULT 1;
 
-CREATE INDEX IF NOT EXISTS idx_pitr_txn_scope_state ON pitr_txn (scope_path, state);
+DROP INDEX IF EXISTS idx_pitr_txn_scope_state;
+CREATE INDEX idx_pitr_txn_scope_state
+    ON pitr_txn (workspace_id, scope_path, state);
 CREATE INDEX IF NOT EXISTS idx_pitr_txn_created     ON pitr_txn (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pitr_txn_closed
     ON pitr_txn (closed_at DESC, id DESC)
@@ -56,8 +78,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_auto_window
     WHERE state = 'auto' AND closed_at IS NULL;
 
 -- 一个 scope 同时只能有一个 active 事务(一期约束)
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_txn_per_path
-    ON pitr_txn (scope_path)
+DROP INDEX IF EXISTS uniq_active_txn_per_path;
+CREATE UNIQUE INDEX uniq_active_txn_per_path
+    ON pitr_txn (workspace_id, scope_path)
     WHERE state = 'active';
 
 -- inode 影子表
@@ -157,11 +180,16 @@ ALTER TABLE pitr_gc_queue
 -- 前台版本关闭只执行有上限的裁剪，其余工作由 daemon 分批继续。单例队列
 -- 只表示“仍需按当前配置重算”，避免为每个候选版本复制一份任务状态。
 CREATE TABLE IF NOT EXISTS pitr_prune_queue (
-    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    workspace_id bigint NOT NULL DEFAULT 1 REFERENCES pitr_workspace(id),
+    singleton    boolean NOT NULL DEFAULT true CHECK (singleton),
     requested_at timestamptz NOT NULL DEFAULT now(),
     attempts     bigint NOT NULL DEFAULT 0,
     last_error   text
 );
+ALTER TABLE pitr_prune_queue ADD COLUMN IF NOT EXISTS workspace_id bigint NOT NULL DEFAULT 1;
+ALTER TABLE pitr_prune_queue DROP CONSTRAINT IF EXISTS pitr_prune_queue_pkey;
+ALTER TABLE pitr_prune_queue ADD CONSTRAINT pitr_prune_queue_pkey
+    PRIMARY KEY (workspace_id,singleton);
 
 -- 数据库内的 schema 账本是升级判断的权威来源。init_pitr.sql 只负责确保
 -- 表结构存在；部署器在同一个 psql --single-transaction 中写入本次逻辑
@@ -203,13 +231,15 @@ CREATE TABLE IF NOT EXISTS pitr_space_state (
 -- 持久化分层配置。当前控制面只允许写全局 '/'，查询按最长路径前缀解析，
 -- 为后续“子目录继承父目录、就近配置优先”预留数据模型。
 CREATE TABLE IF NOT EXISTS pitr_config (
-    scope_path      text PRIMARY KEY,
+    workspace_id   bigint NOT NULL DEFAULT 1 REFERENCES pitr_workspace(id),
+    scope_path      text NOT NULL,
     history_limit   bigint NOT NULL CHECK (history_limit = -1 OR history_limit > 0),
     max_space_bytes bigint NOT NULL DEFAULT 0 CHECK (max_space_bytes >= 0),
     space_reserve_percent integer NOT NULL DEFAULT 20
         CHECK (space_reserve_percent BETWEEN 1 AND 99),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE pitr_config ADD COLUMN IF NOT EXISTS workspace_id bigint NOT NULL DEFAULT 1;
 ALTER TABLE pitr_config
     ADD COLUMN IF NOT EXISTS max_space_bytes bigint NOT NULL DEFAULT 0;
 ALTER TABLE pitr_config
@@ -222,6 +252,9 @@ ALTER TABLE pitr_config
 ALTER TABLE pitr_config
     ADD CONSTRAINT pitr_config_history_limit_check
     CHECK (history_limit = -1 OR history_limit > 0);
+ALTER TABLE pitr_config DROP CONSTRAINT IF EXISTS pitr_config_pkey;
+ALTER TABLE pitr_config ADD CONSTRAINT pitr_config_pkey
+    PRIMARY KEY (workspace_id,scope_path);
 
 -- 卷挂载配置。当前服务只管理一个全局卷；单独建表可让 daemon 在重启后
 -- 恢复由 `pitr init <path>` 选定的用户挂载点。
@@ -233,15 +266,46 @@ CREATE TABLE IF NOT EXISTS pitr_volume_config (
     updated_at     timestamptz NOT NULL DEFAULT now()
 );
 
-INSERT INTO pitr_config (scope_path, history_limit)
-VALUES ('/', 100)
-ON CONFLICT (scope_path) DO NOTHING;
+-- 一个 workspace 可以有多个挂载点；挂载点全局唯一，重启后逐一恢复。
+CREATE TABLE IF NOT EXISTS pitr_workspace_mount (
+    workspace_id bigint NOT NULL REFERENCES pitr_workspace(id) ON DELETE CASCADE,
+    fuse_mount   text NOT NULL UNIQUE,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id,fuse_mount),
+    CHECK (fuse_mount LIKE '/%')
+);
+
+-- 旧安装的卷和单挂载配置无损归入 default workspace。
+UPDATE pitr_workspace w
+   SET volume_name=v.volume_name
+  FROM pitr_volume_config v
+ WHERE w.id=1;
+INSERT INTO pitr_workspace_mount(workspace_id,fuse_mount)
+SELECT 1,fuse_mount FROM pitr_volume_config
+ON CONFLICT (fuse_mount) DO NOTHING;
+
+-- 旧版本把用户挂载绝对路径写进 scope_path。Workspace 内统一使用以 '/'
+-- 开始的相对 scope，使同一 workspace 的多个挂载别名共享一条版本线。
+UPDATE pitr_txn t
+   SET scope_path=CASE
+       WHEN t.scope_path=v.fuse_mount THEN '/'
+       ELSE '/' || ltrim(substr(t.scope_path,length(v.fuse_mount)+1),'/')
+   END
+  FROM pitr_volume_config v
+ WHERE t.workspace_id=1
+   AND (t.scope_path=v.fuse_mount
+        OR t.scope_path LIKE rtrim(v.fuse_mount,'/') || '/%');
+
+INSERT INTO pitr_config (workspace_id,scope_path, history_limit)
+VALUES (1,'/', 100)
+ON CONFLICT (workspace_id,scope_path) DO NOTHING;
 
 -- ---------- 根版本 ----------
 --
 -- id=1 通常预留给 root。用 ON CONFLICT (version_hash) DO NOTHING 保证幂等。
-INSERT INTO pitr_txn (version_hash, scope_path, state, command)
-VALUES ('000000000000', '/', 'root', 'init')
+INSERT INTO pitr_txn (workspace_id,version_hash, scope_path, state, command)
+VALUES (1,'000000000000', '/', 'root', 'init')
 ON CONFLICT (version_hash) DO NOTHING;
 
 -- 自动版本模式升级迁移：旧版本可能遗留 active 手工事务。保留其版本节点
@@ -1176,12 +1240,15 @@ $$ LANGUAGE sql IMMUTABLE;
 -- 时删除旧 overload,升级前先显式移除,避免两参数 CALL 解析歧义。
 DROP PROCEDURE IF EXISTS pitr_revert(character, text);
 DROP PROCEDURE IF EXISTS pitr_revert(character, text, bigint);
+DROP PROCEDURE IF EXISTS pitr_revert(character, text, bigint, bigint[]);
+DROP PROCEDURE IF EXISTS pitr_revert_from_temp(character, text, bigint, boolean);
 
 CREATE OR REPLACE PROCEDURE pitr_revert(
     p_target_hash char(12),
     p_scope_path  text DEFAULT NULL,
     p_capture_txn_id bigint DEFAULT NULL,
-    p_scope_inodes bigint[] DEFAULT NULL
+    p_scope_inodes bigint[] DEFAULT NULL,
+    p_workspace_id bigint DEFAULT 1
 ) AS $$
 DECLARE
     v_target_txn_id  bigint;
@@ -1197,7 +1264,8 @@ DECLARE
     v_affected_chunkids bigint[] := ARRAY[]::bigint[];
 BEGIN
     SELECT id INTO v_target_txn_id
-      FROM pitr_txn WHERE version_hash = p_target_hash;
+      FROM pitr_txn
+     WHERE version_hash = p_target_hash AND workspace_id=p_workspace_id;
     IF v_target_txn_id IS NULL THEN
         RAISE EXCEPTION 'pitr_revert: version_hash % 不存在', p_target_hash;
     END IF;
@@ -1222,6 +1290,7 @@ BEGIN
         FROM   pitr_node_history nh
         JOIN   pitr_txn t ON t.id = nh.txn_id
         WHERE  t.id > v_target_txn_id
+          AND  t.workspace_id=p_workspace_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
           AND  (p_scope_inodes IS NULL OR nh.inode = ANY(p_scope_inodes))
         ORDER  BY nh.recorded_at DESC, nh.txn_id DESC
@@ -1247,6 +1316,7 @@ BEGIN
         FROM   pitr_edge_history eh
         JOIN   pitr_txn t ON t.id = eh.txn_id
         WHERE  t.id > v_target_txn_id
+          AND  t.workspace_id=p_workspace_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
           AND  (p_scope_inodes IS NULL
                 OR eh.parent = ANY(p_scope_inodes)
@@ -1273,6 +1343,7 @@ BEGIN
         FROM   pitr_chunk_history ch
         JOIN   pitr_txn t ON t.id = ch.txn_id
         WHERE  t.id > v_target_txn_id
+          AND  t.workspace_id=p_workspace_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
           AND  (p_scope_inodes IS NULL OR ch.inode = ANY(p_scope_inodes))
         ORDER  BY ch.recorded_at DESC, ch.txn_id DESC
@@ -1320,6 +1391,7 @@ BEGIN
         FROM   pitr_chunk_ref_history crh
         JOIN   pitr_txn t ON t.id = crh.txn_id
         WHERE  t.id > v_target_txn_id
+          AND  t.workspace_id=p_workspace_id
           AND  (p_scope_path IS NULL OR pitr_scopes_overlap(t.scope_path, p_scope_path))
           -- chunk_ref 没有 inode。只有当该 txn 的全部 chunk history 都在
           -- scope closure 内时才安全 replay;跨 scope 的 broad txn 宁可保留
@@ -1375,7 +1447,8 @@ CREATE OR REPLACE PROCEDURE pitr_revert_from_temp(
     p_target_hash char(12),
     p_scope_path text,
     p_capture_txn_id bigint,
-    p_filter_scope boolean
+    p_filter_scope boolean,
+    p_workspace_id bigint
 ) AS $$
 DECLARE
     v_scope_inodes bigint[];
@@ -1388,7 +1461,7 @@ BEGIN
         v_scope_inodes := NULL;
     END IF;
     CALL pitr_revert(
-        p_target_hash,p_scope_path,p_capture_txn_id,v_scope_inodes);
+        p_target_hash,p_scope_path,p_capture_txn_id,v_scope_inodes,p_workspace_id);
 END;
 $$ LANGUAGE plpgsql;
 

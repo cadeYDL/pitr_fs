@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -128,7 +129,12 @@ func freshDB(t *testing.T) (string, func()) {
 	}
 	admin.Close(ctx)
 
-	dsn := strings.Replace(adminDSN, "/postgres?", "/"+name+"?", 1)
+	parsed, err := url.Parse(adminDSN)
+	if err != nil {
+		t.Fatalf("parse admin DSN: %v", err)
+	}
+	parsed.Path = "/" + name
+	dsn := parsed.String()
 	cleanup := func() {
 		a, err := pgx.Connect(ctx, adminDSN)
 		if err != nil {
@@ -228,6 +234,7 @@ func TestSQL_TablesExist(t *testing.T) {
 	defer conn.Close(context.Background())
 
 	for _, tbl := range []string{
+		"pitr_workspace", "pitr_workspace_mount",
 		"pitr_txn", "pitr_node_history", "pitr_edge_history",
 		"pitr_chunk_history", "pitr_chunk_ref_history", "pitr_blob_retention",
 		"pitr_slice_pin", "pitr_slice_ref", "pitr_gc_queue",
@@ -290,6 +297,40 @@ func TestSQL_TablesExist(t *testing.T) {
 		if n < 1 {
 			t.Errorf("过程/函数 %s 未建", proc)
 		}
+	}
+}
+
+func TestSQL_MigratesLegacyStateIntoDefaultWorkspace(t *testing.T) {
+	dsn, cleanup := freshDB(t)
+	defer cleanup()
+	conn := applySchema(t, dsn)
+	defer conn.Close(context.Background())
+
+	mustExec(t, conn, `
+		INSERT INTO pitr_volume_config(volume_name,fuse_mount)
+		VALUES ('legacy-volume','/pitr/legacy')
+		ON CONFLICT (volume_name) DO UPDATE SET fuse_mount=EXCLUDED.fuse_mount`)
+	mustExec(t, conn, `
+		INSERT INTO pitr_txn(version_hash,scope_path,state,command,closed_at)
+		VALUES ('legacy000001','/legacy','auto','write',now())`)
+	mustExec(t, conn, InitSQL)
+
+	var workspaceName, volumeName string
+	if err := conn.QueryRow(context.Background(), `
+		SELECT w.name,w.volume_name
+		  FROM pitr_txn t JOIN pitr_workspace w ON w.id=t.workspace_id
+		 WHERE t.version_hash='legacy000001'`).Scan(
+		&workspaceName, &volumeName); err != nil {
+		t.Fatal(err)
+	}
+	if workspaceName != "default" || volumeName != "legacy-volume" {
+		t.Fatalf("workspace=%q volume=%q", workspaceName, volumeName)
+	}
+	got := mustScalarInt(t, conn, `
+		SELECT count(*) FROM pitr_workspace_mount
+		 WHERE workspace_id=1 AND fuse_mount='/pitr/legacy'`)
+	if got != 1 {
+		t.Fatalf("legacy mount rows=%d", got)
 	}
 }
 

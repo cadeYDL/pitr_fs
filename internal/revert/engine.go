@@ -24,9 +24,11 @@ func ValidVersionHash(value string) bool {
 }
 
 type Engine struct {
-	db        *pg.DB
-	mountMu   sync.RWMutex
-	mountPath string
+	db          *pg.DB
+	mountMu     sync.RWMutex
+	mountPath   string
+	backendPath string
+	workspaceID int64
 }
 
 // SetMountPath 在 init 选定用户挂载点后更新目录级 revert 的路径基准。
@@ -69,8 +71,20 @@ func WithMountPath(value string) EngineOption {
 	}
 }
 
+func WithWorkspace(workspaceID int64, backendPath string) EngineOption {
+	return func(engine *Engine) {
+		if workspaceID > 0 {
+			engine.workspaceID = workspaceID
+		}
+		if backendPath != "" {
+			engine.backendPath = path.Clean(backendPath)
+		}
+		engine.mountPath = "/"
+	}
+}
+
 func NewEngine(db *pg.DB, options ...EngineOption) *Engine {
-	engine := &Engine{db: db}
+	engine := &Engine{db: db, workspaceID: 1, backendPath: "/"}
 	for _, option := range options {
 		option(engine)
 	}
@@ -111,8 +125,9 @@ func (e *Engine) Revert(
 		var targetID int64
 		var targetState string
 		if scanErr := tx.QueryRow(ctx, `
-			SELECT id, state FROM pitr_txn WHERE version_hash=$1`,
-			targetHash).Scan(&targetID, &targetState); scanErr != nil {
+			SELECT id, state FROM pitr_txn
+			 WHERE version_hash=$1 AND workspace_id=$2`,
+			targetHash, e.workspaceID).Scan(&targetID, &targetState); scanErr != nil {
 			if errors.Is(scanErr, pgx.ErrNoRows) {
 				return ErrTargetMissing
 			}
@@ -128,9 +143,10 @@ func (e *Engine) Revert(
 		if scanErr := tx.QueryRow(ctx, `
 			SELECT count(*)
 			  FROM pitr_txn
-			 WHERE (state='active' OR (state='auto' AND closed_at IS NULL))
+			 WHERE workspace_id=$2
+			   AND (state='active' OR (state='auto' AND closed_at IS NULL))
 			   AND ($1::text IS NULL OR pitr_scopes_overlap(scope_path, $1))`,
-			scope).Scan(&activeCount); scanErr != nil {
+			scope, e.workspaceID).Scan(&activeCount); scanErr != nil {
 			return scanErr
 		}
 		if activeCount != 0 {
@@ -155,14 +171,14 @@ func (e *Engine) Revert(
 			SELECT
 			  (SELECT count(*) FROM pitr_node_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
-			   WHERE t.id>$1
+			   WHERE t.id>$1 AND t.workspace_id=$4
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
 			     AND (NOT $3::boolean OR EXISTS (
 			          SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
 			           WHERE s.inode=h.inode))) +
 			  (SELECT count(*) FROM pitr_edge_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
-			   WHERE t.id>$1
+			   WHERE t.id>$1 AND t.workspace_id=$4
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
 			     AND (NOT $3::boolean OR EXISTS (
 			          SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
@@ -170,14 +186,14 @@ func (e *Engine) Revert(
 			              OR s.inode=(h.snapshot->>'inode')::bigint))) +
 			  (SELECT count(*) FROM pitr_chunk_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
-			   WHERE t.id>$1
+			   WHERE t.id>$1 AND t.workspace_id=$4
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
 			     AND (NOT $3::boolean OR EXISTS (
 			          SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
 			           WHERE s.inode=h.inode))) +
 			  (SELECT count(*) FROM pitr_chunk_ref_history h
 			    JOIN pitr_txn t ON t.id=h.txn_id
-			   WHERE t.id>$1
+			   WHERE t.id>$1 AND t.workspace_id=$4
 			     AND ($2::text IS NULL OR pitr_scopes_overlap(t.scope_path,$2))
 			     AND (NOT $3::boolean OR NOT EXISTS (
 			          SELECT 1 FROM pitr_chunk_history scoped_chunk
@@ -186,7 +202,7 @@ func (e *Engine) Revert(
 			                 SELECT 1 FROM pg_temp.pitr_revert_scope_inode s
 			                  WHERE s.inode=scoped_chunk.inode)
 			     )))`,
-			targetID, scope, scopeFiltered).Scan(&applied); scanErr != nil {
+			targetID, scope, scopeFiltered, e.workspaceID).Scan(&applied); scanErr != nil {
 			return scanErr
 		}
 		if options.DryRun {
@@ -205,12 +221,12 @@ func (e *Engine) Revert(
 			}
 			scanErr := tx.QueryRow(ctx, `
 				INSERT INTO pitr_txn
-					(version_hash,parent_id,scope_path,state,command,posix_op,
+					(workspace_id,version_hash,parent_id,scope_path,state,command,posix_op,
 					 process_command,actor_name,change_summary,closed_at)
-				VALUES ($1,$2,$3,'committed',$4,$5,$6,'pitrd',$7,now())
+				VALUES ($1,$2,$3,$4,'committed',$5,$6,$7,'pitrd',$8,now())
 				ON CONFLICT (version_hash) DO NOTHING
 				RETURNING id`,
-				hash, targetID, scopePath, "revert:"+targetHash,
+				e.workspaceID, hash, targetID, scopePath, "revert:"+targetHash,
 				fmt.Sprintf("revert(%q)", targetHash),
 				"pitr rever...",
 				fmt.Sprintf("replay %d history rows", applied)).
@@ -227,12 +243,12 @@ func (e *Engine) Revert(
 			return errors.New("生成唯一 revert version hash 失败:连续冲突 3 次")
 		}
 		if _, callErr := tx.Exec(ctx,
-			"CALL pitr_revert_from_temp($1,$2,$3,$4)",
-			targetHash, scope, revertID, scopeFiltered); callErr != nil {
+			"CALL pitr_revert_from_temp($1,$2,$3,$4,$5)",
+			targetHash, scope, revertID, scopeFiltered, e.workspaceID); callErr != nil {
 			return callErr
 		}
-		if _, pruneErr := txn.PruneClosedVersions(
-			ctx, tx, scopePath); pruneErr != nil {
+		if _, pruneErr := txn.PruneClosedVersionsForWorkspace(
+			ctx, tx, e.workspaceID, scopePath); pruneErr != nil {
 			return pruneErr
 		}
 		return nil
@@ -256,9 +272,9 @@ func (e *Engine) waitForOpenWrites(
 		if err := e.db.QueryRow(ctx, `
 			SELECT count(*)
 			  FROM pitr_txn
-			 WHERE state='auto' AND closed_at IS NULL
+			 WHERE workspace_id=$2 AND state='auto' AND closed_at IS NULL
 			   AND ($1::text IS NULL OR pitr_scopes_overlap(scope_path,$1))`,
-			scope).Scan(&open); err != nil {
+			scope, e.workspaceID).Scan(&open); err != nil {
 			return fmt.Errorf("等待开放写窗口: %w", err)
 		}
 		if open == 0 {
@@ -299,14 +315,22 @@ func (e *Engine) prepareScopeInodes(
 	if mountPath == "" {
 		return false, nil
 	}
-	relative, ok := strings.CutPrefix(path.Clean(scope), mountPath)
-	if !ok || (relative != "" && !strings.HasPrefix(relative, "/")) {
+	cleanedScope := path.Clean(scope)
+	relative, ok := strings.CutPrefix(cleanedScope, mountPath)
+	if mountPath == "/" {
+		relative = strings.TrimPrefix(cleanedScope, "/")
+		ok = true
+	} else if !ok || (relative != "" && !strings.HasPrefix(relative, "/")) {
 		return true, nil
 	}
 	relative = strings.Trim(relative, "/")
 	parts := make([]string, 0)
+	backendRelative := strings.Trim(e.backendPath, "/")
+	if backendRelative != "" {
+		parts = append(parts, strings.Split(backendRelative, "/")...)
+	}
 	if relative != "" {
-		parts = strings.Split(relative, "/")
+		parts = append(parts, strings.Split(relative, "/")...)
 	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO pg_temp.pitr_revert_scope_inode(inode)
@@ -317,7 +341,7 @@ func (e *Engine) prepareScopeInodes(
 		    JOIN pitr_txn t ON t.id=h.txn_id
 		    CROSS JOIN LATERAL
 		      jsonb_populate_record(NULL::jfs_edge,h.snapshot) AS edge
-		   WHERE t.id>$1 AND h.snapshot IS NOT NULL
+		   WHERE t.id>$1 AND t.workspace_id=$4 AND h.snapshot IS NOT NULL
 		     AND pitr_scopes_overlap(t.scope_path,$2)
 		),
 		all_edges AS (
@@ -342,7 +366,7 @@ func (e *Engine) prepareScopeInodes(
 		  SELECT edge.inode FROM tree JOIN all_edges edge ON edge.parent=tree.inode
 		)
 		SELECT DISTINCT inode FROM tree`,
-		targetID, scope, parts)
+		targetID, scope, parts, e.workspaceID)
 	if err != nil {
 		return false, fmt.Errorf("解析 revert scope inode: %w", err)
 	}

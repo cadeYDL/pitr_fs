@@ -35,19 +35,23 @@ message InitRequest {
   optional int64 history_limit = 5;
   optional int64 max_space_bytes = 6;
   optional int32 space_reserve_percent = 7;
+  string workspace = 8;
 }
 
 message InitResponse {
   VolumeStatus volume = 1;
+  WorkspaceStatus workspace = 2;
 }
 
 message MountRequest {
   string path = 1;
   string volume = 2;
+  string workspace = 3;
 }
 
 message MountResponse {
   VolumeStatus volume = 1;
+  WorkspaceStatus workspace = 2;
 }
 
 message UmountRequest {
@@ -69,6 +73,27 @@ message VolumeStatus {
   int32 space_reserve_percent = 10;
   int64 retained_space_bytes = 11;
   int64 reclaimable_space_bytes = 12;
+  int64 workspace_id = 13;
+  string workspace_name = 14;
+}
+
+message MountStatus {
+  string path = 1;
+  bool mounted = 2;
+}
+
+message WorkspaceStatus {
+  int64 id = 1;
+  string name = 2;
+  string volume = 3;
+  string backend_path = 4;
+  string jfs_mount = 5;
+  repeated MountStatus mounts = 6;
+  int64 history_limit = 7;
+  int64 max_space_bytes = 8;
+  int32 space_reserve_percent = 9;
+  int64 retained_space_bytes = 10;
+  int64 reclaimable_space_bytes = 11;
 }
 
 message StatusResponse {
@@ -77,6 +102,7 @@ message StatusResponse {
   repeated VolumeStatus volumes = 3;
   int64 active_transactions = 4 [deprecated = true];
   int64 open_writes = 5;
+  repeated WorkspaceStatus workspaces = 6;
 }
 
 message Transaction {
@@ -96,6 +122,7 @@ message Transaction {
   int64 actor_pid = 14;
   string actor_name = 15;
   string change_summary = 16;
+  int64 workspace_id = 17;
 }
 
 message BeginRequest {
@@ -178,16 +205,19 @@ message DiffResponse {
 
 message RecoverRequest {
   string path = 1;
+  string workspace = 2;
 }
 
 message RecoverResponse {
   repeated VolumeStatus volumes = 1;
+  repeated WorkspaceStatus workspaces = 2;
 }
 
 message ConfigSetRequest {
   string key = 1;
   string value = 2;
   string window = 3 [deprecated = true];
+  string workspace = 4;
 }
 
 message ConfigSetResponse {
@@ -200,6 +230,7 @@ message ClearRequest {
   string path = 1;
   bool global = 2;
   bool confirm = 3;
+  string workspace = 4;
 }
 
 message ClearResponse {

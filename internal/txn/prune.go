@@ -9,6 +9,30 @@ import (
 	"pitr_fs/internal/pg"
 )
 
+// PendingPruneWorkspaceIDs 返回当前有持久化裁剪任务的 workspace。daemon
+// 使用它轮询全部版本线，避免只处理 default workspace。
+func (m *Manager) PendingPruneWorkspaceIDs(ctx context.Context) ([]int64, error) {
+	rows, err := m.db.Query(ctx, `
+		SELECT workspace_id FROM pitr_prune_queue
+		 WHERE singleton ORDER BY requested_at,workspace_id`)
+	if err != nil {
+		return nil, fmt.Errorf("列出 workspace 裁剪队列: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("读取 workspace 裁剪队列: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取 workspace 裁剪队列: %w", err)
+	}
+	return ids, nil
+}
+
 // RunPendingPrune 处理一个有上限的版本裁剪批次。队列只保存“需要重算”这一
 // 事实，所以 daemon 重启后会按当时的持久化配置继续，而不会执行过期计划。
 func (m *Manager) RunPendingPrune(
@@ -25,7 +49,8 @@ func (m *Manager) RunPendingPrune(
 	}
 	var queued bool
 	if err := m.db.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM pitr_prune_queue WHERE singleton)`).
+		SELECT EXISTS (SELECT 1 FROM pitr_prune_queue
+		 WHERE workspace_id=$1 AND singleton)`, m.workspaceID).
 		Scan(&queued); err != nil {
 		return 0, false, fmt.Errorf("读取裁剪队列: %w", err)
 	}
@@ -54,12 +79,12 @@ func (m *Manager) RunPendingPrune(
 		if open != 0 {
 			return ErrMaintenanceBusy
 		}
-		limit, err := historyLimitTx(ctx, tx, normalized)
+		limit, err := historyLimitTx(ctx, tx, m.workspaceID, normalized)
 		if err != nil {
 			return err
 		}
 		result, err = pruneClosedVersionsBatch(
-			ctx, tx, normalized, limit, batch)
+			ctx, tx, m.workspaceID, normalized, limit, batch)
 		return err
 	})
 	if err == nil {
@@ -77,7 +102,7 @@ func (m *Manager) RunPendingPrune(
 	_, updateErr := m.db.Exec(recordCtx, `
 		UPDATE pitr_prune_queue
 		   SET attempts=attempts+1,last_error=$1
-		 WHERE singleton`, message)
+		 WHERE workspace_id=$2 AND singleton`, message, m.workspaceID)
 	if updateErr != nil {
 		return result.Pruned, true, errors.Join(err,
 			fmt.Errorf("记录裁剪失败: %w", updateErr))

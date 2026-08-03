@@ -12,6 +12,7 @@ const (
 
 type Txn struct {
 	ID             int64
+	WorkspaceID    int64
 	VersionHash    string
 	ScopePath      string
 	ParentID       *int64

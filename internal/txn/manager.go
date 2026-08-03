@@ -14,7 +14,7 @@ import (
 	"pitr_fs/internal/pg"
 )
 
-const txnColumns = `id, version_hash, parent_id, scope_path, state,
+const txnColumns = `id, workspace_id, version_hash, parent_id, scope_path, state,
 	COALESCE(command, ''), COALESCE(message, ''),
 	COALESCE(posix_op, ''), COALESCE(process_command, ''),
 	COALESCE(actor_uid, 0), COALESCE(actor_gid, 0), COALESCE(actor_pid, 0),
@@ -27,11 +27,25 @@ const (
 )
 
 type Manager struct {
-	db *pg.DB
+	db          *pg.DB
+	workspaceID int64
 }
 
 func NewManager(db *pg.DB) *Manager {
-	return &Manager{db: db}
+	return &Manager{db: db, workspaceID: 1}
+}
+
+// ForWorkspace 返回共享同一 PostgreSQL 连接池、但所有版本和策略查询都
+// 固定在指定 workspace 的 Manager。
+func (m *Manager) ForWorkspace(workspaceID int64) *Manager {
+	if workspaceID <= 0 {
+		workspaceID = 1
+	}
+	return &Manager{db: m.db, workspaceID: workspaceID}
+}
+
+func (m *Manager) WorkspaceID() int64 {
+	return m.workspaceID
 }
 
 type scanner interface {
@@ -42,6 +56,7 @@ func scanTxn(row scanner) (*Txn, error) {
 	out := new(Txn)
 	if err := row.Scan(
 		&out.ID,
+		&out.WorkspaceID,
 		&out.VersionHash,
 		&out.ParentID,
 		&out.ScopePath,
@@ -88,18 +103,18 @@ func (m *Manager) Begin(ctx context.Context, scope, message string) (*Txn, error
 			if err := tx.QueryRow(ctx, `
 				SELECT id
 				  FROM pitr_txn
-				 WHERE state IN ('committed', 'root')
+				 WHERE workspace_id=$1 AND state IN ('committed', 'root')
 				 ORDER BY id DESC
-				 LIMIT 1`).Scan(&parentID); err != nil {
+				 LIMIT 1`, m.workspaceID).Scan(&parentID); err != nil {
 				return fmt.Errorf("查找 parent version: %w", err)
 			}
 			row := tx.QueryRow(ctx, `
 				INSERT INTO pitr_txn
-					(version_hash, parent_id, scope_path, state, command, message)
-				VALUES ($1, $2, $3, 'active', 'begin', $4)
+					(workspace_id,version_hash, parent_id, scope_path, state, command, message)
+				VALUES ($1,$2, $3, $4, 'active', 'begin', $5)
 				ON CONFLICT (version_hash) DO NOTHING
 				RETURNING `+txnColumns,
-				hash, parentID, normalized, message)
+				m.workspaceID, hash, parentID, normalized, message)
 			created, err = scanTxn(row)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return errHashCollision
@@ -127,7 +142,8 @@ func (m *Manager) Commit(ctx context.Context, txnID int64, message string) (*Txn
 	err := m.db.InTx(ctx, func(tx pg.Tx) error {
 		var state string
 		if err := tx.QueryRow(ctx,
-			"SELECT state FROM pitr_txn WHERE id=$1 FOR UPDATE", txnID).Scan(&state); err != nil {
+			"SELECT state FROM pitr_txn WHERE id=$1 AND workspace_id=$2 FOR UPDATE",
+			txnID, m.workspaceID).Scan(&state); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrTxnNotFound
 			}
@@ -155,7 +171,8 @@ func (m *Manager) Commit(ctx context.Context, txnID int64, message string) (*Txn
 		}
 		var scanErr error
 		committed, scanErr = scanTxn(tx.QueryRow(ctx,
-			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1", txnID))
+			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1 AND workspace_id=$2",
+			txnID, m.workspaceID))
 		return scanErr
 	})
 	if err != nil {
@@ -169,7 +186,8 @@ func (m *Manager) Rollback(ctx context.Context, txnID int64) (*Txn, error) {
 	err := m.db.InTx(ctx, func(tx pg.Tx) error {
 		var state string
 		if err := tx.QueryRow(ctx,
-			"SELECT state FROM pitr_txn WHERE id=$1", txnID).Scan(&state); err != nil {
+			"SELECT state FROM pitr_txn WHERE id=$1 AND workspace_id=$2",
+			txnID, m.workspaceID).Scan(&state); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrTxnNotFound
 			}
@@ -191,7 +209,8 @@ func (m *Manager) Rollback(ctx context.Context, txnID int64) (*Txn, error) {
 		}
 		var scanErr error
 		rolledBack, scanErr = scanTxn(tx.QueryRow(ctx,
-			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1", txnID))
+			"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1 AND workspace_id=$2",
+			txnID, m.workspaceID))
 		return scanErr
 	})
 	if err != nil {
@@ -229,7 +248,8 @@ func waitForClosedAutos(
 
 func (m *Manager) FindByID(ctx context.Context, txnID int64) (*Txn, error) {
 	found, err := scanTxn(m.db.QueryRow(ctx,
-		"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1", txnID))
+		"SELECT "+txnColumns+" FROM pitr_txn WHERE id=$1 AND workspace_id=$2",
+		txnID, m.workspaceID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTxnNotFound
 	}
@@ -241,7 +261,8 @@ func (m *Manager) FindByID(ctx context.Context, txnID int64) (*Txn, error) {
 
 func (m *Manager) FindByHash(ctx context.Context, hash string) (*Txn, error) {
 	found, err := scanTxn(m.db.QueryRow(ctx,
-		"SELECT "+txnColumns+" FROM pitr_txn WHERE version_hash=$1", hash))
+		"SELECT "+txnColumns+" FROM pitr_txn WHERE version_hash=$1 AND workspace_id=$2",
+		hash, m.workspaceID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTxnNotFound
 	}
@@ -260,11 +281,11 @@ func (m *Manager) FindClosedAtOrBefore(
 	found, err := scanTxn(m.db.QueryRow(ctx, `
 		SELECT `+txnColumns+`
 		  FROM pitr_txn
-		 WHERE state<>'root'
+		 WHERE workspace_id=$2 AND state<>'root'
 		   AND closed_at IS NOT NULL
 		   AND closed_at<=$1
 		 ORDER BY closed_at DESC,id DESC
-		 LIMIT 1`, target))
+		 LIMIT 1`, target, m.workspaceID))
 	if err == nil {
 		return found, nil
 	}
@@ -276,7 +297,8 @@ func (m *Manager) FindClosedAtOrBefore(
 	if err := m.db.QueryRow(ctx, `
 		SELECT min(closed_at)
 		  FROM pitr_txn
-		 WHERE state<>'root' AND closed_at IS NOT NULL`).Scan(&earliest); err != nil {
+		 WHERE workspace_id=$1 AND state<>'root' AND closed_at IS NOT NULL`,
+		m.workspaceID).Scan(&earliest); err != nil {
 		return nil, fmt.Errorf("读取最早版本时间: %w", err)
 	}
 	if earliest != nil {
@@ -287,8 +309,8 @@ func (m *Manager) FindClosedAtOrBefore(
 	found, err = scanTxn(m.db.QueryRow(ctx, `
 		SELECT `+txnColumns+`
 		  FROM pitr_txn
-		 WHERE state='root' AND created_at<=$1
-		 ORDER BY id DESC LIMIT 1`, target))
+		 WHERE workspace_id=$2 AND state='root' AND created_at<=$1
+		 ORDER BY id DESC LIMIT 1`, target, m.workspaceID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTimeBeforeHistory
 	}
@@ -306,11 +328,11 @@ func (m *Manager) FindActiveByPath(ctx context.Context, value string) (*Txn, err
 	found, err := scanTxn(m.db.QueryRow(ctx, `
 		SELECT `+txnColumns+`
 		  FROM pitr_txn
-		 WHERE state='active'
+		 WHERE workspace_id=$2 AND state='active'
 		   AND (scope_path='/' OR scope_path=$1
 		        OR $1 LIKE rtrim(scope_path, '/') || '/%')
 		 ORDER BY length(scope_path) DESC, id DESC
-		 LIMIT 1`, normalized))
+		 LIMIT 1`, normalized, m.workspaceID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -328,8 +350,8 @@ func (m *Manager) CreateAutoVersion(
 ) (int64, string, error) {
 	var state, scope string
 	if err := tx.QueryRow(ctx,
-		"SELECT state, scope_path FROM pitr_txn WHERE id=$1 FOR SHARE", parentID).
-		Scan(&state, &scope); err != nil {
+		"SELECT state, scope_path FROM pitr_txn WHERE id=$1 AND workspace_id=$2 FOR SHARE",
+		parentID, m.workspaceID).Scan(&state, &scope); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, "", ErrTxnNotFound
 		}
@@ -346,10 +368,10 @@ func (m *Manager) CreateAutoVersion(
 		var id int64
 		err = tx.QueryRow(ctx, `
 			INSERT INTO pitr_txn
-				(version_hash, parent_id, scope_path, state, command)
-			VALUES ($1, $2, $3, 'auto', $4)
+				(workspace_id, version_hash, parent_id, scope_path, state, command)
+			VALUES ($1, $2, $3, $4, 'auto', $5)
 			ON CONFLICT (version_hash) DO NOTHING
-			RETURNING id`, hash, parentID, scope, command).Scan(&id)
+			RETURNING id`, m.workspaceID, hash, parentID, scope, command).Scan(&id)
 		if err == nil {
 			return id, hash, nil
 		}
@@ -364,7 +386,8 @@ func (m *Manager) CreateAutoVersion(
 func (m *Manager) CloseAutoVersion(ctx context.Context, autoID int64) error {
 	affected, err := m.db.Exec(ctx, `
 		UPDATE pitr_txn SET closed_at=now()
-		 WHERE id=$1 AND state='auto' AND closed_at IS NULL`, autoID)
+		 WHERE id=$1 AND workspace_id=$2
+		   AND state='auto' AND closed_at IS NULL`, autoID, m.workspaceID)
 	if err != nil {
 		return fmt.Errorf("关闭 auto %d: %w", autoID, err)
 	}
@@ -398,8 +421,9 @@ func (m *Manager) OpenAutoVersion(
 func (m *Manager) ReopenAutoVersion(ctx context.Context, autoID, parentID int64) error {
 	affected, err := m.db.Exec(ctx, `
 		UPDATE pitr_txn SET closed_at=NULL
-		 WHERE id=$1 AND parent_id=$2 AND state='auto' AND closed_at IS NOT NULL`,
-		autoID, parentID)
+		 WHERE id=$1 AND parent_id=$2 AND workspace_id=$3
+		   AND state='auto' AND closed_at IS NOT NULL`,
+		autoID, parentID, m.workspaceID)
 	if err != nil {
 		return fmt.Errorf("重开 auto %d: %w", autoID, err)
 	}
@@ -413,6 +437,9 @@ func (m *Manager) ReopenAutoVersion(ctx context.Context, autoID, parentID int64)
 // AbortAutoVersion 反向补偿一个失败的 FUSE 操作并删除对应 auto。SQL 过程只
 // replay 该 auto,不会回滚同一 active 事务下已经成功的其他 auto。
 func (m *Manager) AbortAutoVersion(ctx context.Context, autoID int64) error {
+	if _, err := m.FindByID(ctx, autoID); err != nil {
+		return fmt.Errorf("补偿 auto %d: %w", autoID, err)
+	}
 	if _, err := m.db.Exec(ctx, "CALL pitr_abort_auto($1)", autoID); err != nil {
 		return fmt.Errorf("补偿 auto %d: %w", autoID, err)
 	}
@@ -426,7 +453,8 @@ func (m *Manager) CloseDanglingAutoVersions(ctx context.Context) (int64, error) 
 	affected, err := m.db.Exec(ctx, `
 		UPDATE pitr_txn
 		   SET closed_at=now()
-		 WHERE state='auto' AND closed_at IS NULL`)
+		 WHERE workspace_id=$1 AND state='auto' AND closed_at IS NULL`,
+		m.workspaceID)
 	if err != nil {
 		return 0, fmt.Errorf("关闭遗留 auto 窗口: %w", err)
 	}
@@ -447,12 +475,12 @@ func (m *Manager) List(ctx context.Context, scope string, limit int) ([]*Txn, er
 	rows, err := m.db.Query(ctx, `
 		SELECT `+txnColumns+`
 		  FROM pitr_txn
-		 WHERE state<>'root'
+		 WHERE workspace_id=$3 AND state<>'root'
 		   AND (scope_path=$1
 		    OR scope_path LIKE rtrim($1, '/') || '/%'
 		    OR $1 LIKE rtrim(scope_path, '/') || '/%')
 		 ORDER BY created_at DESC, id DESC
-		 LIMIT $2`, normalized, limit)
+		 LIMIT $2`, normalized, limit, m.workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("list txn: %w", err)
 	}
@@ -490,6 +518,18 @@ func (m *Manager) CountOpenWrites(ctx context.Context) (int64, error) {
 		 WHERE state='active'
 		    OR (state='auto' AND closed_at IS NULL)`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count open writes: %w", err)
+	}
+	return count, nil
+}
+
+func (m *Manager) CountWorkspaceOpenWrites(ctx context.Context) (int64, error) {
+	var count int64
+	if err := m.db.QueryRow(ctx, `
+		SELECT count(*) FROM pitr_txn
+		 WHERE workspace_id=$1 AND
+		       (state='active' OR (state='auto' AND closed_at IS NULL))`,
+		m.workspaceID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count workspace open writes: %w", err)
 	}
 	return count, nil
 }

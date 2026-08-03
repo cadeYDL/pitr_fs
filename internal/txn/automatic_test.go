@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"pitr_fs/internal/workspace"
+
 	"pitr_fs/internal/pg"
 	"pitr_fs/internal/schema"
 )
@@ -62,6 +64,87 @@ func TestStandaloneVersionPersistsAuditMetadata(t *testing.T) {
 		byHash.ChangeSummary != `"v1" -> "v2"` ||
 		byHash.ClosedAt == nil {
 		t.Fatalf("audit metadata=%+v", byHash)
+	}
+}
+
+func TestWorkspaceManagersKeepVersionLinesAndPoliciesIndependent(t *testing.T) {
+	defaultManager, db := setupManager(t)
+	ctx := context.Background()
+	alpha, err := workspace.NewCatalog(db).Ensure(ctx, "alpha", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaManager := defaultManager.ForWorkspace(alpha.ID)
+
+	defaultID, err := defaultManager.OpenStandaloneVersion(
+		ctx, "/same/file", "write:default", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultManager.CloseStandaloneVersion(ctx, defaultID, "write", ""); err != nil {
+		t.Fatal(err)
+	}
+	alphaID, err := alphaManager.OpenStandaloneVersion(
+		ctx, "/same/file", "write:alpha", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := alphaManager.CloseStandaloneVersion(ctx, alphaID, "write", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	defaultLogs, err := defaultManager.List(ctx, "/", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaLogs, err := alphaManager.List(ctx, "/", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultLogs) != 1 || defaultLogs[0].Command != "write:default" {
+		t.Fatalf("default logs=%+v", defaultLogs)
+	}
+	if len(alphaLogs) != 1 || alphaLogs[0].Command != "write:alpha" {
+		t.Fatalf("alpha logs=%+v", alphaLogs)
+	}
+	if defaultLogs[0].WorkspaceID == alphaLogs[0].WorkspaceID {
+		t.Fatalf("workspace id 未隔离: default=%d alpha=%d",
+			defaultLogs[0].WorkspaceID, alphaLogs[0].WorkspaceID)
+	}
+	if _, err := alphaManager.SetHistoryLimit(ctx, "/", 7); err != nil {
+		t.Fatal(err)
+	}
+	defaultLimit, err := defaultManager.HistoryLimit(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaLimit, err := alphaManager.HistoryLimit(ctx, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultLimit != 100 || alphaLimit != 7 {
+		t.Fatalf("limits default=%d alpha=%d", defaultLimit, alphaLimit)
+	}
+}
+
+func TestWorkspaceConcurrentWindowFailsBusyWithoutCrossAttribution(t *testing.T) {
+	defaultManager, db := setupManager(t)
+	ctx := context.Background()
+	alpha, err := workspace.NewCatalog(db).Ensure(ctx, "alpha", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultID, err := defaultManager.OpenStandaloneVersion(
+		ctx, "/file-a", "write:default", VersionMetadata{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaultManager.ForWorkspace(alpha.ID).OpenStandaloneVersion(
+		ctx, "/file-b", "write:alpha", VersionMetadata{}); !errors.Is(err, ErrMaintenanceBusy) {
+		t.Fatalf("并发 workspace 写应快速返回 busy，实际 err=%v", err)
+	}
+	if err := defaultManager.CloseStandaloneVersion(ctx, defaultID, "write", ""); err != nil {
+		t.Fatal(err)
 	}
 }
 
