@@ -610,12 +610,10 @@ do_recover() {
     wait_ready
     install_host_upgrader
     install_wrapper
-    if docker_cli exec "$CONTAINER" pitr status | grep -q 'fuse='; then
-        docker_cli exec "$CONTAINER" pitr recover
-        echo "  ✓ 服务与挂载恢复完成"
-    else
-        echo "  ✓ 服务恢复完成；尚无已 init 的挂载"
-    fi
+	# recover 是幂等操作：新版本按 workspace catalog 恢复全部挂载，旧版本
+	# 也会校验已配置卷。不能解析 status 的展示文本来判断是否存在挂载。
+	docker_cli exec "$CONTAINER" pitr recover
+	echo "  ✓ 服务与 workspace 挂载恢复完成"
 }
 
 install_main() {

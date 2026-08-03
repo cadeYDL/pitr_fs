@@ -23,6 +23,7 @@ import (
 	"pitr_fs/internal/revert"
 	"pitr_fs/internal/schema"
 	"pitr_fs/internal/txn"
+	"pitr_fs/internal/workspace"
 )
 
 var serverTestDSN string
@@ -754,6 +755,36 @@ func TestServer_WorkspacePoliciesAndVersionLogsAreIndependent(t *testing.T) {
 	}
 	if limits["alpha"] != 3 || limits["beta"] != 9 {
 		t.Fatalf("limits=%v", limits)
+	}
+}
+
+func TestServer_RecoverWorkspaceDoesNotRequireLegacyFuseMount(t *testing.T) {
+	f := setupServer(t)
+	ctx := context.Background()
+	mountCalls := 0
+	handler := New(f.db, f.mgr, Config{
+		Volume: "test-volume", JFSMount: "/jfs", MountRoot: "/pitr",
+		JFSMounted: true, FUSEMounted: false,
+		MountWorkspaceFunc: func(
+			context.Context, workspace.Workspace, string,
+		) error {
+			mountCalls++
+			return nil
+		},
+	})
+	if _, err := handler.Init(ctx, &pb.InitRequest{
+		Path: "/pitr/alpha", Workspace: "alpha", Volume: "test-volume",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler.mountedWorkspacePaths["/pitr/alpha"] = false
+	recovered, err := handler.Recover(ctx, &pb.RecoverRequest{Workspace: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mountCalls != 2 || len(recovered.GetWorkspaces()) != 1 ||
+		!recovered.GetWorkspaces()[0].GetMounts()[0].GetMounted() {
+		t.Fatalf("mount calls=%d recover=%+v", mountCalls, recovered)
 	}
 }
 

@@ -11,6 +11,8 @@ pitr-fs 是运行在 JuiceFS 之上的时间回溯文件系统。它透明拦截
 
 - 默认自动版本模式，无需 `begin` 或 `commit`。创建、写入、截断、删除、
   重命名、链接和扩展属性变更都会自动形成版本。
+- 一个服务可管理多个 workspace；每个 workspace 拥有独立版本线、
+  `history-limit` 和挂载生命周期，同一 workspace 可绑定多个访问路径。
 - 默认全局保留最近 100 个版本；`history-limit` 可配置并持久化，设为 `-1`
   时不限制版本数量。
 - 可按用户熟悉的文件容量设置空间上限和预留比例；默认在预计占用达到上限的
@@ -202,8 +204,32 @@ pitr init ./data --history-limit 100 --max-space 100GiB --space-reserve 20
 `20%` 表示达到约 `80GiB` 时开始淘汰最老版本。估算按去重 slice 大小计算，
 不包含对象存储协议开销、压缩差异和异步 GC 尚未删除的临时占用。
 
-当前版本一个服务只管理一个全局卷和一个挂载路径。`init` 幂等执行，并把路径
-与保留策略写入 PostgreSQL；容器重启后会自动恢复这个挂载。
+`init` 幂等创建或恢复 workspace，并把路径与保留策略写入 PostgreSQL；容器
+重启后会恢复全部挂载。省略 `--workspace` 时使用兼容旧安装的 `default`。
+
+创建两个版本相互隔离的 workspace：
+
+```bash
+mkdir -p /pitr/project-a /pitr/project-b
+pitr init /pitr/project-a --workspace project-a --history-limit 100
+pitr init /pitr/project-b --workspace project-b --history-limit 20
+```
+
+为 `project-a` 增加第二个访问入口：
+
+```bash
+mkdir -p /pitr/project-a-alias
+pitr mount /pitr/project-a-alias --workspace project-a
+pitr status
+```
+
+两个 `project-a` 路径看到同一份文件和同一条版本线；`project-b` 的文件、历史
+和版本数策略均独立。卸载某个别名不会影响同 workspace 的其他挂载。
+
+当前 `max-space`、`space-reserve`、物理 slice 计数和对象 GC 仍属于共享的
+JuiceFS 卷，只能通过 `default` workspace 配置，不能视为 workspace 独立配额。
+受 JuiceFS 触发器归属机制限制，全卷同一时刻只允许一个开放写窗口；不同
+workspace 的重叠写入会快速返回 `EBUSY`，不会串到错误版本，可由调用方重试。
 
 ### 4. 快速验证
 
@@ -501,15 +527,19 @@ pitr revert --at "$target_time" --path .
 
 ```text
 应用 POSIX 操作
-    -> 用户挂载点上的 FUSE proxy（打开自动版本并采集有界审计信息）
+    -> workspace 挂载别名（同 workspace 的多个别名指向同一个 proxy）
+    -> workspace FUSE proxy（打开该 workspace 的自动版本并采集有界审计信息）
     -> 私有 JuiceFS 挂载（文件数据写入对象存储）
     -> PostgreSQL 触发器（把 jfs_* 旧值写入 pitr_*_history）
     -> 操作完成后关闭版本并按 history-limit 裁剪
 ```
 
 安装时，宿主机的 `PITR_MOUNT_ROOT` 以相同绝对路径、`rshared` 方式绑定进
-容器。`pitr init <path>` 只能选择该根目录下的子目录，daemon 随后在同一路径
-创建 FUSE 挂载并持久化配置。这个边界避免把整个宿主根文件系统暴露给容器。
+容器。`pitr init <path>` 只能选择该根目录下的子目录。daemon 为每个 workspace
+创建一个隐藏 FUSE proxy，再把用户挂载别名 bind 到该 proxy；同 workspace 因而
+共享文件视图和版本窗口，挂载点本身不成为版本边界。非 default workspace 的数据
+位于 JuiceFS 内部保留目录，default proxy 会隐藏并拒绝访问该目录。这个边界避免
+把整个宿主根文件系统暴露给容器，也防止 workspace 通过路径绕过隔离。
 
 `pitrd` 通过 Unix socket 提供 gRPC 控制面。CLI 和 SDK 负责路径解析与请求
 封装；版本选择、完整性检查、目录范围解析和 history 回放在 daemon 内完成。
@@ -574,14 +604,16 @@ API，因此所有依赖集中在 `internal/juicefsabi/v1` 契约中。`pitrd` �
 1. **性能尽量对齐 JuiceFS**：拆分双层 FUSE、自动版本、审计和 PostgreSQL
    的增量成本，减少元数据往返和 history 写放大；在基准证明收益后，评估把
    pitr 操作上下文和元数据捕获注入固定版本 JuiceFS，将两层 FUSE 收敛为一层。
-2. **补齐 Agent 存储基建能力**：引入 tenant/user/agent/session/workspace
-   身份与隔离域、多卷和多挂载点、私有工作视图、跨文件/目录原子 `publish`、
+2. **补齐 Agent 存储基建能力**：在已实现的单机多 workspace/多挂载基础上，
+   引入 tenant/user/agent/session 身份与隔离域、多卷、私有工作视图、跨文件/目录原子 `publish`、
    冲突检测、变更订阅、配额与权限，再逐步扩展到多节点和分片。
 
 普通 POSIX 写入仍默认自动产生可恢复历史，不重新要求用户执行
 `begin/commit`。文件级版本用于细粒度 undo；未来的发布版本用于表达一次跨文件、
 跨目录的完整业务改动。完整推演、阶段门槛和暂不承诺项见
-[《演进推演》](docs/演进推演.md)。
+[《演进推演》](docs/演进推演.md)；workspace 当前语义和未来外部
+PostgreSQL/对象存储接入边界见
+[《Workspace 与外部存储接入》](docs/Workspace与外部存储接入.md)。
 
 ## 许可证
 

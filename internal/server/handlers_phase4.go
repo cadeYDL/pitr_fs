@@ -335,7 +335,11 @@ func (s *Server) recoverWorkspaces(
 ) (*pb.RecoverResponse, error) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
-	if err := recoverVolume(ctx, s.volumes[0]); err != nil {
+	// workspace 模式没有单一的 legacy FUSEMount；各 workspace proxy 在下面
+	// 分别恢复。这里仅校验共享 JuiceFS 元数据和底层挂载。
+	physicalVolume := s.volumes[0]
+	physicalVolume.FUSEMounted = true
+	if err := recoverVolume(ctx, physicalVolume); err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 	var items []workspace.Workspace
