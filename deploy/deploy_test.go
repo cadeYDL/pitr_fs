@@ -350,10 +350,101 @@ func TestBuildUpgradeBundleSupportsLinuxArchitecturesAndSelfUpdate(t *testing.T)
 	for _, required := range []string{
 		`PITR_GOARCH`, `GOOS=linux GOARCH="$goarch"`,
 		`pitr-host-upgrade`, `goarch=%s`, `SCHEMA-COMPAT`,
+		`PITR_BUNDLE_FORMAT`, `legacy-bootstrap`,
 	} {
 		if !bytes.Contains(content, []byte(required)) {
 			t.Errorf("升级包构建器缺少 %q", required)
 		}
+	}
+}
+
+func TestLogicUpgradeAcceptsLegacyBootstrapBundle(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+set -euo pipefail
+source "$1"
+fixture=$2/fixture
+work=$2/work
+bundle=$2/legacy-bootstrap.tar.gz
+mkdir -p "$fixture" "$work"
+cat >"$fixture/pitr" <<'SH'
+#!/bin/sh
+printf 'pitr dev-bootstrap\n'
+SH
+cat >"$fixture/pitrd" <<'SH'
+#!/bin/sh
+exit 0
+SH
+cat >"$fixture/pitr-host-upgrade" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod 0755 "$fixture/pitr" "$fixture/pitrd" "$fixture/pitr-host-upgrade"
+printf '%s\n' 'SELECT 1;' >"$fixture/init_pitr.sql"
+printf '%s\n' dev-bootstrap >"$fixture/VERSION"
+cat >"$fixture/BUILD-INFO" <<'EOF'
+commit=bootstrap
+build_date=2026-08-04T00:00:00Z
+goarch=arm64
+schema_revision=3
+min_logic_revision=3
+EOF
+(
+  cd "$fixture"
+  sha256sum pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO >SHA256SUMS
+  tar -czf "$bundle" pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO SHA256SUMS
+)
+expected=$(printf '%s\n' BUILD-INFO SHA256SUMS VERSION init_pitr.sql pitr pitr-host-upgrade pitrd | LC_ALL=C sort)
+listed=$(tar -tzf "$bundle" | LC_ALL=C sort)
+test "$listed" = "$expected"
+version=$(validate_bundle "$bundle" "$work")
+test "$version" = dev-bootstrap
+test "$(cat "$work/SCHEMA-COMPAT")" = "$(printf 'schema_revision=3\nmin_logic_revision=3')"
+`, "bash", script, temp)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("旧升级器可接受的引导包未通过新版校验: %v\n%s", err, output)
+	}
+}
+
+func TestLogicUpgradeTreatsRuntimeWithoutContractAsRevisionOne(t *testing.T) {
+	root := repoRoot(t)
+	temp := t.TempDir()
+	config := filepath.Join(temp, "install.conf")
+	if err := os.WriteFile(config, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := filepath.Join(temp, "runtime")
+	if err := os.MkdirAll(filepath.Join(runtimeDir, "versions", "legacy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapDir := filepath.Join(runtimeDir, "versions", "bootstrap")
+	if err := os.MkdirAll(bootstrapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bootstrapDir, "BUILD-INFO"), []byte(
+		"schema_revision=3\nmin_logic_revision=3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "scripts", "pitr-host-upgrade.sh")
+	command := exec.Command("bash", "-c", `
+set -euo pipefail
+source "$1"
+RUNTIME_DIR=$2
+test "$(runtime_contract_value legacy schema_revision)" = 1
+test "$(runtime_contract_value legacy min_logic_revision)" = 1
+test "$(runtime_contract_value bootstrap schema_revision)" = 3
+test "$(runtime_contract_value bootstrap min_logic_revision)" = 3
+`, "bash", script, runtimeDir)
+	command.Env = append(os.Environ(), "PITR_INSTALL_CONFIG="+config)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("旧运行时缺少 schema 契约时未采用保守版本: %v\n%s", err, output)
 	}
 }
 

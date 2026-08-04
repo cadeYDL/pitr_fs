@@ -50,6 +50,9 @@ jobs:
       - name: 构建双架构升级包
         env:
           PITR_VERSION: ${{ github.ref_name }}
+          # 兼容尚未认识 SCHEMA-COMPAT 的早期宿主升级器；新版会从受
+          # SHA256 保护的 BUILD-INFO 重建契约。旧客户端迁移完成后可移除。
+          PITR_BUNDLE_FORMAT: legacy-bootstrap
         run: |
           set -euo pipefail
           mkdir -p dist

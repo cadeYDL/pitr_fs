@@ -120,17 +120,45 @@ validate_contract_file() {
     }
 }
 
+restore_contract_from_build_info() {
+    local build_info=$1 contract=$2 revision min_logic
+    revision=$(contract_file_value "$build_info" schema_revision) || {
+        echo "错误: 兼容引导包的 BUILD-INFO 缺少有效 schema_revision" >&2
+        return 1
+    }
+    min_logic=$(contract_file_value "$build_info" min_logic_revision) || {
+        echo "错误: 兼容引导包的 BUILD-INFO 缺少有效 min_logic_revision" >&2
+        return 1
+    }
+    printf 'schema_revision=%s\nmin_logic_revision=%s\n' \
+        "$revision" "$min_logic" >"$contract"
+    validate_contract_file "$contract"
+}
+
 validate_bundle() {
-    local bundle=$1 work=$2 listed expected version binary_version
+    local bundle=$1 work=$2 listed expected legacy_expected version binary_version
+    local bundle_format=current
+    local -a files
     [ -f "$bundle" ] || { echo "错误: 升级包不存在: $bundle" >&2; return 1; }
     listed=$(tar -tzf "$bundle" | LC_ALL=C sort)
     expected=$(printf '%s\n' BUILD-INFO SCHEMA-COMPAT SHA256SUMS VERSION init_pitr.sql \
         pitr pitr-host-upgrade pitrd |
         LC_ALL=C sort)
-    [ "$listed" = "$expected" ] || {
-        echo "错误: 升级包只能包含 pitr、pitrd、宿主升级器、schema 和校验清单" >&2
+    legacy_expected=$(printf '%s\n' BUILD-INFO SHA256SUMS VERSION init_pitr.sql \
+        pitr pitr-host-upgrade pitrd |
+        LC_ALL=C sort)
+    if [ "$listed" = "$expected" ]; then
+        files=(pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT VERSION BUILD-INFO SHA256SUMS)
+    elif [ "$listed" = "$legacy_expected" ]; then
+        bundle_format=legacy-bootstrap
+        files=(pitr pitrd pitr-host-upgrade init_pitr.sql VERSION BUILD-INFO SHA256SUMS)
+    else
+        echo "错误: 升级包文件清单不受支持；实际包含:" >&2
+        while IFS= read -r entry; do
+            printf '  %s\n' "$entry" >&2
+        done <<<"$listed"
         return 1
-    }
+    fi
     if tar -tvzf "$bundle" | awk '$1 !~ /^-/ { exit 1 }'; then
         :
     else
@@ -138,11 +166,14 @@ validate_bundle() {
         return 1
     fi
     tar -xzf "$bundle" -C "$work" --no-same-owner --no-same-permissions -- \
-        pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT VERSION BUILD-INFO SHA256SUMS
+        "${files[@]}"
     (cd "$work" && sha256sum -c SHA256SUMS >/dev/null) || {
         echo "错误: 升级包 SHA256 校验失败" >&2
         return 1
     }
+    if [ "$bundle_format" = legacy-bootstrap ]; then
+        restore_contract_from_build_info "$work/BUILD-INFO" "$work/SCHEMA-COMPAT" || return 1
+    fi
     validate_contract_file "$work/SCHEMA-COMPAT" || return 1
     [ "$(wc -l <"$work/VERSION")" -eq 1 ] || {
         echo "错误: VERSION 格式无效" >&2
@@ -458,15 +489,33 @@ switch_runtime() {
 runtime_contract_value() {
     local target=$1 key=$2 file
     if [ "$target" = builtin ]; then
-        docker_cli exec "$CONTAINER" cat /etc/pitr/SCHEMA-COMPAT |
-            awk -F= -v key="$key" '
-                $1==key && $2 ~ /^[0-9]+$/ { value=$2; count++ }
-                END { if (count==1) print value; else exit 1 }
-            '
-        return
+        if docker_cli exec "$CONTAINER" test -r /etc/pitr/SCHEMA-COMPAT; then
+            docker_cli exec "$CONTAINER" cat /etc/pitr/SCHEMA-COMPAT |
+                awk -F= -v key="$key" '
+                    $1==key && $2 ~ /^[0-9]+$/ { value=$2; count++ }
+                    END { if (count==1) print value; else exit 1 }
+                '
+            return
+        fi
+    else
+        file="$RUNTIME_DIR/versions/$target/SCHEMA-COMPAT"
+        if [ -r "$file" ]; then
+            contract_file_value "$file" "$key"
+            return
+        fi
+        # 由旧升级器安装的 legacy-bootstrap 包不会把重建后的
+        # SCHEMA-COMPAT 写入运行目录，但 BUILD-INFO 已包含且校验了同一契约。
+        file="$RUNTIME_DIR/versions/$target/BUILD-INFO"
+        if [ -r "$file" ] && contract_file_value "$file" "$key"; then
+            return
+        fi
     fi
-    file="$RUNTIME_DIR/versions/$target/SCHEMA-COMPAT"
-    contract_file_value "$file" "$key"
+    # 早期运行时没有显式 schema 契约。按最保守的初始修订处理：它可以
+    # 作为升级来源，但不能跨越要求更高 min_logic_revision 的 schema 回退。
+    case "$key" in
+        schema_revision|min_logic_revision) printf '1\n' ;;
+        *) return 1 ;;
+    esac
 }
 
 schema_rollback_safe() {

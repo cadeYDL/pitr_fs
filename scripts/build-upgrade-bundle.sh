@@ -34,6 +34,22 @@ case "$goarch" in
     amd64|arm64) ;;
     *) echo "错误: PITR_GOARCH 仅支持 amd64/arm64: $goarch" >&2; exit 2 ;;
 esac
+bundle_format=${PITR_BUNDLE_FORMAT:-current}
+case "$bundle_format" in
+    current|legacy-bootstrap) ;;
+    *)
+        echo "错误: PITR_BUNDLE_FORMAT 仅支持 current/legacy-bootstrap: $bundle_format" >&2
+        exit 2
+        ;;
+esac
+schema_revision=$(awk -F= '$1=="schema_revision" && $2 ~ /^[0-9]+$/ { print $2 }' \
+    "$REPO_ROOT/SCHEMA-COMPAT")
+min_logic_revision=$(awk -F= '$1=="min_logic_revision" && $2 ~ /^[0-9]+$/ { print $2 }' \
+    "$REPO_ROOT/SCHEMA-COMPAT")
+[ -n "$schema_revision" ] && [ -n "$min_logic_revision" ] || {
+    echo "错误: SCHEMA-COMPAT 缺少有效兼容版本" >&2
+    exit 1
+}
 output=$(realpath -m -- "$1")
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
@@ -50,15 +66,20 @@ install -m 0644 "$REPO_ROOT/internal/schema/init_pitr.sql" "$work/init_pitr.sql"
 install -m 0644 "$REPO_ROOT/SCHEMA-COMPAT" "$work/SCHEMA-COMPAT"
 install -m 0755 "$REPO_ROOT/scripts/pitr-host-upgrade.sh" "$work/pitr-host-upgrade"
 printf '%s\n' "$version" >"$work/VERSION"
-printf 'commit=%s\nbuild_date=%s\ngoarch=%s\n' \
-    "$commit" "$build_date" "$goarch" >"$work/BUILD-INFO"
+printf 'commit=%s\nbuild_date=%s\ngoarch=%s\nschema_revision=%s\nmin_logic_revision=%s\n' \
+    "$commit" "$build_date" "$goarch" "$schema_revision" "$min_logic_revision" \
+    >"$work/BUILD-INFO"
 (
     cd "$work"
-    sha256sum pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT VERSION BUILD-INFO \
-        >SHA256SUMS
-    tar -czf "$output" pitr pitrd pitr-host-upgrade init_pitr.sql SCHEMA-COMPAT \
-        VERSION BUILD-INFO SHA256SUMS
+    bundle_files=(pitr pitrd pitr-host-upgrade init_pitr.sql)
+    if [ "$bundle_format" = current ]; then
+        bundle_files+=(SCHEMA-COMPAT)
+    fi
+    bundle_files+=(VERSION BUILD-INFO)
+    sha256sum "${bundle_files[@]}" >SHA256SUMS
+    tar -czf "$output" "${bundle_files[@]}" SHA256SUMS
 )
 echo "已生成逻辑升级包: $output"
 echo "版本: $version"
 echo "架构: linux/$goarch"
+echo "格式: $bundle_format"

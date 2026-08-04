@@ -261,11 +261,37 @@ func (r *WorkspaceRuntime) StopAll() error {
 type unixWorkspaceBinder struct{}
 
 func (unixWorkspaceBinder) Bind(source, target string) error {
-	if err := os.MkdirAll(target, 0o755); err != nil {
+	if err := prepareWorkspaceMountTarget(target, os.MkdirAll, unix.Unmount); err != nil {
 		return err
 	}
 	if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
 		return fmt.Errorf("bind mount %s -> %s: %w", source, target, err)
+	}
+	return nil
+}
+
+func prepareWorkspaceMountTarget(
+	target string,
+	mkdirAll func(string, os.FileMode) error,
+	unmount func(string, int) error,
+) error {
+	err := mkdirAll(target, 0o755)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, unix.ENOTCONN) && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+
+	// 升级采用 lazy unmount 时，旧 FUSE endpoint 可能仍短暂存在于容器
+	// mount namespace；此时 MkdirAll 会返回 ENOTCONN 或 EEXIST。仅对这种
+	// 明确的残留状态做限定目标的 lazy unmount，然后重试一次。
+	if unmountErr := unmount(target, unix.MNT_DETACH); unmountErr != nil &&
+		!errors.Is(unmountErr, unix.EINVAL) && !errors.Is(unmountErr, unix.ENOENT) {
+		return fmt.Errorf("清理断连的 workspace 挂载点 %s: %w", target, unmountErr)
+	}
+	if err := mkdirAll(target, 0o755); err != nil {
+		return fmt.Errorf("重建 workspace 挂载点 %s: %w", target, err)
 	}
 	return nil
 }

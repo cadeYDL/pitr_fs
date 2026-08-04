@@ -2,13 +2,57 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"pitr_fs/internal/txn"
 	"pitr_fs/internal/workspace"
 )
+
+func TestPrepareWorkspaceMountTargetRecoversDisconnectedFuse(t *testing.T) {
+	mkdirCalls := 0
+	unmountCalls := 0
+	err := prepareWorkspaceMountTarget("/pitr/data", func(path string, mode os.FileMode) error {
+		mkdirCalls++
+		if path != "/pitr/data" || mode != 0o755 {
+			t.Fatalf("mkdir(%q, %o)", path, mode)
+		}
+		if mkdirCalls == 1 {
+			return &os.PathError{Op: "mkdir", Path: path, Err: unix.ENOTCONN}
+		}
+		return nil
+	}, func(path string, flags int) error {
+		unmountCalls++
+		if path != "/pitr/data" || flags != unix.MNT_DETACH {
+			t.Fatalf("unmount(%q, %d)", path, flags)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mkdirCalls != 2 || unmountCalls != 1 {
+		t.Fatalf("mkdir=%d unmount=%d", mkdirCalls, unmountCalls)
+	}
+}
+
+func TestPrepareWorkspaceMountTargetDoesNotUnmountOrdinaryFailure(t *testing.T) {
+	unmountCalls := 0
+	want := errors.New("permission denied")
+	err := prepareWorkspaceMountTarget("/pitr/data", func(string, os.FileMode) error {
+		return want
+	}, func(string, int) error {
+		unmountCalls++
+		return nil
+	})
+	if !errors.Is(err, want) || unmountCalls != 0 {
+		t.Fatalf("err=%v unmount=%d", err, unmountCalls)
+	}
+}
 
 type fakeWorkspaceProxy struct {
 	started bool
