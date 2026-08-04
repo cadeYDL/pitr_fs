@@ -32,3 +32,5 @@ __pycache__/
 .env.local
 .claude
 .codex
+.agents
+skills-lock.json
